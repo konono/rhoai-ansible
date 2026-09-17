@@ -1,0 +1,10 @@
+---
+- name: "Warn: {{ _parent }} requires {{ _dep }}"
+  ansible.builtin.debug:
+    msg: "install_{{ _parent }} requires install_{{ _dep }} — auto-enabled"
+  when: not (lookup('vars', 'install_' + _dep, default=true) | bool)
+
+- name: "Auto-enable install_{{ _dep }} (required by {{ _parent }})"
+  ansible.builtin.set_fact:
+    "install_{{ _dep }}": true
+  when: not (lookup('vars', 'install_' + _dep, default=true) | bool)

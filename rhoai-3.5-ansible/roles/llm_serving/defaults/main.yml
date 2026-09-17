@@ -1,0 +1,15 @@
+---
+llm_namespace: llm-serving
+
+model_defaults:
+  namespace: llm-serving
+  state: present
+  vllm_image: vllm/vllm-openai:v0.28.0
+  tool_call_parser: qwen3_coder
+  reasoning_parser: ""
+  chat_template_configmap: qwen3-chat-template
+  gpu_count: 1
+  vllm_extra_args:
+    - "--max-model-len=4096"
+    - "--enable-auto-tool-choice"
+  purge: false

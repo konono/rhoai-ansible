@@ -1,0 +1,54 @@
+---
+- name: Install ODF Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: odf-operator
+    operator_namespace: openshift-storage
+    operator_channel: "{{ operator_channels.odf }}"
+    operator_target_namespaces:
+      - openshift-storage
+
+- name: Wait for NooBaa CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: noobaas.noobaa.io
+
+- name: Check existing NooBaa
+  kubernetes.core.k8s_info:
+    api_version: noobaa.io/v1alpha1
+    kind: NooBaa
+    name: noobaa
+    namespace: openshift-storage
+  register: _noobaa_existing
+
+- name: Apply NooBaa
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: noobaa.io/v1alpha1
+      kind: NooBaa
+      metadata:
+        name: noobaa
+        namespace: openshift-storage
+      spec:
+        dbType: postgres
+        dbStorageClass: "{{ storage_class }}"
+        coreResources:
+          requests:
+            cpu: "0.1"
+            memory: 1Gi
+  when: >-
+    _noobaa_existing.resources | length == 0 or
+    _noobaa_existing.resources[0].spec.dbType | default('') != 'postgres' or
+    _noobaa_existing.resources[0].spec.dbStorageClass | default('') != storage_class
+
+- name: Wait for NooBaa Ready
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_field.yml"
+  vars:
+    res_api: noobaa.io/v1alpha1
+    res_kind: NooBaa
+    res_name: noobaa
+    res_namespace: openshift-storage
+    res_field: status.phase
+    res_expected: Ready
+    res_timeout: 900

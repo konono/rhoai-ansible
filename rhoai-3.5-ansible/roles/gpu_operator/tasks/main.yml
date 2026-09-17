@@ -1,0 +1,47 @@
+---
+- name: Install GPU Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: gpu-operator-certified
+    operator_namespace: nvidia-gpu-operator
+    operator_channel: "{{ operator_channels.gpu }}"
+    operator_target_namespaces:
+      - nvidia-gpu-operator
+    operator_source: "{{ catalog_sources.certified }}"
+
+- name: Apply GPU ClusterPolicy
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: nvidia.com/v1
+      kind: ClusterPolicy
+      metadata:
+        name: gpu-cluster-policy
+      spec:
+        operator:
+          defaultRuntime: crio
+        daemonsets:
+          tolerations:
+            - key: nvidia.com/gpu
+              operator: Exists
+              effect: NoSchedule
+        driver:
+          enabled: true
+          upgradePolicy:
+            autoUpgrade: true
+            maxParallelUpgrades: 1
+            maxUnavailable: "25%"
+        toolkit:
+          enabled: true
+        devicePlugin:
+          enabled: true
+        dcgm:
+          enabled: true
+        dcgmExporter:
+          enabled: true
+        gfd:
+          enabled: true
+        migManager:
+          enabled: true
+        nodeStatusExporter:
+          enabled: true

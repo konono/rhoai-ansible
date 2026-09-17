@@ -1,0 +1,88 @@
+---
+# roles/integration_rhoai_oidc/tasks/main.yml
+# Patch AITenant with Keycloak OIDC config for MaaS
+
+- name: Set Keycloak URL
+  ansible.builtin.set_fact:
+    keycloak_namespace: "{{ keycloak_namespace | default('keycloak') }}"
+    keycloak_realm: "{{ keycloak_realm | default('maas') }}"
+
+- name: Derive Keycloak URL
+  ansible.builtin.set_fact:
+    keycloak_url: "https://keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}"
+
+# --- Find AITenant ---
+- name: Get AITenant
+  ansible.builtin.command: >-
+    oc get aitenants.maas.opendatahub.io -A
+    -o jsonpath='{.items[0].metadata.name}:{.items[0].metadata.namespace}'
+  changed_when: false
+  failed_when: false
+  register: _aitenant_info
+
+- name: Parse AITenant name and namespace
+  ansible.builtin.set_fact:
+    _aitenant_name: "{{ _aitenant_info.stdout.split(':')[0] | default('') }}"
+    _aitenant_ns: "{{ _aitenant_info.stdout.split(':')[1] | default('') }}"
+  when: _aitenant_info.rc == 0 and ':' in _aitenant_info.stdout
+
+- name: Warn if no AITenant found
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: AITenant not found. OIDC patch skipped.
+      AITenant is created by RHOAI when MaaS is enabled — it may take a few minutes after deploy.
+  when: _aitenant_name is not defined or _aitenant_name | length == 0
+
+# --- Patch AITenant with OIDC ---
+- name: Patch AITenant with OIDC config
+  ansible.builtin.command: >-
+    oc patch aitenants.maas.opendatahub.io {{ _aitenant_name }}
+    -n {{ _aitenant_ns }} --type=merge
+    -p '{"spec":{"oidc":{"clientId":"maas-oidc","issuerUrl":"{{ keycloak_url }}/realms/{{ keycloak_realm }}","ttl":300}}}'
+  register: _patch_aitenant
+  changed_when: "'patched' in _patch_aitenant.stdout and '(no change)' not in _patch_aitenant.stdout"
+  when: _aitenant_name is defined and _aitenant_name | length > 0
+
+- name: Get AITenant tenant namespace
+  ansible.builtin.command: >-
+    oc get aitenants.maas.opendatahub.io {{ _aitenant_name }}
+    -n {{ _aitenant_ns }} -o jsonpath='{.status.tenantNamespace}'
+  register: _tenant_ns
+  changed_when: false
+  failed_when: false
+  when: _aitenant_name is defined and _aitenant_name | length > 0
+
+- name: Create maas-oidc-client-secret in gateway namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: maas-oidc-client-secret
+        namespace: redhat-ai-gateway-infra
+      type: Opaque
+      data:
+        client-secret: "{{ maas_oidc_client_secret | b64encode }}"
+  when: _aitenant_name is defined and _aitenant_name | length > 0
+
+- name: Create maas-oidc-client-secret in tenant namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: maas-oidc-client-secret
+        namespace: "{{ _tenant_ns.stdout | default('models-as-a-service') }}"
+      type: Opaque
+      data:
+        client-secret: "{{ maas_oidc_client_secret | b64encode }}"
+  when:
+    - _aitenant_name is defined and _aitenant_name | length > 0
+    - _tenant_ns.stdout | default('') | length > 0
+
+- name: AITenant OIDC integration complete
+  ansible.builtin.debug:
+    msg: "AITenant {{ _aitenant_name }} patched with Keycloak OIDC (issuer: {{ keycloak_url }}/realms/{{ keycloak_realm }})"
+  when: _aitenant_name is defined and _aitenant_name | length > 0

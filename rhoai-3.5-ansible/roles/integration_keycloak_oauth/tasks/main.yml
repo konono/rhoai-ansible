@@ -1,0 +1,172 @@
+---
+# roles/integration_keycloak_oauth/tasks/main.yml
+# Register Keycloak as OpenShift OIDC IdP
+
+- name: Set Keycloak URL
+  ansible.builtin.set_fact:
+    keycloak_namespace: "{{ keycloak_namespace | default('keycloak') }}"
+    keycloak_realm: "{{ keycloak_realm | default('maas') }}"
+
+- name: Derive Keycloak URL
+  ansible.builtin.set_fact:
+    keycloak_url: "https://keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}"
+    keycloak_issuer: "https://keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}/realms/{{ keycloak_realm }}"
+
+# --- Get OIDC client secret from Keycloak API ---
+- name: Get Keycloak admin token
+  ansible.builtin.include_tasks: "{{ role_path }}/../keycloak/tasks/_get_kc_token.yml"
+
+- name: Get openshift-oidc client secret from Keycloak
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=openshift-oidc"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+  register: _oidc_client
+
+- name: Set OIDC client secret
+  ansible.builtin.set_fact:
+    _oidc_secret: "{{ _oidc_client.json[0].secret }}"
+
+- name: Fail if OIDC secret not found
+  ansible.builtin.fail:
+    msg: "OIDC client secret not found. Run keycloak deploy first."
+  when: _oidc_secret | default('') | length == 0
+
+# --- Determine if CA is needed ---
+- name: Check Keycloak Route certificate issuer
+  ansible.builtin.command: >-
+    bash -c "echo | openssl s_client -connect keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}:443
+    -servername keycloak-{{ keycloak_namespace }}.{{ cluster_domain }} 2>/dev/null |
+    openssl x509 -noout -issuer 2>/dev/null"
+  changed_when: false
+  failed_when: false
+  register: _cert_issuer
+
+- name: Determine if public CA
+  ansible.builtin.set_fact:
+    _is_public_ca: >-
+      {{ _cert_issuer.stdout | default('') | regex_search("Let's Encrypt|DigiCert|GlobalSign|Comodo|GoDaddy|Amazon|Google Trust", ignorecase=true) | default('', true) | length > 0 }}
+
+- name: Get Ingress CA for non-public cert
+  ansible.builtin.command: >-
+    oc get cm router-ca -n openshift-config-managed -o jsonpath='{.data.ca-bundle\.crt}'
+  changed_when: false
+  failed_when: false
+  register: _ingress_ca
+  when: not _is_public_ca
+
+- name: Fallback to kube-root-ca
+  ansible.builtin.command: >-
+    oc get cm kube-root-ca.crt -n openshift-config -o jsonpath='{.data.ca\.crt}'
+  changed_when: false
+  failed_when: false
+  register: _kube_ca
+  when:
+    - not _is_public_ca
+    - _ingress_ca.stdout | default('') | length == 0
+
+- name: Set CA content
+  ansible.builtin.set_fact:
+    _kc_ca: "{{ _ingress_ca.stdout | default('') if (_ingress_ca.stdout | default('') | length > 0) else _kube_ca.stdout | default('') }}"
+  when: not _is_public_ca
+
+- name: Set CA empty for public cert
+  ansible.builtin.set_fact:
+    _kc_ca: ""
+  when: _is_public_ca
+
+# --- Create CA ConfigMap in openshift-config (if needed) ---
+- name: Create keycloak-ca ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: keycloak-ca
+        namespace: openshift-config
+      data:
+        ca.crt: "{{ _kc_ca }}"
+  when: _kc_ca | length > 0
+
+# --- Create OIDC client secret ---
+- name: Create OIDC client secret in openshift-config
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: keycloak-oidc-client-secret
+        namespace: openshift-config
+      type: Opaque
+      stringData:
+        clientSecret: "{{ _oidc_secret }}"
+
+# --- Patch OAuth CR ---
+- name: Get current OAuth IdPs
+  ansible.builtin.command: >-
+    oc get oauth cluster -o json
+  changed_when: false
+  failed_when: false
+  register: _oauth_json
+
+- name: Build IdP entry
+  ansible.builtin.set_fact:
+    _keycloak_idp:
+      name: keycloak
+      mappingMethod: claim
+      type: OpenID
+      openID:
+        clientID: openshift-oidc
+        clientSecret:
+          name: keycloak-oidc-client-secret
+        issuer: "{{ keycloak_issuer }}"
+        claims:
+          preferredUsername: ["preferred_username"]
+          name: ["preferred_username"]
+          email: ["email"]
+          groups: ["groups"]
+
+- name: Add CA ref to IdP (if needed)
+  ansible.builtin.set_fact:
+    _keycloak_idp: >-
+      {{ _keycloak_idp | combine({'openID': _keycloak_idp.openID | combine({'ca': {'name': 'keycloak-ca'}})}) }}
+  when: _kc_ca | length > 0
+
+- name: Compute new IdP list
+  ansible.builtin.set_fact:
+    _new_idps: >-
+      {{ ((_oauth_json.stdout | from_json).spec.identityProviders | default([])
+          | rejectattr('name', 'equalto', 'keycloak') | list) + [_keycloak_idp] }}
+
+- name: Patch OAuth cluster CR
+  ansible.builtin.command: >-
+    oc patch oauth cluster --type=merge
+    -p '{"spec":{"identityProviders":{{ _new_idps | to_json }}}}'
+  register: _oauth_patch
+  changed_when: "'patched' in _oauth_patch.stdout and '(no change)' not in _oauth_patch.stdout"
+
+# --- Restart OAuth pods ---
+- name: Delete OAuth pods to reload config
+  ansible.builtin.command: >-
+    oc delete pods -n openshift-authentication --all
+  changed_when: _oauth_patch.changed | default(false)
+  failed_when: false
+  when: _oauth_patch.changed | default(false)
+
+- name: Wait for OAuth pods ready
+  ansible.builtin.command: >-
+    oc get pods -n openshift-authentication --no-headers
+  changed_when: false
+  register: _oauth_pods
+  until: >-
+    _oauth_pods.stdout_lines | select('search', '1/1.*Running') | list | length >= 1
+  retries: 24
+  delay: 5
+
+- name: OAuth IdP registration complete
+  ansible.builtin.debug:
+    msg: "Keycloak OIDC IdP registered on OpenShift OAuth"

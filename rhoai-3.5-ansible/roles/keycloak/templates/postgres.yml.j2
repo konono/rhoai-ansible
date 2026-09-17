@@ -1,0 +1,82 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: keycloak-db-credentials
+  namespace: {{ keycloak_namespace }}
+type: Opaque
+stringData:
+  POSTGRES_DB: keycloak
+  POSTGRES_USER: keycloak
+  POSTGRES_PASSWORD: {{ keycloak_db_password }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: {{ keycloak_namespace }}
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-postgres
+  template:
+    metadata:
+      labels:
+        app: keycloak-postgres
+    spec:
+      securityContext:
+        fsGroup: 26
+      containers:
+        - name: postgres
+          image: registry.redhat.io/rhel9/postgresql-16:latest
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRESQL_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-credentials
+                  key: POSTGRES_DB
+            - name: POSTGRESQL_USER
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-credentials
+                  key: POSTGRES_USER
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: keycloak-db-credentials
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/pgsql/data
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: {{ storage_class }}
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: {{ keycloak_namespace }}
+spec:
+  selector:
+    app: keycloak-postgres
+  ports:
+    - port: 5432
+      targetPort: 5432
+  clusterIP: None

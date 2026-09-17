@@ -1,0 +1,358 @@
+---
+# =============================================================================
+# Role: ogx — OGX Server セットアップ
+# =============================================================================
+
+# --- Verify DSC ogx is Managed ---
+- name: Check DSC ogx managementState
+  ansible.builtin.command: >-
+    oc get datasciencecluster default-dsc
+    -o jsonpath='{.spec.components.ogx.managementState}'
+  register: _ogx_state
+  changed_when: false
+
+- name: Fail if ogx is not Managed
+  ansible.builtin.fail:
+    msg: "DSC ogx is not Managed (current: {{ _ogx_state.stdout }})"
+  when: _ogx_state.stdout != "Managed"
+
+# --- Wait for OGX CRD ---
+- name: Wait for OGX CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: ogxservers.ogx.io
+
+# --- Get VLLM API Token ---
+- name: Check existing OGX vllm connection Secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: ogx-vllm-connection
+    namespace: redhat-ods-applications
+  register: _existing_ogx_vllm_secret
+
+- name: Create VLLM API token
+  ansible.builtin.command: >-
+    oc create token llm-serving-sa -n llm-serving
+    --audience=maas --duration=8760h
+  register: _vllm_token
+  changed_when: false
+  failed_when: false
+  when: _existing_ogx_vllm_secret.resources | length == 0
+
+- name: Set vllm_token fact (new)
+  ansible.builtin.set_fact:
+    _vllm_api_token: "{{ _vllm_token.stdout }}"
+  when: _existing_ogx_vllm_secret.resources | length == 0
+
+- name: Set vllm_token fact (existing)
+  ansible.builtin.set_fact:
+    _vllm_api_token: "{{ _existing_ogx_vllm_secret.resources[0].data.VLLM_API_TOKEN | b64decode }}"
+  when: _existing_ogx_vllm_secret.resources | length > 0
+
+# --- Get NooBaa CA ---
+- name: Get NooBaa CA cert
+  ansible.builtin.command: >-
+    oc get secret noobaa-s3-serving-cert -n openshift-storage
+    -o jsonpath='{.data.tls\.crt}'
+  register: _noobaa_ca_b64
+  changed_when: false
+  failed_when: false
+
+# --- OGX vllm connection Secret ---
+- name: Create OGX vllm connection Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: ogx-vllm-connection
+        namespace: redhat-ods-applications
+      type: Opaque
+      data:
+        INFERENCE_MODEL: "{{ llm_model_name | b64encode }}"
+        VLLM_URL: "{{ ('https://' ~ llm_model_name ~ '-kserve-workload-svc.llm-serving.svc.cluster.local:8000/v1') | b64encode }}"
+        VLLM_TLS_VERIFY: "{{ 'false' | b64encode }}"
+        VLLM_API_TOKEN: "{{ _vllm_api_token | b64encode }}"
+
+# --- OGX PostgreSQL credentials ---
+- name: Create OGX PostgreSQL credentials Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: ogx-postgres-credentials
+        namespace: redhat-ods-applications
+      type: Opaque
+      data:
+        POSTGRES_DB: "{{ 'ogx' | b64encode }}"
+        POSTGRES_USER: "{{ 'ogx' | b64encode }}"
+        POSTGRES_PASSWORD: "{{ ogx_db_password | b64encode }}"
+
+# --- OGX PostgreSQL PVC ---
+- name: Check if OGX PostgreSQL PVC exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: ogx-postgres-data
+    namespace: redhat-ods-applications
+  register: _ogx_pvc
+
+- name: Create OGX PostgreSQL PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: ogx-postgres-data
+        namespace: redhat-ods-applications
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: "{{ storage_class }}"
+        resources:
+          requests:
+            storage: 10Gi
+  when: _ogx_pvc.resources | length == 0
+
+# --- OGX PostgreSQL StatefulSet + Service ---
+- name: Check if OGX PostgreSQL StatefulSet exists
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: StatefulSet
+    name: ogx-postgres
+    namespace: redhat-ods-applications
+  register: _ogx_sts
+
+- name: Deploy OGX PostgreSQL StatefulSet
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: apps/v1
+      kind: StatefulSet
+      metadata:
+        name: ogx-postgres
+        namespace: redhat-ods-applications
+      spec:
+        serviceName: ogx-postgres
+        replicas: 1
+        selector:
+          matchLabels:
+            app: ogx-postgres
+        template:
+          metadata:
+            labels:
+              app: ogx-postgres
+          spec:
+            containers:
+              - name: postgres
+                image: registry.redhat.io/rhel9/postgresql-16:latest
+                ports:
+                  - containerPort: 5432
+                env:
+                  - name: POSTGRESQL_DATABASE
+                    valueFrom:
+                      secretKeyRef:
+                        name: ogx-postgres-credentials
+                        key: POSTGRES_DB
+                  - name: POSTGRESQL_USER
+                    valueFrom:
+                      secretKeyRef:
+                        name: ogx-postgres-credentials
+                        key: POSTGRES_USER
+                  - name: POSTGRESQL_PASSWORD
+                    valueFrom:
+                      secretKeyRef:
+                        name: ogx-postgres-credentials
+                        key: POSTGRES_PASSWORD
+                volumeMounts:
+                  - name: data
+                    mountPath: /var/lib/pgsql/data
+                resources:
+                  requests:
+                    cpu: 250m
+                    memory: 512Mi
+                  limits:
+                    cpu: "1"
+                    memory: 1Gi
+        volumeClaimTemplates:
+          - metadata:
+              name: data
+            spec:
+              accessModes: [ReadWriteOnce]
+              storageClassName: "{{ storage_class }}"
+              resources:
+                requests:
+                  storage: 10Gi
+  when: _ogx_sts.resources | length == 0
+
+- name: Create OGX PostgreSQL Service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: ogx-postgres
+        namespace: redhat-ods-applications
+      spec:
+        selector:
+          app: ogx-postgres
+        ports:
+          - port: 5432
+            targetPort: 5432
+        clusterIP: None
+
+# --- NooBaa BackingStore + BucketClass + OBC ---
+- name: Create OGX BackingStore
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: noobaa.io/v1alpha1
+      kind: BackingStore
+      metadata:
+        name: ogx-pv-backing-store
+        namespace: openshift-storage
+      spec:
+        type: pv-pool
+        pvPool:
+          numVolumes: 1
+          storageClass: "{{ storage_class }}"
+          resources:
+            requests:
+              storage: 50Gi
+
+- name: Create OGX BucketClass
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: noobaa.io/v1alpha1
+      kind: BucketClass
+      metadata:
+        name: ogx-bucket-class
+        namespace: openshift-storage
+      spec:
+        placementPolicy:
+          tiers:
+            - backingStores:
+                - ogx-pv-backing-store
+
+- name: Create OGX OBC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: objectbucket.io/v1alpha1
+      kind: ObjectBucketClaim
+      metadata:
+        name: ogx-obc
+        namespace: redhat-ods-applications
+      spec:
+        generateBucketName: ogx
+        storageClassName: openshift-storage.noobaa.io
+        additionalConfig:
+          bucketclass: ogx-bucket-class
+
+# --- NooBaa CA bundle ConfigMap ---
+- name: Apply NooBaa CA bundle for OGX
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: noobaa-ca-bundle
+        namespace: redhat-ods-applications
+      data:
+        ca-bundle.crt: "{{ _noobaa_ca_b64.stdout | b64decode }}"
+  when: _noobaa_ca_b64.stdout | default('') | length > 0
+
+# --- Wait for PostgreSQL ---
+- name: Wait for OGX PostgreSQL rollout
+  ansible.builtin.command: >-
+    oc rollout status sts/ogx-postgres -n redhat-ods-applications --timeout=120s
+  changed_when: false
+  failed_when: false
+
+# --- OGXServer ---
+- name: Apply OGXServer
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: ogx.io/v1beta1
+      kind: OGXServer
+      metadata:
+        name: ogx-server
+        namespace: redhat-ods-applications
+        labels:
+          app.kubernetes.io/part-of: ogx
+      spec:
+        distribution:
+          name: rh
+        workload:
+          replicas: 1
+          storage:
+            size: 10Gi
+          overrides:
+            env:
+              - name: INFERENCE_MODEL
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-vllm-connection
+                    key: INFERENCE_MODEL
+              - name: VLLM_URL
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-vllm-connection
+                    key: VLLM_URL
+              - name: VLLM_TLS_VERIFY
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-vllm-connection
+                    key: VLLM_TLS_VERIFY
+              - name: VLLM_API_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-vllm-connection
+                    key: VLLM_API_TOKEN
+              - name: VLLM_REFRESH_MODELS
+                value: "true"
+              - name: VLLM_MAX_TOKENS
+                value: "4096"
+              - name: POSTGRES_HOST
+                value: ogx-postgres
+              - name: POSTGRES_PORT
+                value: "5432"
+              - name: POSTGRES_DB
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-postgres-credentials
+                    key: POSTGRES_DB
+              - name: POSTGRES_USER
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-postgres-credentials
+                    key: POSTGRES_USER
+              - name: POSTGRES_PASSWORD
+                valueFrom:
+                  secretKeyRef:
+                    name: ogx-postgres-credentials
+                    key: POSTGRES_PASSWORD
+            resources:
+              requests:
+                cpu: "100m"
+                memory: "512Mi"
+              limits:
+                cpu: "1"
+                memory: "2Gi"
+            volumes:
+              - name: noobaa-ca
+                configMap:
+                  name: noobaa-ca-bundle
+                  defaultMode: 0444
+            volumeMounts:
+              - name: noobaa-ca
+                mountPath: /etc/pki/tls/certs/noobaa-ca
+                readOnly: true

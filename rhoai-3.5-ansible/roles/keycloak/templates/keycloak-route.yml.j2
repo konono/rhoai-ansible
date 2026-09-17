@@ -1,0 +1,20 @@
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: keycloak
+  namespace: {{ keycloak_namespace }}
+spec:
+  host: {{ keycloak_hostname }}
+  port:
+    targetPort: https
+  tls:
+    termination: reencrypt
+    insecureEdgeTerminationPolicy: Redirect
+{% if _dest_ca.stdout | default('') | length > 0 %}
+    destinationCACertificate: |
+{{ _dest_ca.stdout | indent(6, true) }}
+{% endif %}
+  to:
+    kind: Service
+    name: keycloak-service
+    weight: 100

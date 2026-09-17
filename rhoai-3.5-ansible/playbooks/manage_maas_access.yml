@@ -1,0 +1,16 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  tasks:
+    - name: Preflight (light)
+      ansible.builtin.include_role:
+        name: preflight
+        tasks_from: light
+    - name: Manage MaaS access
+      ansible.builtin.include_role:
+        name: keycloak
+        tasks_from: manage_maas_access

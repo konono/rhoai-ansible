@@ -1,0 +1,23 @@
+---
+- name: Install RHCL Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: rhcl-operator
+    operator_namespace: openshift-rhcl
+    operator_channel: "{{ operator_channels.rhcl }}"
+
+- name: Wait for Kuadrant CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: kuadrants.kuadrant.io
+
+- name: Apply Kuadrant CR
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: kuadrant.io/v1beta1
+      kind: Kuadrant
+      metadata:
+        name: kuadrant
+        namespace: openshift-rhcl
+      spec: {}

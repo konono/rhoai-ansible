@@ -1,0 +1,98 @@
+---
+- name: Remove stale ODF mutating webhook
+  kubernetes.core.k8s:
+    state: absent
+    api_version: admissionregistration.k8s.io/v1
+    kind: MutatingWebhookConfiguration
+    name: csv.odf.openshift.io
+  changed_when: false
+
+- name: Create openshift-storage namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: openshift-storage
+        labels:
+          openshift.io/cluster-monitoring: "true"
+
+- name: Remove stale ODF OperatorGroup
+  kubernetes.core.k8s:
+    state: absent
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    name: odf-operator-group
+    namespace: openshift-storage
+  ignore_errors: true
+
+- name: Install LVM Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: lvms-operator
+    operator_namespace: openshift-lvm-storage
+    operator_channel: "{{ operator_channels.lvm }}"
+    operator_target_namespaces:
+      - openshift-lvm-storage
+
+- name: Wait for LVMCluster CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: lvmclusters.lvm.topolvm.io
+
+- name: Apply LVMCluster
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: lvm.topolvm.io/v1alpha1
+      kind: LVMCluster
+      metadata:
+        name: lvmcluster
+        namespace: openshift-lvm-storage
+      spec:
+        storage:
+          deviceClasses:
+            - name: vg1
+              default: true
+              deviceSelector:
+                paths: "{{ lvm_device_paths }}"
+              thinPoolConfig:
+                name: thin-pool-1
+                sizePercent: 90
+                overprovisionRatio: 10
+
+- name: Wait for LVMCluster Ready
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_field.yml"
+  vars:
+    res_api: lvm.topolvm.io/v1alpha1
+    res_kind: LVMCluster
+    res_name: lvmcluster
+    res_namespace: openshift-lvm-storage
+    res_field: status.state
+    res_expected: Ready
+    res_timeout: 300
+
+- name: Get current default StorageClass
+  ansible.builtin.command: >-
+    oc get sc -o jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}'
+  register: _current_default_sc
+  changed_when: false
+  failed_when: false
+
+- name: Unset previous default StorageClass
+  ansible.builtin.command: >-
+    oc patch sc {{ _current_default_sc.stdout }}
+    -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"false"}}}'
+  register: _unset_sc
+  changed_when: "'patched' in _unset_sc.stdout and '(no change)' not in _unset_sc.stdout"
+  when:
+    - _current_default_sc.stdout | length > 0
+    - _current_default_sc.stdout != 'lvms-vg1'
+
+- name: Set lvms-vg1 as default StorageClass
+  ansible.builtin.command: >-
+    oc patch sc lvms-vg1
+    -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+  register: _set_sc
+  changed_when: "'patched' in _set_sc.stdout and '(no change)' not in _set_sc.stdout"

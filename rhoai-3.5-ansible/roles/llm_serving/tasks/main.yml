@@ -1,0 +1,213 @@
+---
+# =============================================================================
+# Role: llm_serving — LLM Serving (llm-d) のデプロイ
+# models 変数でマルチモデルを管理。absent → present の順で処理（GPU 解放優先）
+# =============================================================================
+
+# === GPU キャパシティチェック ===
+- name: Calculate total GPU required by present models
+  ansible.builtin.set_fact:
+    _required_gpus: >-
+      {{ models | dict2items
+         | selectattr('value.state', 'defined')
+         | selectattr('value.state', 'equalto', 'present')
+         | map(attribute='value')
+         | map(attribute='gpu_count', default=model_defaults.gpu_count)
+         | map('int') | sum
+         + models | dict2items
+           | rejectattr('value.state', 'defined')
+           | map(attribute='value')
+           | map(attribute='gpu_count', default=model_defaults.gpu_count)
+           | map('int') | sum }}
+
+- name: Check cluster GPU capacity
+  ansible.builtin.command: >-
+    oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+  register: _cluster_gpus
+  changed_when: false
+  failed_when: false
+
+- name: Warn if GPU capacity insufficient for all present models
+  ansible.builtin.fail:
+    msg: >-
+      GPU 不足: present モデルの合計 GPU 要求数 ({{ _required_gpus }}) が
+      クラスタの GPU 数 ({{ _cluster_gpu_total }}) を超えています。
+      一部のモデルの state を absent に変更するか、gpu_count を調整してください。
+  vars:
+    _cluster_gpu_total: "{{ _cluster_gpus.stdout_lines | default([]) | select('ne', '') | map('int') | sum }}"
+  when:
+    - _cluster_gpus.rc == 0
+    - (_required_gpus | int) > (_cluster_gpu_total | int)
+
+- name: Create llm-serving namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ llm_namespace }}"
+
+- name: Create hf-token Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: hf-token
+        namespace: "{{ llm_namespace }}"
+      type: Opaque
+      data:
+        HF_TOKEN: "{{ hf_token | b64encode }}"
+
+- name: Check if model cache PVC exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: hf-model-cache
+    namespace: "{{ llm_namespace }}"
+  register: _model_pvc
+
+- name: Create model-cache PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: hf-model-cache
+        namespace: "{{ llm_namespace }}"
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: "{{ storage_class }}"
+        resources:
+          requests:
+            storage: 200Gi
+  when: _model_pvc.resources | length == 0
+
+- name: Wait for ClusterStorageContainer CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: clusterstoragecontainers.serving.kserve.io
+
+- name: Check existing ClusterStorageContainer
+  kubernetes.core.k8s_info:
+    api_version: serving.kserve.io/v1alpha1
+    kind: ClusterStorageContainer
+    name: default
+  register: _csc_existing
+
+- name: Apply ClusterStorageContainer
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: serving.kserve.io/v1alpha1
+      kind: ClusterStorageContainer
+      metadata:
+        name: default
+      spec:
+        container:
+          name: storage-initializer
+          image: "{{ llm_storage_initializer_image }}"
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+        supportedUriFormats:
+          - prefix: "pvc://"
+          - prefix: "hf://"
+  when: _csc_existing.resources | length == 0
+
+- name: Read chat template file
+  ansible.builtin.slurp:
+    src: "{{ ansible_root }}/../manifests/07-llm-serving/chat_template.jinja"
+  register: _chat_template
+
+- name: Collect unique chat template ConfigMap names
+  ansible.builtin.set_fact:
+    _chat_template_configmaps: >-
+      {{ models | dict2items
+         | map(attribute='value')
+         | map(attribute='chat_template_configmap', default=model_defaults.chat_template_configmap)
+         | unique | list }}
+
+- name: Apply chat template ConfigMaps
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ item }}"
+        namespace: "{{ llm_namespace }}"
+      data:
+        chat_template.jinja: "{{ _chat_template.content | b64decode }}"
+  loop: "{{ _chat_template_configmaps }}"
+
+- name: Create llm-serving-sa ServiceAccount
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: llm-serving-sa
+        namespace: "{{ llm_namespace }}"
+
+- name: Create RoleBinding for llm-serving-sa
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: llm-serving-sa-admin
+        namespace: "{{ llm_namespace }}"
+      roleRef:
+        apiGroup: rbac.authorization.k8s.io
+        kind: ClusterRole
+        name: admin
+      subjects:
+        - kind: ServiceAccount
+          name: llm-serving-sa
+          namespace: "{{ llm_namespace }}"
+
+- name: Delete old ClusterRoleBinding if exists
+  kubernetes.core.k8s:
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: llm-serving-sa-admin
+
+# === Phase 1: absent モデルの削除（GPU 解放優先） ===
+- name: "Process absent models"
+  ansible.builtin.include_tasks: remove_model.yml
+  vars:
+    _model_name: "{{ item.key }}"
+    _model_cfg: "{{ model_defaults | combine(item.value) }}"
+  loop: "{{ models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} (absent)"
+  when: (item.value.state | default(model_defaults.state)) == 'absent'
+
+# === Phase 2: present モデルのデプロイ ===
+- name: "Deploy present models"
+  ansible.builtin.include_tasks: deploy_model.yml
+  vars:
+    _model_name: "{{ item.key }}"
+    _model_cfg: "{{ model_defaults | combine(item.value) }}"
+  loop: "{{ models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }} (present)"
+  when: (item.value.state | default(model_defaults.state)) == 'present'

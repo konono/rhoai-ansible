@@ -1,0 +1,5 @@
+---
+- name: Manage MaaS access
+  ansible.builtin.include_role:
+    name: keycloak
+    tasks_from: manage_maas_access

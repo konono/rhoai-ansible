@@ -1,0 +1,157 @@
+---
+# KVM VM の Secure Boot を無効化する Playbook
+# NVIDIA GPU パススルー環境でドライバの署名検証エラーを回避するために使用
+#
+# Usage:
+#   ansible-playbook playbooks/disable_secureboot.yml -e vm_name=sno
+#   ansible-playbook playbooks/disable_secureboot.yml -e vm_name=sno -e libvirt_uri=qemu+ssh://root@kvmhost/system
+#
+# Prerequisites:
+#   - libvirt の管理権限（virsh が実行可能なユーザー）
+#   - VM が停止状態であること（起動中の場合は自動でシャットダウンを試みる）
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    vm_name: sno
+    libvirt_uri: "qemu:///system"
+    shutdown_timeout: 120
+
+  tasks:
+    - name: Validate vm_name is provided
+      ansible.builtin.assert:
+        that: vm_name | length > 0
+        fail_msg: "vm_name を指定してください: -e vm_name=<VM名>"
+
+    - name: Get VM state
+      ansible.builtin.command: >-
+        virsh -c {{ libvirt_uri }} domstate {{ vm_name }}
+      register: _vm_state
+      changed_when: false
+
+    - name: Display current VM state
+      ansible.builtin.debug:
+        msg: "VM '{{ vm_name }}' の現在の状態: {{ _vm_state.stdout | trim }}"
+
+    - name: Shut down VM if running
+      when: _vm_state.stdout | trim == 'running'
+      block:
+        - name: Send ACPI shutdown to VM
+          ansible.builtin.command: >-
+            virsh -c {{ libvirt_uri }} shutdown {{ vm_name }}
+          changed_when: true
+
+        - name: Wait for VM to shut off
+          ansible.builtin.command: >-
+            virsh -c {{ libvirt_uri }} domstate {{ vm_name }}
+          register: _vm_wait
+          until: _vm_wait.stdout | trim == 'shut off'
+          retries: "{{ (shutdown_timeout | int / 5) | int }}"
+          delay: 5
+          changed_when: false
+
+    - name: Dump current VM XML
+      ansible.builtin.command: >-
+        virsh -c {{ libvirt_uri }} dumpxml --inactive {{ vm_name }}
+      register: _vm_xml
+      changed_when: false
+
+    - name: Check if Secure Boot is currently enabled
+      ansible.builtin.set_fact:
+        secureboot_enabled: "{{ \"<feature enabled='yes' name='secure-boot'/>\" in _vm_xml.stdout }}"
+
+    - name: Skip if Secure Boot is already disabled
+      when: not secureboot_enabled
+      ansible.builtin.debug:
+        msg: "Secure Boot は既に無効です。変更は不要です。"
+
+    - name: Disable Secure Boot
+      when: secureboot_enabled
+      block:
+        - name: Build modified XML
+          ansible.builtin.set_fact:
+            vm_xml_modified: >-
+              {{ _vm_xml.stdout
+                | regex_replace("<feature enabled='yes' name='enrolled-keys'/>",
+                                "<feature enabled='no' name='enrolled-keys'/>")
+                | regex_replace("<feature enabled='yes' name='secure-boot'/>",
+                                "<feature enabled='no' name='secure-boot'/>")
+                | regex_replace("secure='yes' type='pflash'",
+                                "secure='no' type='pflash'")
+                | regex_replace("OVMF_CODE\.secboot\.fd", "OVMF_CODE.fd")
+                | regex_replace("OVMF_VARS\.secboot\.fd", "OVMF_VARS.fd")
+                | regex_replace("<smm state='on'/>", "<smm state='off'/>")
+              }}
+
+        - name: Write modified XML to temp file
+          ansible.builtin.copy:
+            content: "{{ vm_xml_modified }}"
+            dest: "/tmp/{{ vm_name }}-nosecboot.xml"
+            mode: "0600"
+
+        - name: Get NVRAM path from XML
+          ansible.builtin.set_fact:
+            nvram_path: >-
+              {{ _vm_xml.stdout
+                | regex_search("<nvram[^>]*>([^<]+)</nvram>", "\1")
+                | first }}
+
+        - name: Back up current NVRAM
+          ansible.builtin.copy:
+            src: "{{ nvram_path }}"
+            dest: "{{ nvram_path }}.secboot-backup"
+            remote_src: true
+            mode: "0600"
+          become: true
+
+        - name: Undefine VM (preserving NVRAM)
+          ansible.builtin.command: >-
+            virsh -c {{ libvirt_uri }} undefine {{ vm_name }} --nvram
+          changed_when: true
+
+        - name: Remove old NVRAM (will be regenerated from template)
+          ansible.builtin.file:
+            path: "{{ nvram_path }}"
+            state: absent
+          become: true
+
+        - name: Redefine VM with Secure Boot disabled
+          ansible.builtin.command: >-
+            virsh -c {{ libvirt_uri }} define /tmp/{{ vm_name }}-nosecboot.xml
+          changed_when: true
+
+        - name: Clean up temp file
+          ansible.builtin.file:
+            path: "/tmp/{{ vm_name }}-nosecboot.xml"
+            state: absent
+
+        - name: Verify Secure Boot is disabled
+          ansible.builtin.command: >-
+            virsh -c {{ libvirt_uri }} dumpxml --inactive {{ vm_name }}
+          register: _vm_xml_after
+          changed_when: false
+
+        - name: Assert Secure Boot is disabled
+          ansible.builtin.assert:
+            that:
+              - "'secure-boot' not in _vm_xml_after.stdout or \"enabled='no' name='secure-boot'\" in _vm_xml_after.stdout"
+            fail_msg: "Secure Boot の無効化に失敗しました"
+            success_msg: "Secure Boot を正常に無効化しました"
+
+        - name: Start VM
+          ansible.builtin.command: >-
+            virsh -c {{ libvirt_uri }} start {{ vm_name }}
+          changed_when: true
+
+        - name: Summary
+          ansible.builtin.debug:
+            msg: |
+              ========================================
+              VM '{{ vm_name }}' の Secure Boot を無効化しました。
+              - NVRAM バックアップ: {{ nvram_path }}.secboot-backup
+              - VM を起動しました。
+              - NVIDIA ドライバ Pod が正常にロードされるか確認してください:
+                  oc get pods -n nvidia-gpu-operator -w
+              ========================================

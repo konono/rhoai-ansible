@@ -1,0 +1,2 @@
+# ansible-vault encrypt inventory/<your-env>/group_vars/all/vault.yml
+hf_token: hf_your_token_here

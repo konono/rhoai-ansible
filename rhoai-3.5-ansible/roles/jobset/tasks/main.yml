@@ -1,0 +1,25 @@
+---
+- name: Install JobSet Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: job-set
+    operator_namespace: openshift-jobset
+    operator_channel: "{{ operator_channels.jobset }}"
+    operator_target_namespaces:
+      - openshift-jobset
+
+- name: Wait for JobSetOperator CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: jobsetoperators.operator.openshift.io
+
+- name: Apply JobSetOperator CR
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operator.openshift.io/v1
+      kind: JobSetOperator
+      metadata:
+        name: cluster
+      spec:
+        managementState: Managed

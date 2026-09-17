@@ -1,0 +1,7 @@
+---
+- name: Install Kueue Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: kueue-operator
+    operator_namespace: openshift-kueue
+    operator_channel: "{{ operator_channels.kueue }}"

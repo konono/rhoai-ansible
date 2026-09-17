@@ -1,0 +1,20 @@
+---
+- name: Install NFD Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: nfd
+    operator_namespace: openshift-nfd
+    operator_channel: "{{ operator_channels.nfd }}"
+    operator_target_namespaces:
+      - openshift-nfd
+
+- name: Apply NFD instance
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: nfd.openshift.io/v1
+      kind: NodeFeatureDiscovery
+      metadata:
+        name: nfd-instance
+        namespace: openshift-nfd
+      spec: {}

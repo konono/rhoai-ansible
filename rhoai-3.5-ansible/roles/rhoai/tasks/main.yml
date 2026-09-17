@@ -1,0 +1,555 @@
+---
+# =============================================================================
+# Role: rhoai — OpenShift AI (RHOAI) のインストール
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Step 1: RHOAI Operator
+# ---------------------------------------------------------------------------
+- name: Install RHOAI Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: rhods-operator
+    operator_namespace: redhat-ods-operator
+    operator_channel: "{{ operator_channels.rhoai }}"
+    operator_target_namespaces: []
+
+- name: Get cluster domain
+  ansible.builtin.command: oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}'
+  register: _cluster_domain_result
+  changed_when: false
+
+- name: Set cluster_domain fact
+  ansible.builtin.set_fact:
+    cluster_domain: "{{ _cluster_domain_result.stdout }}"
+
+# ---------------------------------------------------------------------------
+# Step 2: Wait for redhat-ods-applications namespace
+# ---------------------------------------------------------------------------
+- name: Wait for redhat-ods-applications namespace
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: redhat-ods-applications
+  register: _rhoai_ns
+  until: _rhoai_ns.resources | length > 0
+  retries: 24
+  delay: 5
+
+# ---------------------------------------------------------------------------
+# Step 3: MaaS PostgreSQL
+# ---------------------------------------------------------------------------
+- name: Check if MaaS PostgreSQL PVC exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: maas-postgres-data
+    namespace: redhat-ods-applications
+  register: _maas_pvc
+
+- name: Create MaaS PostgreSQL PVC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: maas-postgres-data
+        namespace: redhat-ods-applications
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: "{{ storage_class }}"
+        resources:
+          requests:
+            storage: 10Gi
+  when: _maas_pvc.resources | length == 0
+
+- name: Deploy MaaS PostgreSQL
+  kubernetes.core.k8s:
+    state: present
+    template: maas-postgres.yml.j2
+
+- name: Wait for MaaS PostgreSQL rollout
+  ansible.builtin.command: >-
+    oc rollout status deployment/maas-postgres
+    -n redhat-ods-applications --timeout=300s
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# Step 4: maas-db-config Secret
+# ---------------------------------------------------------------------------
+- name: Create maas-db-config Secret in redhat-ods-applications
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: maas-db-config
+        namespace: redhat-ods-applications
+      type: Opaque
+      data:
+        host: "{{ 'maas-postgres' | b64encode }}"
+        port: "{{ '5432' | b64encode }}"
+        database: "{{ 'maas' | b64encode }}"
+        username: "{{ 'maas' | b64encode }}"
+        password: "{{ maas_db_password | b64encode }}"
+        DB_CONNECTION_URL: "{{ ('postgresql://maas:' ~ maas_db_password ~ '@maas-postgres:5432/maas') | b64encode }}"
+
+- name: Check if redhat-ai-gateway-infra namespace exists
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: redhat-ai-gateway-infra
+  register: _gateway_ns
+
+- name: Sync maas-db-config to redhat-ai-gateway-infra
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: maas-db-config
+        namespace: redhat-ai-gateway-infra
+      type: Opaque
+      data:
+        DB_CONNECTION_URL: "{{ ('postgresql://maas:' ~ maas_db_password ~ '@maas-postgres.redhat-ods-applications.svc.cluster.local:5432/maas') | b64encode }}"
+  register: _sync_db_config_1
+  when: _gateway_ns.resources | length > 0
+
+- name: Restart maas-api in gateway namespace
+  ansible.builtin.command: >-
+    oc rollout restart deployment/maas-api -n redhat-ai-gateway-infra
+  register: _restart_maas
+  changed_when: "'restarted' in _restart_maas.stdout"
+  failed_when: false
+  when:
+    - _gateway_ns.resources | length > 0
+    - _sync_db_config_1 is changed
+
+# ---------------------------------------------------------------------------
+# Step 5: DataScienceCluster
+# ---------------------------------------------------------------------------
+- name: Apply DataScienceCluster
+  kubernetes.core.k8s:
+    state: present
+    template: datasciencecluster.yml.j2
+
+- name: Wait for redhat-ai-gateway-infra namespace
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: redhat-ai-gateway-infra
+  register: _gw_ns
+  until: _gw_ns.resources | length > 0
+  retries: 12
+  delay: 10
+
+- name: Sync maas-db-config to gateway namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: maas-db-config
+        namespace: redhat-ai-gateway-infra
+      type: Opaque
+      data:
+        DB_CONNECTION_URL: "{{ ('postgresql://maas:' ~ maas_db_password ~ '@maas-postgres.redhat-ods-applications.svc.cluster.local:5432/maas') | b64encode }}"
+  register: _sync_db_config_2
+
+- name: Restart maas-api after db-config sync
+  ansible.builtin.command: >-
+    oc rollout restart deployment/maas-api -n redhat-ai-gateway-infra
+  register: _restart_result
+  changed_when: "'restarted' in _restart_result.stdout"
+  failed_when: false
+  when: _sync_db_config_2 is changed
+
+- name: Wait for rhods-dashboard Deployment
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: rhods-dashboard
+    namespace: redhat-ods-applications
+  register: _dashboard
+  until: _dashboard.resources | length > 0
+  retries: 30
+  delay: 10
+
+# ---------------------------------------------------------------------------
+# Step 6: HardwareProfile
+# ---------------------------------------------------------------------------
+- name: Wait for HardwareProfile CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: hardwareprofiles.infrastructure.opendatahub.io
+
+- name: Apply HardwareProfile
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: infrastructure.opendatahub.io/v1alpha1
+      kind: HardwareProfile
+      metadata:
+        name: nvidia-gpu-1
+        namespace: redhat-ods-applications
+        labels:
+          opendatahub.io/dashboard: "true"
+      spec:
+        displayName: "NVIDIA GPU (1 GPU)"
+        description: "GPU ワークロード用プロファイル (1 GPU)"
+        enabled: true
+        identifiers:
+          - displayName: CPU
+            identifier: cpu
+            minCount: 1
+            maxCount: 8
+            defaultCount: 2
+          - displayName: Memory
+            identifier: memory
+            minCount: "2Gi"
+            maxCount: "64Gi"
+            defaultCount: "8Gi"
+          - displayName: NVIDIA GPU
+            identifier: nvidia.com/gpu
+            minCount: 1
+            maxCount: 1
+            defaultCount: 1
+        tolerations:
+          - key: nvidia.com/gpu
+            operator: Exists
+            effect: NoSchedule
+
+# ---------------------------------------------------------------------------
+# Step 7: MaaS Gateway
+# ---------------------------------------------------------------------------
+- name: Detect TLS cert name for data-science-gateway
+  ansible.builtin.command: >-
+    oc get secret -n openshift-ingress
+    -l gateway.networking.k8s.io/gateway-name=data-science-gateway
+    -o jsonpath='{.items[0].metadata.name}'
+  register: _cert_result
+  changed_when: false
+  failed_when: false
+
+- name: Set cert_name fact
+  ansible.builtin.set_fact:
+    cert_name: "{{ _cert_result.stdout | default('data-science-gateway-service-tls', true) }}"
+
+- name: Apply MaaS Gateway
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: gateway.networking.k8s.io/v1
+      kind: Gateway
+      metadata:
+        name: maas-default-gateway
+        namespace: openshift-ingress
+        annotations:
+          opendatahub.io/managed: "false"
+          security.opendatahub.io/authorino-tls-bootstrap: "true"
+      spec:
+        gatewayClassName: data-science-gateway-class
+        listeners:
+          - name: https
+            hostname: "maas.{{ cluster_domain }}"
+            port: 443
+            protocol: HTTPS
+            tls:
+              mode: Terminate
+              certificateRefs:
+                - name: "{{ cert_name }}"
+            allowedRoutes:
+              namespaces:
+                from: All
+
+- name: Wait for MaaS Gateway Programmed
+  ansible.builtin.command: >-
+    oc get gateway maas-default-gateway -n openshift-ingress
+    -o jsonpath='{.status.conditions[?(@.type=="Programmed")].status}'
+  register: _gw_status
+  until: _gw_status.stdout == "True"
+  retries: 12
+  delay: 10
+  changed_when: false
+
+- name: Remove loadBalancerIP from Gateway service (MetalLB workaround)
+  ansible.builtin.command: >-
+    oc patch svc maas-default-gateway-data-science-gateway-class -n openshift-ingress
+    --type=json -p '[{"op":"remove","path":"/spec/loadBalancerIP"}]'
+  register: _patch_svc
+  changed_when: "'patched' in _patch_svc.stdout and '(no change)' not in _patch_svc.stdout"
+  failed_when: false
+  retries: 3
+  delay: 5
+  until: _patch_svc.rc == 0 or 'not found' in (_patch_svc.stderr | default(''))
+
+# ---------------------------------------------------------------------------
+# Step 8: Namespace labels
+# ---------------------------------------------------------------------------
+- name: Create llm-serving namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: llm-serving
+
+- name: Label llm-serving namespace
+  ansible.builtin.command: >-
+    oc label namespace llm-serving
+    maas.opendatahub.io/gateway-access=true
+    opendatahub.io/generated-namespace=true --overwrite
+  register: _label_llm
+  changed_when: "'not labeled' not in _label_llm.stdout"
+
+- name: Label redhat-ai-gateway-infra namespace
+  ansible.builtin.command: >-
+    oc label namespace redhat-ai-gateway-infra
+    maas.opendatahub.io/gateway-access=true --overwrite
+  register: _label_gw
+  changed_when: "'not labeled' not in _label_gw.stdout"
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Step 9: Authorino TLS
+# ---------------------------------------------------------------------------
+- name: Annotate Authorino service for serving cert
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: authorino-authorino-authorization
+        namespace: openshift-rhcl
+        annotations:
+          service.beta.openshift.io/serving-cert-secret-name: authorino-server-cert
+
+- name: Wait for authorino-server-cert secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: authorino-server-cert
+    namespace: openshift-rhcl
+  register: _authorino_cert
+  until: _authorino_cert.resources | length > 0
+  retries: 12
+  delay: 5
+
+- name: Patch Authorino for TLS
+  ansible.builtin.command: >-
+    oc patch authorino authorino -n openshift-rhcl --type=merge
+    -p '{"spec":{"listener":{"tls":{"enabled":true,"certSecretRef":{"name":"authorino-server-cert"}}}}}'
+  register: _patch_authorino
+  changed_when: "'patched' in _patch_authorino.stdout and '(no change)' not in _patch_authorino.stdout"
+  failed_when: false
+
+- name: Restart Authorino deployment
+  ansible.builtin.command: oc rollout restart deployment/authorino -n openshift-rhcl
+  changed_when: _patch_authorino.changed | default(false)
+  failed_when: false
+  when: _patch_authorino.changed | default(false)
+
+- name: Wait for Authorino rollout
+  ansible.builtin.command: >-
+    oc rollout status deployment/authorino -n openshift-rhcl --timeout=120s
+  changed_when: false
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Step 10: NetworkPolicy — Authorino -> maas-api
+# ---------------------------------------------------------------------------
+- name: Apply Authorino NetworkPolicy
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: networking.k8s.io/v1
+      kind: NetworkPolicy
+      metadata:
+        name: maas-authorino-allow-rhcl
+        namespace: redhat-ai-gateway-infra
+      spec:
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/component: api
+            app.kubernetes.io/name: maas-api
+            app.kubernetes.io/part-of: models-as-a-service
+        policyTypes:
+          - Ingress
+        ingress:
+          - from:
+              - namespaceSelector:
+                  matchLabels:
+                    kubernetes.io/metadata.name: openshift-rhcl
+                podSelector:
+                  matchLabels:
+                    authorino-resource: authorino
+
+# ---------------------------------------------------------------------------
+# Step 11: Proxy configuration (conditional)
+# ---------------------------------------------------------------------------
+- name: Check cluster proxy settings
+  ansible.builtin.command: >-
+    oc get proxy cluster -o jsonpath='{.spec.httpProxy}'
+  register: _http_proxy_result
+  changed_when: false
+  failed_when: false
+
+- name: Configure proxy for RHOAI components
+  when: _http_proxy_result.stdout | length > 0 or (cluster_proxy.http_proxy is defined and cluster_proxy.http_proxy | length > 0)
+  block:
+    - name: Get proxy settings from cluster
+      ansible.builtin.command: >-
+        oc get proxy cluster -o jsonpath='{.spec.{{ item }}}'
+      loop:
+        - httpsProxy
+        - noProxy
+      register: _proxy_results
+      changed_when: false
+      failed_when: false
+
+    - name: Set proxy facts
+      ansible.builtin.set_fact:
+        _http_proxy: "{{ cluster_proxy.http_proxy | default(_http_proxy_result.stdout) }}"
+        _https_proxy: "{{ cluster_proxy.https_proxy | default(_proxy_results.results[0].stdout) }}"
+        _no_proxy: "{{ cluster_proxy.no_proxy | default(_proxy_results.results[1].stdout) }}"
+
+    - name: Warn if cluster noProxy contains .apps
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: クラスター noProxy に .apps が含まれています。
+          MaaS Gateway の通信に影響する可能性があります。
+          確認: oc get proxy cluster -o jsonpath='{.spec.noProxy}'
+      when: "'.apps.' in _no_proxy"
+
+    - name: Set proxy on kube-auth-proxy
+      ansible.builtin.command: >-
+        oc set env deploy/kube-auth-proxy -n openshift-ingress
+        HTTP_PROXY={{ _http_proxy }} HTTPS_PROXY={{ _https_proxy }} NO_PROXY={{ _no_proxy }}
+      register: _set_env_kube_auth
+      changed_when: "'updated' in _set_env_kube_auth.stdout"
+      failed_when: false
+
+    - name: Wait for kube-auth-proxy rollout
+      ansible.builtin.command: >-
+        oc rollout status deploy/kube-auth-proxy -n openshift-ingress --timeout=60s
+      changed_when: false
+      failed_when: false
+
+    - name: Set proxy on rhods-dashboard core-bff
+      ansible.builtin.command: >-
+        oc set env deploy/rhods-dashboard -n redhat-ods-applications -c core-bff
+        HTTP_PROXY={{ _http_proxy }} HTTPS_PROXY={{ _https_proxy }} NO_PROXY={{ _no_proxy }}
+      register: _set_env_dashboard
+      changed_when: "'updated' in _set_env_dashboard.stdout"
+      failed_when: false
+
+    - name: Wait for maas-ui deployment
+      kubernetes.core.k8s_info:
+        api_version: apps/v1
+        kind: Deployment
+        name: maas-ui
+        namespace: redhat-ods-applications
+      register: _maas_ui
+      until: _maas_ui.resources | length > 0
+      retries: 12
+      delay: 10
+      failed_when: false
+
+    - name: Set proxy on maas-ui
+      ansible.builtin.command: >-
+        oc set env deploy/maas-ui -n redhat-ods-applications
+        HTTP_PROXY={{ _http_proxy }} HTTPS_PROXY={{ _https_proxy }} NO_PROXY={{ _no_proxy }}
+      register: _set_env_maas_ui
+      changed_when: "'updated' in _set_env_maas_ui.stdout"
+      failed_when: false
+      when: _maas_ui.resources | default([]) | length > 0
+
+# ---------------------------------------------------------------------------
+# Step 12: Dashboard Feature Flags
+# ---------------------------------------------------------------------------
+- name: Enable Dashboard feature flags
+  ansible.builtin.command: >-
+    oc patch odhdashboardconfig odh-dashboard-config
+    -n redhat-ods-applications --type=merge
+    -p '{"spec":{"dashboardConfig":{"genAiStudio":true,"observabilityDashboard":true}}}'
+  register: _patch_dashboard
+  changed_when: "'patched' in _patch_dashboard.stdout and '(no change)' not in _patch_dashboard.stdout"
+  failed_when: false
+
+# ---------------------------------------------------------------------------
+# Step 13: Config CR + AITenant
+# ---------------------------------------------------------------------------
+- name: Wait for Config CR
+  ansible.builtin.command: oc get configs.maas.opendatahub.io default
+  register: _config_cr
+  until: _config_cr.rc == 0
+  retries: 12
+  delay: 10
+  changed_when: false
+  failed_when: false
+
+- name: Check AITenant bootstrap annotation
+  ansible.builtin.command: >-
+    oc get configs.maas.opendatahub.io default
+    -o jsonpath='{.metadata.annotations.maas\.opendatahub\.io/default-aitenant-bootstrapped}'
+  register: _bootstrap_anno
+  changed_when: false
+  failed_when: false
+
+- name: Check if any AITenant exists
+  ansible.builtin.command: oc get aitenants.maas.opendatahub.io -A --no-headers
+  register: _aitenant_check
+  changed_when: false
+  failed_when: false
+
+- name: Remove stale bootstrap annotation if no AITenant exists
+  ansible.builtin.command: >-
+    oc annotate configs.maas.opendatahub.io default
+    maas.opendatahub.io/default-aitenant-bootstrapped-
+  when:
+    - _bootstrap_anno.stdout == "true"
+    - _aitenant_check.stdout | length == 0
+  register: _remove_anno
+  changed_when: "'annotated' in (_remove_anno.stdout | default(''))"
+  failed_when: false
+
+- name: Wait for AITenant
+  ansible.builtin.command: >-
+    oc get aitenants.maas.opendatahub.io -A
+    -o jsonpath='{.items[0].metadata.name}'
+  register: _aitenant
+  until: _aitenant.stdout | length > 0
+  retries: 30
+  delay: 10
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# Step 14: Gateway ConfigMap + parametersRef
+# ---------------------------------------------------------------------------
+- name: Apply Gateway ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: maas-gateway-options
+        namespace: openshift-ingress
+      data:
+        resources: '{"limits":{"memory":"2Gi"},"requests":{"memory":"2Gi"}}'
+
+- name: Patch Gateway with parametersRef
+  ansible.builtin.command: >-
+    oc patch gateway maas-default-gateway -n openshift-ingress --type=merge
+    -p '{"spec":{"infrastructure":{"parametersRef":{"group":"","kind":"ConfigMap","name":"maas-gateway-options"}}}}'
+  register: _patch_gw
+  changed_when: "'patched' in _patch_gw.stdout and '(no change)' not in _patch_gw.stdout"
+  failed_when: false
+
+# ClusterStorageContainer は llm_serving ロールで管理

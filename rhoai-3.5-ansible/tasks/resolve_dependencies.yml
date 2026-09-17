@@ -1,0 +1,86 @@
+---
+- name: Define dependency table
+  ansible.builtin.set_fact:
+    _deps: >-
+      {{ _dependency_overrides | default({
+        'rhoai': ['cert_manager', 'servicemesh', 'rhcl', 'kueue', 'jobset', 'leaderworkerset', 'nfd', 'gpu_operator'],
+        'llm_serving': ['rhoai'],
+        'maas_resources': ['rhoai', 'llm_serving'],
+        'ogx': ['rhoai', 'odf'],
+        'mlflow': ['rhoai', 'odf'],
+        'guardrails': ['llm_serving'],
+        'observability': ['rhoai'],
+        'keycloak': ['lvm'],
+      }) }}
+
+- name: Check and auto-enable dependencies for rhoai
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['rhoai'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: rhoai
+  when: install_rhoai | default(true)
+
+- name: Check and auto-enable dependencies for llm_serving
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['llm_serving'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: llm_serving
+  when: install_llm_serving | default(true)
+
+- name: Check and auto-enable dependencies for maas_resources
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['maas_resources'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: maas_resources
+  when: install_maas_resources | default(true)
+
+- name: Check and auto-enable dependencies for ogx
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['ogx'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: ogx
+  when: install_ogx | default(true)
+
+- name: Check and auto-enable dependencies for mlflow
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['mlflow'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: mlflow
+  when: install_mlflow | default(true)
+
+- name: Check and auto-enable dependencies for guardrails
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['guardrails'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: guardrails
+  when: install_guardrails | default(true)
+
+- name: Check and auto-enable dependencies for observability
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['observability'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: observability
+  when: install_observability | default(true)
+
+- name: Check and auto-enable dependencies for keycloak
+  ansible.builtin.include_tasks: _resolve_one.yml
+  loop: "{{ _deps['keycloak'] | default([]) }}"
+  loop_control:
+    loop_var: _dep
+  vars:
+    _parent: keycloak
+  when: install_keycloak | default(true)

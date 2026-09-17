@@ -1,0 +1,33 @@
+---
+# 既存リソースがあればスキップ、なければ作成する
+# PVC, StatefulSet, OperatorGroup など immutable spec を持つリソース用
+#
+# パラメータ:
+#   resource_definition: リソース定義 (dict)
+#
+# 使い方:
+#   - name: Create PVC if not exists
+#     ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/create_if_absent.yml"
+#     vars:
+#       resource_definition:
+#         apiVersion: v1
+#         kind: PersistentVolumeClaim
+#         metadata:
+#           name: my-pvc
+#           namespace: my-ns
+#         spec:
+#           ...
+
+- name: "Check if {{ resource_definition.kind }}/{{ resource_definition.metadata.name }} exists"
+  kubernetes.core.k8s_info:
+    api_version: "{{ resource_definition.apiVersion }}"
+    kind: "{{ resource_definition.kind }}"
+    name: "{{ resource_definition.metadata.name }}"
+    namespace: "{{ resource_definition.metadata.namespace | default(omit) }}"
+  register: _existing_resource
+
+- name: "Create {{ resource_definition.kind }}/{{ resource_definition.metadata.name }}"
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ resource_definition }}"
+  when: _existing_resource.resources | length == 0

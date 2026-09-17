@@ -1,0 +1,93 @@
+# ============================================================
+# ソリューション固有設定
+# 各 Role 内でのみ使用。変更の影響範囲は該当 Role に限定。
+# ============================================================
+
+# ---- LVM ----
+# LVMS の VolumeGroup に使うデバイスパス。以下の形式が使用可能:
+#   - /dev/nvme1n1                              (デバイス名 — 再起動で番号が変わる場合あり)
+#   - /dev/disk/by-path/pci-0000:34:00.0-nvme-1 (PCI パス — 再起動でも安定、推奨)
+#   - /dev/disk/by-id/nvme-Amazon_EC2_...       (デバイス ID — インスタンス固有)
+#
+# 確認方法 (ノード上で実行):
+#   # デバイス一覧 (サイズ・モデルで用途を判別):
+#   oc debug node/<node-name> -- chroot /host lsblk -d -o NAME,SIZE,TYPE,MODEL
+#
+#   # デバイス名と by-path の対応表 (どの PCI パスがどのディスクか確認):
+#   oc debug node/<node-name> -- chroot /host bash -c \
+#     'for d in $(lsblk -dn -o NAME | grep nvme); do \
+#       BP=$(find /dev/disk/by-path -lname "*/$d" -printf "%f" 2>/dev/null); \
+#       printf "%-12s %-8s %-40s %s\n" "/dev/$d" \
+#         "$(lsblk -dn -o SIZE /dev/$d)" \
+#         "$(lsblk -dn -o MODEL /dev/$d)" \
+#         "${BP:-(none)}"; \
+#     done'
+#
+# EC2 Instance Storage は再起動でデバイス番号が変わるため by-path を推奨
+lvm_device_paths:
+  - /dev/disk/by-path/pci-0000:34:00.0-nvme-1
+
+# ---- MetalLB ----
+# 空ならノード IP から自動計算
+metallb_ip_range: ""
+
+# ---- LLM Models ----
+# デフォルト値は roles/llm_serving/defaults/main.yml の model_defaults を参照
+# モデルごとに上書きしたいフィールドだけ記述する
+llm_storage_initializer_image: quay.io/modh/kserve-storage-initializer:rhoai-2.22
+models:
+  qwen3-06b:
+    hf_repo: Qwen/Qwen3-0.6B
+    state: present
+    tool_call_parser: qwen3_coder
+    reasoning_parser: qwen3
+
+# ---- Keycloak ----
+keycloak_namespace: keycloak
+keycloak_realm: maas
+keycloak_users:
+  - username: admin1
+    email: admin1@example.com
+    groups: [maas-admins]
+  - username: testuser1
+    email: testuser1@example.com
+    # グループ名は maas-<モデル名>-users の命名規則に従う
+    groups: [maas-qwen3-06b-users]
+
+keycloak_groups:
+  maas-admins:
+    models: ["*"]
+    priority: 20
+    quota_tokens_24h: 5000000
+  # グループ名は maas-<モデル名>-users に合わせる
+  maas-qwen3-06b-users:
+    models: ["qwen3-06b"]
+    priority: 10
+    quota_tokens_24h: 1000000
+
+# ---- Role 有効/無効 ----
+install_lvm: true
+install_metallb: true
+install_cert_manager: true
+install_servicemesh: true
+install_nfd: true
+install_gpu_operator: true
+install_rhcl: true
+install_kueue: true
+install_jobset: true
+install_leaderworkerset: true
+install_odf: true
+install_rhoai: true
+install_keycloak: true
+install_llm_serving: true
+install_maas_resources: true
+install_mlflow: true
+install_ogx: true
+install_guardrails: true
+install_observability: true
+
+# ---- Integration 有効/無効 ----
+integrate_keycloak_oauth: true
+integrate_keycloak_maas: true
+integrate_rhoai_oidc: true
+

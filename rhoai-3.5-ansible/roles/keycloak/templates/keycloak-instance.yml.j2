@@ -1,0 +1,25 @@
+apiVersion: k8s.keycloak.org/v2beta1
+kind: Keycloak
+metadata:
+  name: keycloak
+  namespace: {{ keycloak_namespace }}
+spec:
+  instances: 1
+  hostname:
+    hostname: {{ keycloak_hostname }}
+  http:
+    tlsSecret: keycloak-tls
+    httpEnabled: false
+  ingress:
+    enabled: false
+  db:
+    vendor: postgres
+    host: postgres
+    port: 5432
+    usernameSecret:
+      name: keycloak-db-credentials
+      key: POSTGRES_USER
+    passwordSecret:
+      name: keycloak-db-credentials
+      key: POSTGRES_PASSWORD
+    database: keycloak

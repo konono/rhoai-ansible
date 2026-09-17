@@ -1,0 +1,33 @@
+# Python / Ansible runtime
+.venv/
+.local/
+collections/
+__pycache__/
+*.pyc
+uv.lock
+
+# Vendor (downloaded offline deps — large binaries)
+vendor/
+
+# Environment-specific inventories (keep only sample/)
+inventory/*/group_vars/all/cluster.yml
+inventory/*/group_vars/all/components.yml
+inventory/*/group_vars/all/vault.yml
+!inventory/sample/group_vars/all/*.sample
+
+# Generated files
+.generated-passwords.yml
+.maas-policies-generated.yaml
+
+# Secrets / credentials
+.credentials/
+.kube/
+.vllm-token
+.envrc
+
+# Work logs
+.tracecraft/
+.opencode/
+
+# OS
+.DS_Store

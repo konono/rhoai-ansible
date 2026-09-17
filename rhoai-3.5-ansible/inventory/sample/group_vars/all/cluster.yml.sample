@@ -1,0 +1,60 @@
+# ============================================================
+# クラスター共通設定
+# 複数の Role から参照される。変更は広範囲に影響する。
+# ============================================================
+
+# ---- Ansible Root ----
+# playbook_dir はエントリポイントにより変わるため、role/playbook 横断で使うパスはこの変数を基準にする
+# site.yml (ansible/) → playbook_dir そのまま, playbooks/*.yml → playbook_dir/..
+ansible_root: "{{ playbook_dir ~ ('/..' if '/playbooks' in playbook_dir else '') }}"
+
+# ---- Kubeconfig ----
+# kubernetes.core モジュールが参照する kubeconfig パス
+# 未設定なら KUBECONFIG 環境変数 → ~/.kube/config の順でフォールバック
+# k8s_kubeconfig: /path/to/.kube/config
+
+# ---- ストレージ ----
+# PVC の StorageClass。lvm, odf, keycloak, rhoai, ogx, mlflow 等が参照
+storage_class: lvms-vg1
+
+# ---- Proxy ----
+# 設定すると rhoai role が kube-auth-proxy, rhods-dashboard, maas-ui に注入
+# 空ならスキップ
+cluster_proxy:
+  http_proxy: ""
+  https_proxy: ""
+  no_proxy: "localhost,127.0.0.1,.cluster.local,.svc"
+
+# ---- Operator チャネル ----
+# 全 Operator のバージョンを一元管理
+operator_channels:
+  lvm: stable-4.22
+  metallb: stable
+  cert_manager: stable-v1
+  servicemesh: stable
+  nfd: stable
+  gpu: stable
+  rhcl: stable
+  kueue: stable-v1.4
+  jobset: stable-v1.0
+  leaderworkerset: stable-v1.0
+  coo: stable
+  opentelemetry: stable
+  odf: stable-4.22
+  rhoai: stable-3.5
+  keycloak: stable-v26
+  group_sync: alpha
+
+# ---- CatalogSource ----
+# オンライン環境ではデフォルトのまま使用
+# Disconnected 環境ではミラーカタログの CatalogSource 名に変更する
+catalog_sources:
+  redhat: redhat-operators
+  certified: certified-operators
+  community: community-operators
+
+# ---- DB パスワード ----
+# 空なら自動生成。rhoai, keycloak, ogx が参照
+maas_db_password: ""
+ogx_db_password: ""
+keycloak_db_password: ""

@@ -1,0 +1,32 @@
+---
+# 軽量 preflight — 運用 Playbook (manage_maas_access, llm_add_model 等) 用
+# HF トークン検証や依存解決をスキップする
+- name: Verify oc login
+  ansible.builtin.command: oc whoami
+  changed_when: false
+  register: _oc_user
+
+- name: Show cluster info
+  ansible.builtin.command: oc whoami --show-server
+  changed_when: false
+  register: _oc_server
+
+- name: Display cluster info
+  ansible.builtin.debug:
+    msg: "Cluster: {{ _oc_server.stdout }} / User: {{ _oc_user.stdout }}"
+
+- name: Get cluster domain
+  ansible.builtin.command: >-
+    oc get ingresses.config.openshift.io cluster
+    -o jsonpath='{.spec.domain}'
+  changed_when: false
+  register: _cluster_domain
+
+- name: Set cluster domain fact
+  ansible.builtin.set_fact:
+    cluster_domain: "{{ _cluster_domain.stdout }}"
+
+- name: Load previously generated passwords
+  ansible.builtin.include_vars:
+    file: "{{ ansible_root }}/.generated-passwords.yml"
+  ignore_errors: true

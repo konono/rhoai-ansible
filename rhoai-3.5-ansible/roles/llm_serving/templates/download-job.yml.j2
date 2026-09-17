@@ -1,0 +1,45 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: "download-{{ _model_name }}"
+  namespace: "{{ _model_cfg.namespace }}"
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: download
+          image: registry.access.redhat.com/ubi9/python-311:latest
+          command:
+            - bash
+            - -c
+            - |
+              set -e
+              pip install -q huggingface_hub
+              export HF_XET_HIGH_PERFORMANCE=1
+              hf download {{ _model_cfg.hf_repo }} \
+                --local-dir /models/{{ _model_name }}
+              test -f /models/{{ _model_name }}/config.json || { echo "ERROR: config.json not found"; exit 1; }
+              echo "Download complete"
+              ls -la /models/{{ _model_name }}/
+          env:
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: model-cache
+              mountPath: /models
+      volumes:
+        - name: model-cache
+          persistentVolumeClaim:
+            claimName: hf-model-cache

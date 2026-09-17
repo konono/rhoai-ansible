@@ -1,0 +1,175 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    # k8s_kubeconfig (group_vars) → KUBECONFIG 環境変数 → ~/.kube/config の順でフォールバック
+    # K8S_AUTH_KUBECONFIG: kubernetes.core Python モジュール用
+    # KUBECONFIG: oc コマンド用
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+
+  tasks:
+    # ==================== Preflight ====================
+    - name: Preflight checks
+      ansible.builtin.import_role:
+        name: preflight
+      tags: [always]
+
+    # ==================== Infrastructure ====================
+    - name: LVM Operator
+      ansible.builtin.import_role:
+        name: lvm
+      when: install_lvm
+      tags: [infra, lvm]
+
+    - name: MetalLB
+      ansible.builtin.import_role:
+        name: metallb
+      when: install_metallb
+      tags: [infra, metallb]
+
+    # ==================== Dependency Operators ====================
+    - name: cert-manager
+      ansible.builtin.import_role:
+        name: cert_manager
+      when: install_cert_manager
+      tags: [deps, cert_manager]
+
+    - name: ServiceMesh
+      ansible.builtin.import_role:
+        name: servicemesh
+      when: install_servicemesh
+      tags: [deps, servicemesh]
+
+    - name: Node Feature Discovery
+      ansible.builtin.import_role:
+        name: nfd
+      when: install_nfd
+      tags: [deps, nfd]
+
+    - name: GPU Operator
+      ansible.builtin.import_role:
+        name: gpu_operator
+      when: install_gpu_operator
+      tags: [deps, gpu]
+
+    - name: RHCL (Kuadrant/Authorino)
+      ansible.builtin.import_role:
+        name: rhcl
+      when: install_rhcl
+      tags: [deps, rhcl]
+
+    - name: Kueue
+      ansible.builtin.import_role:
+        name: kueue
+      when: install_kueue
+      tags: [deps, kueue]
+
+    - name: JobSet
+      ansible.builtin.import_role:
+        name: jobset
+      when: install_jobset
+      tags: [deps, jobset]
+
+    - name: LeaderWorkerSet
+      ansible.builtin.import_role:
+        name: leaderworkerset
+      when: install_leaderworkerset
+      tags: [deps, leaderworkerset]
+
+    # ==================== Storage ====================
+    - name: ODF Object Storage
+      ansible.builtin.import_role:
+        name: odf
+      when: install_odf
+      tags: [storage, odf]
+
+    # ==================== Platform ====================
+    - name: OpenShift AI (RHOAI)
+      ansible.builtin.import_role:
+        name: rhoai
+      when: install_rhoai
+      tags: [platform, rhoai]
+
+    - name: Keycloak
+      ansible.builtin.import_role:
+        name: keycloak
+      when: install_keycloak
+      tags: [platform, keycloak]
+
+    # ==================== Integration ====================
+    - name: "Integration: Keycloak → OpenShift OAuth"
+      ansible.builtin.import_role:
+        name: integration_keycloak_oauth
+      when: install_keycloak and integrate_keycloak_oauth
+      tags: [integration, keycloak_oauth]
+
+    - name: "Integration: Keycloak → MaaS Policies"
+      ansible.builtin.import_role:
+        name: integration_keycloak_maas
+      when: install_keycloak and integrate_keycloak_maas
+      tags: [integration, keycloak_maas]
+
+    - name: "Integration: Keycloak → AITenant OIDC"
+      ansible.builtin.import_role:
+        name: integration_rhoai_oidc
+      when: install_keycloak and install_rhoai and integrate_rhoai_oidc
+      tags: [integration, rhoai_oidc]
+
+    # ==================== Workloads ====================
+    - name: MaaS Resources (absent models cleanup + ModelRef)
+      ansible.builtin.import_role:
+        name: maas_resources
+      when: install_maas_resources
+      tags: [workload, maas]
+
+    - name: LLM Serving (llm-d + vLLM)
+      ansible.builtin.import_role:
+        name: llm_serving
+      when: install_llm_serving
+      tags: [workload, llm]
+
+    - name: RH MLflow
+      ansible.builtin.import_role:
+        name: mlflow
+      when: install_mlflow
+      tags: [workload, mlflow]
+
+    - name: OGX Server
+      ansible.builtin.import_role:
+        name: ogx
+      when: install_ogx
+      tags: [workload, ogx]
+
+    - name: NeMo Guardrails
+      ansible.builtin.import_role:
+        name: guardrails
+      when: install_guardrails
+      tags: [workload, guardrails]
+
+    - name: RHOAI Observability
+      ansible.builtin.import_role:
+        name: observability
+      when: install_observability
+      tags: [workload, observability]
+
+    # ==================== Post-deploy ====================
+    - name: OpenCode setup (API Key + opencode.json)
+      ansible.builtin.command: >-
+        bash {{ ansible_root }}/../scripts/setup-opencode.sh setup
+      args:
+        chdir: "{{ ansible_root }}/.."
+      register: _opencode
+      changed_when: "'opencode.json' in _opencode.stdout"
+      failed_when: false
+      tags: [post_deploy, opencode]
+
+    - name: Warn if OpenCode setup failed
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: OpenCode setup failed (rc={{ _opencode.rc }}).
+          API Key / opencode.json が未生成の可能性があります。
+          手動で実行: bash scripts/setup-opencode.sh setup
+      when: _opencode.rc | default(0) != 0
+      tags: [post_deploy, opencode]

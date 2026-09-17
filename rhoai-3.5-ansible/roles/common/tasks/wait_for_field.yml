@@ -1,0 +1,13 @@
+---
+- name: "Wait for {{ res_kind }}/{{ res_name }} {{ res_field }}={{ res_expected }}"
+  kubernetes.core.k8s_info:
+    api_version: "{{ res_api }}"
+    kind: "{{ res_kind }}"
+    name: "{{ res_name }}"
+    namespace: "{{ res_namespace | default(omit) }}"
+  register: _res
+  until: >-
+    _res.resources | length > 0 and
+    _res.resources[0] | community.general.json_query(res_field | regex_replace('^\\.', '')) == res_expected
+  retries: "{{ ((res_timeout | default(300)) | int / 10) | int }}"
+  delay: 10

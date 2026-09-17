@@ -1,0 +1,82 @@
+---
+- name: "Create namespace {{ operator_namespace }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ operator_namespace }}"
+
+- name: "Check existing OperatorGroup in {{ operator_namespace }}"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1
+    kind: OperatorGroup
+    namespace: "{{ operator_namespace }}"
+  register: _existing_og
+
+- name: "Create OperatorGroup in {{ operator_namespace }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1
+      kind: OperatorGroup
+      metadata:
+        name: "{{ operator_name }}"
+        namespace: "{{ operator_namespace }}"
+      spec: "{{ {'targetNamespaces': operator_target_namespaces} if operator_target_namespaces is defined else {} }}"
+  when: _existing_og.resources | length == 0
+
+- name: "Create Subscription {{ operator_name }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: Subscription
+      metadata:
+        name: "{{ operator_name }}"
+        namespace: "{{ operator_namespace }}"
+      spec:
+        channel: "{{ operator_channel }}"
+        name: "{{ operator_name }}"
+        source: "{{ operator_source | default(catalog_sources.redhat) }}"
+        sourceNamespace: openshift-marketplace
+        installPlanApproval: Automatic
+
+- name: "Wait for installedCSV of {{ operator_name }}"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ operator_name }}"
+    namespace: "{{ operator_namespace }}"
+  register: _sub
+  until: >-
+    _sub.resources | length > 0 and
+    _sub.resources[0].status is defined and
+    _sub.resources[0].status.installedCSV is defined and
+    _sub.resources[0].status.installedCSV | length > 0
+  retries: 40
+  delay: 15
+
+- name: "Set CSV name for {{ operator_name }}"
+  ansible.builtin.set_fact:
+    _csv_name: "{{ _sub.resources[0].status.installedCSV }}"
+
+- name: "Wait for CSV {{ _csv_name }} to succeed"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: "{{ _csv_name }}"
+    namespace: "{{ operator_namespace }}"
+  register: _csv
+  until: >-
+    _csv.resources | length > 0 and
+    _csv.resources[0].status is defined and
+    _csv.resources[0].status.phase is defined and
+    _csv.resources[0].status.phase == "Succeeded"
+  retries: 40
+  delay: 15
+
+- name: "Operator {{ operator_name }} installed"
+  ansible.builtin.debug:
+    msg: "{{ _csv_name }} — Succeeded"

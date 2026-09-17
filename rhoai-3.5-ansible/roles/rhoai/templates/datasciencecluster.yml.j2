@@ -1,0 +1,51 @@
+apiVersion: datasciencecluster.opendatahub.io/v2
+kind: DataScienceCluster
+metadata:
+  name: default-dsc
+spec:
+  components:
+    dashboard:
+      managementState: Managed
+    kserve:
+      managementState: "{{ 'Managed' if install_llm_serving else 'Removed' }}"
+      nim:
+        managementState: Removed
+      rawDeploymentServiceConfig: Headless
+    workbenches:
+      managementState: Managed
+      workbenchNamespace: rhods-notebooks
+    ogx:
+      managementState: "{{ 'Managed' if install_ogx else 'Removed' }}"
+    llamastackoperator:
+      managementState: Removed
+    mlflowoperator:
+      managementState: "{{ 'Managed' if install_mlflow else 'Removed' }}"
+    modelregistry:
+      managementState: Managed
+      registriesNamespace: rhoai-model-registries
+    trustyai:
+      managementState: Managed
+      eval:
+        lmeval:
+          permitCodeExecution: deny
+          permitOnline: deny
+    feastoperator:
+      managementState: Managed
+    aipipelines:
+      managementState: Managed
+      argoWorkflowsControllers:
+        managementState: Managed
+    ray:
+      managementState: Managed
+    kueue:
+      managementState: Removed
+    trainingoperator:
+      managementState: Managed
+    trainer:
+      managementState: Managed
+    aigateway:
+      managementState: Managed
+      modelsAsAService:
+        managementState: "{{ 'Managed' if install_maas_resources else 'Removed' }}"
+    nemoguardrails:
+      managementState: "{{ 'Managed' if install_guardrails else 'Removed' }}"

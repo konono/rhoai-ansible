@@ -1,0 +1,59 @@
+---
+- name: Install Cluster Observability Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: cluster-observability-operator
+    operator_namespace: openshift-cluster-observability-operator
+    operator_channel: "{{ operator_channels.coo }}"
+
+- name: Install OpenTelemetry Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: opentelemetry-product
+    operator_namespace: openshift-opentelemetry-operator
+    operator_channel: "{{ operator_channels.opentelemetry }}"
+
+- name: Ensure openshift-user-workload-monitoring namespace exists
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: openshift-user-workload-monitoring
+
+- name: Apply user-workload-monitoring ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: user-workload-monitoring-config
+        namespace: openshift-user-workload-monitoring
+      data:
+        config.yaml: |
+          prometheus:
+            retention: 7d
+            volumeClaimTemplate:
+              spec:
+                storageClassName: {{ storage_class }}
+                resources:
+                  requests:
+                    storage: 40Gi
+
+- name: Check existing ClusterPolicy
+  kubernetes.core.k8s_info:
+    api_version: nvidia.com/v1
+    kind: ClusterPolicy
+    name: gpu-cluster-policy
+  register: _clusterpolicy_existing
+
+- name: Apply observability manifests
+  kubernetes.core.k8s:
+    state: present
+    src: "{{ item }}"
+  loop: "{{ lookup('fileglob', role_path + '/../../../manifests/12-rhoai-observability/*.yaml', wantlist=True) | sort }}"
+  when:
+    - item | basename != 'kustomization.yaml'
+    - item | basename != '05-gpu-utilization.yaml' or _clusterpolicy_existing.resources | length == 0

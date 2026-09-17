@@ -1,0 +1,9 @@
+---
+- name: Install LeaderWorkerSet Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: leader-worker-set
+    operator_namespace: openshift-leaderworkerset
+    operator_channel: "{{ operator_channels.leaderworkerset }}"
+    operator_target_namespaces:
+      - openshift-leaderworkerset

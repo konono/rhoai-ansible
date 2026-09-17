@@ -1,0 +1,28 @@
+---
+# =============================================================================
+# Role: maas_resources — MaaS リソース (Dashboard RBAC)
+# MaaSModelRef は llm_serving role の deploy_model / remove_model で管理
+# AuthPolicy / Subscription は integration_keycloak_maas (manage_maas_access) で管理
+# =============================================================================
+
+- name: Apply Dashboard RBAC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: rbac.authorization.k8s.io/v1
+      kind: ClusterRoleBinding
+      metadata:
+        name: maas-admins-dashboard
+      subjects:
+        - kind: Group
+          name: maas-admins
+          apiGroup: rbac.authorization.k8s.io
+      roleRef:
+        kind: ClusterRole
+        name: cluster-admin
+        apiGroup: rbac.authorization.k8s.io
+
+# NOTE: maas-model-gateway-authpolicy は適用しない
+# maas-controller が maas-gateway-auth を自動管理しており、
+# 両方が存在すると maas-gateway-auth が Enforced: False になり
+# API Key / OIDC 認証が効かなくなる

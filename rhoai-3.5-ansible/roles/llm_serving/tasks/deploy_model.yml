@@ -1,0 +1,243 @@
+---
+# =============================================================================
+# Reusable task: deploy_model — モデルダウンロード + InferenceService デプロイ
+# Required vars: _model_name, _model_cfg (model_defaults | combine(item.value))
+# =============================================================================
+
+- name: "Check if LLMInferenceService already exists ({{ _model_name }})"
+  kubernetes.core.k8s_info:
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    name: "{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+  register: _existing_lis
+
+- name: "Check if model already ready ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _model_already_ready: >-
+      {{ _existing_lis.resources | length > 0 and
+         (_existing_lis.resources[0].status.conditions | default([])
+          | selectattr('type', 'equalto', 'Ready')
+          | selectattr('status', 'equalto', 'True')
+          | list | length > 0) }}
+
+- name: "Check if download Job already completed ({{ _model_name }})"
+  kubernetes.core.k8s_info:
+    api_version: batch/v1
+    kind: Job
+    name: "download-{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+  register: _existing_job
+  when: not (_model_already_ready | bool)
+
+- name: "Check if download Job is currently running ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _job_running: >-
+      {{ _existing_job.resources | default([]) | length > 0 and
+         (_existing_job.resources[0].status.active | default(0)) > 0 }}
+  when: not (_model_already_ready | bool)
+
+- name: "Determine if download is needed ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _download_needed: >-
+      {{ not (_model_already_ready | bool) and
+         not (_job_running | default(false) | bool) and
+         (_existing_job.resources | default([]) | length == 0 or
+          (_existing_job.resources[0].status.succeeded | default(0)) == 0) }}
+
+- name: "Check if model data exists on PVC ({{ _model_name }})"
+  ansible.builtin.shell: |
+    oc run pvc-check-{{ _model_name }} --rm -i --restart=Never \
+      -n {{ _model_cfg.namespace }} \
+      --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
+      --overrides='{
+        "spec": {
+          "containers": [{
+            "name": "check",
+            "image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+            "command": ["test", "-f", "/models/{{ _model_name }}/config.json"],
+            "volumeMounts": [{"name": "cache", "mountPath": "/models"}]
+          }],
+          "volumes": [{"name": "cache", "persistentVolumeClaim": {"claimName": "hf-model-cache"}}]
+        }
+      }' 2>/dev/null
+  register: _pvc_check
+  changed_when: false
+  failed_when: false
+  when: _download_needed | bool
+
+- name: "Skip download — model data already on PVC ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _download_needed: false
+  when: _download_needed | bool and _pvc_check.rc | default(1) == 0
+
+- name: "Delete failed download Job ({{ _model_name }})"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: batch/v1
+    kind: Job
+    name: "download-{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+  when: >-
+    _download_needed | bool and
+    _existing_job.resources | default([]) | length > 0 and
+    (_existing_job.resources[0].status.succeeded | default(0)) == 0
+
+- name: "Create download Job for {{ _model_name }}"
+  kubernetes.core.k8s:
+    state: present
+    template: download-job.yml.j2
+  when: _download_needed | bool
+
+- name: "Wait for running download Job completion ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc wait --for=condition=complete
+    job/download-{{ _model_name }}
+    -n {{ _model_cfg.namespace }} --timeout=3600s
+  changed_when: false
+  when: _job_running | default(false) | bool
+
+- name: "Wait for download Job completion ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc wait --for=condition=complete
+    job/download-{{ _model_name }}
+    -n {{ _model_cfg.namespace }} --timeout=3600s
+  changed_when: false
+  when: _download_needed | bool
+
+- name: "Check cluster GPU capacity"
+  ansible.builtin.command: >-
+    oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+  register: _gpu_allocatable
+  changed_when: false
+  failed_when: false
+  when: not (_model_already_ready | bool)
+
+- name: "Check GPU usage by running pods"
+  ansible.builtin.shell: |
+    oc get pods -A --field-selector=status.phase=Running -o json | \
+      python3 -c "
+    import sys,json
+    data = json.load(sys.stdin)
+    total = 0
+    for pod in data.get('items', []):
+      for c in pod.get('spec', {}).get('containers', []):
+        gpu = c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', '0')
+        total += int(gpu)
+    print(total)
+    "
+  register: _gpu_used
+  changed_when: false
+  failed_when: false
+  when: not (_model_already_ready | bool)
+
+- name: "Determine GPU availability"
+  ansible.builtin.set_fact:
+    _total_gpus: "{{ _gpu_allocatable.stdout_lines | select('ne', '') | map('int') | sum }}"
+    _used_gpus: "{{ _gpu_used.stdout | trim | int }}"
+    _needed_gpus: "{{ _model_cfg.gpu_count }}"
+  when: not (_model_already_ready | bool)
+
+- name: "Calculate GPU deficit"
+  ansible.builtin.set_fact:
+    _available_gpus: "{{ (_total_gpus | int) - (_used_gpus | int) }}"
+    _gpu_deficit: "{{ (_needed_gpus | int) - ((_total_gpus | int) - (_used_gpus | int)) }}"
+  when: not (_model_already_ready | bool)
+
+- name: "Display GPU status"
+  ansible.builtin.debug:
+    msg: >-
+      GPU: total={{ _total_gpus }}, used={{ _used_gpus }}, available={{ _available_gpus }},
+      needed={{ _needed_gpus }}, deficit={{ _gpu_deficit }}
+  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
+
+- name: "Find GPU-consuming deployments to scale down"
+  ansible.builtin.shell: |
+    oc get pods -n {{ _model_cfg.namespace }} --field-selector=status.phase=Running -o json | \
+      python3 -c "
+    import sys,json
+    data = json.load(sys.stdin)
+    deployments = set()
+    for pod in data.get('items', []):
+      for c in pod.get('spec', {}).get('containers', []):
+        gpu = c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', '0')
+        if int(gpu) > 0:
+          for ref in pod.get('metadata', {}).get('ownerReferences', []):
+            if ref.get('kind') == 'ReplicaSet':
+              rs = ref['name']
+              deploy = '-'.join(rs.split('-')[:-1])
+              deployments.add(deploy)
+    for d in sorted(deployments):
+      print(d)
+    "
+  register: _gpu_deployments
+  changed_when: false
+  failed_when: false
+  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
+
+- name: "Scale down GPU deployments for reallocation"
+  ansible.builtin.command: >-
+    oc scale deployment/{{ _gpu_deploy }} -n {{ _model_cfg.namespace }} --replicas=0
+  register: _scale_down
+  changed_when: "'scaled' in _scale_down.stdout"
+  failed_when: false
+  loop: "{{ _gpu_deployments.stdout_lines | default([]) }}"
+  loop_control:
+    loop_var: _gpu_deploy
+  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
+
+- name: "Wait for GPU release"
+  ansible.builtin.shell: |
+    oc get pods -n {{ _model_cfg.namespace }} --field-selector=status.phase=Running -o json | \
+      python3 -c "
+    import sys,json
+    data = json.load(sys.stdin)
+    total = 0
+    for pod in data.get('items', []):
+      for c in pod.get('spec', {}).get('containers', []):
+        gpu = c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', '0')
+        total += int(gpu)
+    print(total)
+    "
+  register: _remaining_gpu
+  until: (_remaining_gpu.stdout | trim | int) <= ((_total_gpus | int) - (_needed_gpus | int))
+  retries: 30
+  delay: 5
+  changed_when: false
+  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
+
+- name: "Apply LLMInferenceService for {{ _model_name }}"
+  kubernetes.core.k8s:
+    state: present
+    template: llminferenceservice.yml.j2
+
+- name: "Apply MaaSModelRef for {{ _model_name }}"
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: maas.opendatahub.io/v1alpha1
+      kind: MaaSModelRef
+      metadata:
+        name: "{{ _model_name }}"
+        namespace: "{{ _model_cfg.namespace }}"
+      spec:
+        modelRef:
+          kind: LLMInferenceService
+          name: "{{ _model_name }}"
+        tenantRef: models-as-a-service
+
+- name: "Wait for LLMInferenceService Ready ({{ _model_name }})"
+  kubernetes.core.k8s_info:
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    name: "{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+  register: _lis_status
+  until: >-
+    _lis_status.resources | length > 0 and
+    (_lis_status.resources[0].status.conditions | default([])
+     | selectattr('type', 'equalto', 'Ready')
+     | selectattr('status', 'equalto', 'True')
+     | list | length > 0)
+  retries: 120
+  delay: 10

@@ -1,0 +1,184 @@
+---
+- name: Verify oc login
+  ansible.builtin.command: oc whoami
+  changed_when: false
+  register: _oc_user
+
+- name: Show cluster info
+  ansible.builtin.command: oc whoami --show-server
+  changed_when: false
+  register: _oc_server
+
+- name: Display cluster info
+  ansible.builtin.debug:
+    msg: "Cluster: {{ _oc_server.stdout }} / User: {{ _oc_user.stdout }}"
+
+- name: Get cluster domain
+  ansible.builtin.command: >-
+    oc get ingresses.config.openshift.io cluster
+    -o jsonpath='{.spec.domain}'
+  changed_when: false
+  register: _cluster_domain
+
+- name: Set cluster domain fact
+  ansible.builtin.set_fact:
+    cluster_domain: "{{ _cluster_domain.stdout }}"
+
+- name: Load previously generated passwords
+  ansible.builtin.include_vars:
+    file: "{{ ansible_root }}/.generated-passwords.yml"
+  ignore_errors: true
+
+- name: Generate maas_db_password if empty
+  ansible.builtin.set_fact:
+    maas_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+  when: maas_db_password | default('') | length == 0
+
+- name: Generate ogx_db_password if empty
+  ansible.builtin.set_fact:
+    ogx_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+  when: ogx_db_password | default('') | length == 0
+
+- name: Generate keycloak_db_password if empty
+  ansible.builtin.set_fact:
+    keycloak_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+  when: keycloak_db_password | default('') | length == 0
+
+- name: Check if passwords file needs update
+  ansible.builtin.set_fact:
+    _passwords_changed: >-
+      {{ (maas_db_password != _prev_maas_db_password | default('')) or
+         (ogx_db_password != _prev_ogx_db_password | default('')) or
+         (keycloak_db_password != _prev_keycloak_db_password | default('')) }}
+  vars:
+    _prev_maas_db_password: "{{ lookup('file', ansible_root ~ '/.generated-passwords.yml', errors='ignore') | regex_search('maas_db_password:\\s*(\\S+)', '\\1') | default([''], true) | first }}"
+    _prev_ogx_db_password: "{{ lookup('file', ansible_root ~ '/.generated-passwords.yml', errors='ignore') | regex_search('ogx_db_password:\\s*(\\S+)', '\\1') | default([''], true) | first }}"
+    _prev_keycloak_db_password: "{{ lookup('file', ansible_root ~ '/.generated-passwords.yml', errors='ignore') | regex_search('keycloak_db_password:\\s*(\\S+)', '\\1') | default([''], true) | first }}"
+
+- name: Save generated passwords to local file
+  ansible.builtin.copy:
+    content: |
+      # Auto-generated passwords — do NOT commit to git
+      # Generated at {{ lookup('pipe', 'date -Iseconds') }}
+      maas_db_password: {{ maas_db_password }}
+      ogx_db_password: {{ ogx_db_password }}
+      keycloak_db_password: {{ keycloak_db_password }}
+    dest: "{{ ansible_root }}/.generated-passwords.yml"
+    mode: "0600"
+  delegate_to: localhost
+  when: _passwords_changed | default(true) | bool
+
+- name: Auto-enable install_lvm when storage_class uses lvms
+  ansible.builtin.set_fact:
+    install_lvm: true
+  when:
+    - storage_class is defined
+    - storage_class is match('lvms-.*')
+    - not (install_lvm | default(true))
+
+- name: Validate models variable is defined
+  ansible.builtin.assert:
+    that:
+      - models is defined
+      - models | length > 0
+    fail_msg: "models 変数が未定義または空です。components.yml を確認してください"
+    quiet: true
+  when: install_llm_serving | default(true)
+
+- name: Validate model names are RFC 1123 compliant
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+    fail_msg: >-
+      models のキー '{{ item }}' は K8s リソース名として不正です。
+      小文字英数字、ハイフン、ドットのみ使用可能です。
+    quiet: true
+  loop: "{{ models | list }}"
+  when: install_llm_serving | default(true)
+
+- name: Validate each model has hf_repo
+  ansible.builtin.assert:
+    that:
+      - item.value.hf_repo is defined and item.value.hf_repo | length > 0
+    fail_msg: "models.{{ item.key }}.hf_repo が未設定です"
+    quiet: true
+  loop: "{{ models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: install_llm_serving | default(true)
+
+- name: Set llm_model_name for backward compatibility (first present model)
+  ansible.builtin.set_fact:
+    llm_model_name: >-
+      {{ (models | dict2items
+          | selectattr('value.state', 'defined')
+          | selectattr('value.state', 'equalto', 'present')
+          | map(attribute='key') | list
+          + models | dict2items
+            | rejectattr('value.state', 'defined')
+            | map(attribute='key') | list)
+         | first | default('') }}
+  when: install_llm_serving | default(true)
+
+- name: Validate keycloak_groups names are RFC 1123 compliant
+  ansible.builtin.assert:
+    that:
+      - item is match('^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$')
+    fail_msg: >-
+      keycloak_groups のキー '{{ item }}' は K8s リソース名として不正です。
+      小文字英数字、ハイフン、ドットのみ使用可能です。
+    quiet: true
+  loop: "{{ keycloak_groups | default({}) | list }}"
+  when: keycloak_groups is defined
+
+- name: Validate required variables
+  ansible.builtin.assert:
+    that:
+      - storage_class is defined and storage_class | length > 0
+      - (lvm_device_paths | default([]) | length > 0) or not (install_lvm | default(true))
+    fail_msg: "必須変数が未設定です。components.yml を確認してください"
+    quiet: true
+
+- name: Validate LLM required variables
+  ansible.builtin.assert:
+    that:
+      - hf_token is defined and hf_token | length > 0
+      - llm_storage_initializer_image is defined and llm_storage_initializer_image | length > 0
+    fail_msg: "必須変数が未設定です。components.yml を確認してください"
+    quiet: true
+  when: install_llm_serving | default(true)
+
+- name: Resolve role dependencies
+  ansible.builtin.include_tasks: "{{ ansible_root }}/tasks/resolve_dependencies.yml"
+
+- name: Display enabled roles
+  ansible.builtin.debug:
+    msg: >-
+      Enabled: {{ ['lvm', 'metallb', 'cert_manager', 'servicemesh', 'nfd',
+        'gpu_operator', 'rhcl', 'kueue', 'jobset', 'leaderworkerset',
+        'odf', 'rhoai', 'keycloak', 'llm_serving', 'maas_resources',
+        'mlflow', 'ogx', 'guardrails', 'observability']
+        | select('match', '.*')
+        | select('in', _enabled_list)
+        | list | join(', ') }}
+  vars:
+    _enabled_list: >-
+      {{ (['lvm'] if install_lvm | default(true) else []) +
+         (['metallb'] if install_metallb | default(true) else []) +
+         (['cert_manager'] if install_cert_manager | default(true) else []) +
+         (['servicemesh'] if install_servicemesh | default(true) else []) +
+         (['nfd'] if install_nfd | default(true) else []) +
+         (['gpu_operator'] if install_gpu_operator | default(true) else []) +
+         (['rhcl'] if install_rhcl | default(true) else []) +
+         (['kueue'] if install_kueue | default(true) else []) +
+         (['jobset'] if install_jobset | default(true) else []) +
+         (['leaderworkerset'] if install_leaderworkerset | default(true) else []) +
+         (['odf'] if install_odf | default(true) else []) +
+         (['rhoai'] if install_rhoai | default(true) else []) +
+         (['keycloak'] if install_keycloak | default(true) else []) +
+         (['llm_serving'] if install_llm_serving | default(true) else []) +
+         (['maas_resources'] if install_maas_resources | default(true) else []) +
+         (['mlflow'] if install_mlflow | default(true) else []) +
+         (['ogx'] if install_ogx | default(true) else []) +
+         (['guardrails'] if install_guardrails | default(true) else []) +
+         (['observability'] if install_observability | default(true) else []) }}

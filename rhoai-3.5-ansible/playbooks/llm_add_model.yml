@@ -1,0 +1,27 @@
+---
+# Deploy models defined in the `models` variable.
+# To deploy a specific model, override its state:
+#   ansible-playbook playbooks/llm_add_model.yml -i inventory/myenv \
+#     -e '{"models": {"qwen3-8b": {"hf_repo": "Qwen/Qwen3-8B", "state": "present"}}}'
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  tasks:
+    - name: Preflight (light)
+      ansible.builtin.include_role:
+        name: preflight
+        tasks_from: light
+
+    - name: Deploy LLM models
+      ansible.builtin.include_role:
+        name: llm_serving
+
+    - name: Manage MaaS access (users + policies)
+      ansible.builtin.include_role:
+        name: keycloak
+        tasks_from: manage_maas_access
+      when: install_keycloak | default(true)

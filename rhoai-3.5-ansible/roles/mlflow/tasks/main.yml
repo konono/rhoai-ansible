@@ -1,0 +1,156 @@
+---
+# =============================================================================
+# Role: mlflow — RH MLflow セットアップ
+# =============================================================================
+
+- name: Create mlflow-workspace namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: mlflow-workspace
+        labels:
+          opendatahub.io/dashboard: "true"
+
+- name: Create MLflow OBC
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: objectbucket.io/v1alpha1
+      kind: ObjectBucketClaim
+      metadata:
+        name: mlflow-obc
+        namespace: mlflow-workspace
+      spec:
+        generateBucketName: mlflow
+        storageClassName: openshift-storage.noobaa.io
+
+- name: Wait for OBC to be bound
+  ansible.builtin.command: >-
+    oc get obc mlflow-obc -n mlflow-workspace
+    -o jsonpath='{.status.phase}'
+  register: _obc_phase
+  until: _obc_phase.stdout == "Bound"
+  retries: 30
+  delay: 10
+  changed_when: false
+
+- name: Apply MLflow API ServiceAccount and RoleBinding
+  kubernetes.core.k8s:
+    state: present
+    definition: "{{ item }}"
+  loop:
+    - apiVersion: v1
+      kind: ServiceAccount
+      metadata:
+        name: mlflow-api
+        namespace: mlflow-workspace
+    - apiVersion: rbac.authorization.k8s.io/v1
+      kind: RoleBinding
+      metadata:
+        name: mlflow-api-admin
+        namespace: mlflow-workspace
+      subjects:
+        - kind: ServiceAccount
+          name: mlflow-api
+          namespace: mlflow-workspace
+      roleRef:
+        kind: ClusterRole
+        name: admin
+        apiGroup: rbac.authorization.k8s.io
+
+# --- NooBaa CA Bundle ---
+- name: Get NooBaa CA cert
+  ansible.builtin.command: >-
+    oc get secret noobaa-s3-serving-cert -n openshift-storage
+    -o jsonpath='{.data.tls\.crt}'
+  register: _noobaa_ca_b64
+  changed_when: false
+  failed_when: false
+
+- name: Apply NooBaa CA bundle ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: noobaa-ca-bundle
+        namespace: mlflow-workspace
+      data:
+        ca-bundle.crt: "{{ _noobaa_ca_b64.stdout | b64decode }}"
+  when: _noobaa_ca_b64.stdout | length > 0
+
+# --- OBC credentials ---
+- name: Get OBC bucket info
+  ansible.builtin.command: >-
+    oc get cm mlflow-obc -n mlflow-workspace
+    -o jsonpath='{.data.{{ item }}}'
+  loop:
+    - BUCKET_NAME
+    - BUCKET_HOST
+    - BUCKET_PORT
+  register: _obc_cm
+  changed_when: false
+
+- name: Get OBC access key
+  ansible.builtin.command: >-
+    oc get secret mlflow-obc -n mlflow-workspace
+    -o jsonpath='{.data.AWS_ACCESS_KEY_ID}'
+  register: _obc_access_key_b64
+  changed_when: false
+
+- name: Get OBC secret key
+  ansible.builtin.command: >-
+    oc get secret mlflow-obc -n mlflow-workspace
+    -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}'
+  register: _obc_secret_key_b64
+  changed_when: false
+
+- name: Set OBC facts
+  ansible.builtin.set_fact:
+    _bucket_name: "{{ _obc_cm.results[0].stdout }}"
+    _s3_endpoint: "https://{{ _obc_cm.results[1].stdout }}:{{ _obc_cm.results[2].stdout }}"
+    _access_key: "{{ _obc_access_key_b64.stdout | b64decode }}"
+    _secret_key: "{{ _obc_secret_key_b64.stdout | b64decode }}"
+
+- name: Create MLflow S3 config Secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: mlflow-s3-config
+        namespace: redhat-ods-applications
+      type: Opaque
+      data:
+        AWS_ACCESS_KEY_ID: "{{ _access_key | b64encode }}"
+        AWS_SECRET_ACCESS_KEY: "{{ _secret_key | b64encode }}"
+        MLFLOW_S3_ENDPOINT_URL: "{{ _s3_endpoint | b64encode }}"
+        AWS_CA_BUNDLE: "{{ '/etc/pki/tls/certs/noobaa-ca/ca-bundle.crt' | b64encode }}"
+        MLFLOW_S3_IGNORE_TLS: "{{ 'true' | b64encode }}"
+
+# --- MLflow instance ---
+- name: Apply MLflow instance
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: mlflow.opendatahub.io/v1
+      kind: MLflow
+      metadata:
+        name: mlflow
+        namespace: redhat-ods-applications
+      spec:
+        defaultArtifactRoot: "s3://{{ _bucket_name }}/artifacts"
+        backendStoreUri: "sqlite:////mlflow/mlflow.db"
+        storage:
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 10Gi
+        envFrom:
+          - secretRef:
+              name: mlflow-s3-config

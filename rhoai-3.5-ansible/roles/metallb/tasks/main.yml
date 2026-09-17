@@ -1,0 +1,81 @@
+---
+- name: Install MetalLB Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: metallb-operator
+    operator_namespace: metallb-system
+    operator_channel: "{{ operator_channels.metallb }}"
+
+- name: Wait for MetalLB CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: metallbs.metallb.io
+
+- name: Create MetalLB instance
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: MetalLB
+      metadata:
+        name: metallb
+        namespace: metallb-system
+
+- name: Wait for MetalLB speaker pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: metallb-system
+    label_selectors:
+      - component=speaker
+    field_selectors:
+      - status.phase=Running
+  register: _speaker
+  until: _speaker.resources | length > 0
+  retries: 12
+  delay: 10
+
+- name: Compute MetalLB IP range from node IP
+  when: metallb_ip_range | default('') | length == 0
+  block:
+    - name: Get node internal IP
+      ansible.builtin.command: >-
+        oc get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'
+      register: _node_ip
+      changed_when: false
+
+    - name: Calculate IP range
+      ansible.builtin.set_fact:
+        metallb_ip_range: >-
+          {{ _node_ip.stdout | regex_replace('\.[0-9]+$', '') }}.{{ (_node_ip.stdout.split('.')[-1] | int) - 1 }}-{{ _node_ip.stdout | regex_replace('\.[0-9]+$', '') }}.{{ (_node_ip.stdout.split('.')[-1] | int) + 5 }}
+
+    - name: Display computed IP range
+      ansible.builtin.debug:
+        msg: "MetalLB IP range (auto): {{ metallb_ip_range }}"
+
+- name: Apply IPAddressPool
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: IPAddressPool
+      metadata:
+        name: default-pool
+        namespace: metallb-system
+      spec:
+        addresses:
+          - "{{ metallb_ip_range }}"
+        autoAssign: true
+
+- name: Apply L2Advertisement
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: metallb.io/v1beta1
+      kind: L2Advertisement
+      metadata:
+        name: default-l2
+        namespace: metallb-system
+      spec:
+        ipAddressPools:
+          - default-pool

@@ -1,0 +1,40 @@
+---
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  tasks:
+    - name: Preflight
+      ansible.builtin.import_role:
+        name: preflight
+        tasks_from: light
+
+    - name: Get maas-api Pod name
+      ansible.builtin.command: >-
+        oc get pods -n redhat-ai-gateway-infra
+        -l app.kubernetes.io/name=maas-api
+        -o jsonpath='{.items[0].metadata.name}'
+      register: _maas_pod
+      changed_when: false
+
+    - name: Fail if maas-api Pod not found
+      ansible.builtin.fail:
+        msg: "maas-api Pod が見つかりません。RHOAI がデプロイ済みか確認してください。"
+      when: _maas_pod.stdout | default('') | length == 0
+
+    - name: Create API key via oc exec
+      ansible.builtin.command: >-
+        oc exec -n redhat-ai-gateway-infra {{ _maas_pod.stdout }}
+        -- curl -sk
+        -X POST https://localhost:8443/v1/api-keys
+        -H 'X-MaaS-Username: {{ api_key_user | default(ansible_user_id) }}'
+        -H 'X-MaaS-Group: ["maas-admins"]'
+        -H 'Content-Type: application/json'
+        -d '{"name":"{{ api_key_name | default("default") }}"}'
+      register: _apikey
+
+    - name: Display API key
+      ansible.builtin.debug:
+        msg: "API Key: {{ (_apikey.stdout | from_json).key }}"

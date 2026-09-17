@@ -1,0 +1,28 @@
+---
+# Post-deploy: OpenCode 設定 + API Key 発行
+# NOTE: site.yml に統合済みのため、通常は単独実行不要です
+# site.yml の OpenCode タスクが失敗した場合の再実行用
+#
+# Usage:
+#   ansible-playbook playbooks/post_deploy.yml -i inventory/myenv
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+
+  tasks:
+    - name: Run OpenCode setup
+      ansible.builtin.command: >-
+        bash {{ ansible_root }}/../scripts/setup-opencode.sh setup
+      args:
+        chdir: "{{ ansible_root }}/.."
+      register: _opencode
+      changed_when: "'opencode.json' in _opencode.stdout"
+      failed_when: false
+
+    - name: Display OpenCode result
+      ansible.builtin.debug:
+        msg: "{{ _opencode.stdout_lines | default(['OpenCode setup skipped']) }}"

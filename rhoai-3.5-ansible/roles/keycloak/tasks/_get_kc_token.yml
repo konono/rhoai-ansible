@@ -1,0 +1,36 @@
+---
+# Get Keycloak admin token and set _kc_token fact
+- name: Get Keycloak admin username
+  ansible.builtin.command: >-
+    oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+    -o jsonpath='{.data.username}'
+  changed_when: false
+  register: _kc_admin_user_b64
+
+- name: Get Keycloak admin password
+  ansible.builtin.command: >-
+    oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+    -o jsonpath='{.data.password}'
+  changed_when: false
+  register: _kc_admin_pass_b64
+
+- name: Obtain Keycloak admin token
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      client_id: admin-cli
+      username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
+      password: "{{ _kc_admin_pass_b64.stdout | b64decode }}"
+      grant_type: password
+    validate_certs: false
+    return_content: true
+  register: _kc_token_response
+  retries: 5
+  delay: 10
+  until: _kc_token_response.status == 200
+
+- name: Set Keycloak token fact
+  ansible.builtin.set_fact:
+    _kc_token: "{{ _kc_token_response.json.access_token }}"

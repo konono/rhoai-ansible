@@ -1,0 +1,54 @@
+---
+# =============================================================================
+# Reusable task: remove_model — absent モデルの LLMInferenceService + MaaSModelRef 削除
+# Required vars: _model_name, _model_cfg
+# =============================================================================
+
+- name: "Delete LLMInferenceService ({{ _model_name }})"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    name: "{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+
+- name: "Wait for GPU Pod termination ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc get pods -n {{ _model_cfg.namespace }}
+    -l app.kubernetes.io/name={{ _model_name }}
+    --field-selector=status.phase=Running
+    --no-headers --ignore-not-found
+  register: _gpu_pods_remaining
+  until: _gpu_pods_remaining.stdout_lines | length == 0
+  retries: 60
+  delay: 5
+  changed_when: false
+  failed_when: false
+
+- name: "Delete MaaSModelRef ({{ _model_name }})"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: MaaSModelRef
+    name: "{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+
+- name: "Purge model data from PVC ({{ _model_name }})"
+  ansible.builtin.shell: |
+    oc run purge-{{ _model_name }} --rm -i --restart=Never \
+      -n {{ _model_cfg.namespace }} \
+      --image=registry.access.redhat.com/ubi9/ubi-minimal:latest \
+      --overrides='{
+        "spec": {
+          "containers": [{
+            "name": "purge",
+            "image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+            "command": ["rm", "-rf", "/models/{{ _model_name }}"],
+            "volumeMounts": [{"name": "cache", "mountPath": "/models"}]
+          }],
+          "volumes": [{"name": "cache", "persistentVolumeClaim": {"claimName": "hf-model-cache"}}]
+        }
+      }' 2>/dev/null
+  changed_when: true
+  failed_when: false
+  when: _model_cfg.purge | default(false) | bool

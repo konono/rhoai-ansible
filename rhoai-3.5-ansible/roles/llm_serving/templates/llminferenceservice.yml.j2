@@ -1,0 +1,81 @@
+apiVersion: serving.kserve.io/v1alpha2
+kind: LLMInferenceService
+metadata:
+  name: "{{ _model_name }}"
+  namespace: "{{ _model_cfg.namespace }}"
+  annotations:
+    alpha.maas.opendatahub.io/tiers: '[]'
+spec:
+  model:
+    uri: "pvc://hf-model-cache/{{ _model_name }}"
+    name: "{{ _model_name }}"
+  replicas: 1
+  router:
+    route: {}
+    gateway:
+      refs:
+        - name: maas-default-gateway
+          namespace: openshift-ingress
+  template:
+    containers:
+      - name: main
+        image: {{ _model_cfg.vllm_image }}
+        args:
+          - "--served-model-name={{ _model_name }}"
+          - --enable-prefix-caching
+          - --gpu-memory-utilization=0.90
+          - --max-model-len=32768
+          - --enforce-eager
+          - --tool-call-parser={{ _model_cfg.tool_call_parser }}
+{% if _model_cfg.reasoning_parser | default('') | length > 0 %}
+          - --reasoning-parser={{ _model_cfg.reasoning_parser }}
+{% endif %}
+          - --enable-auto-tool-choice
+          - --chat-template=/chat-templates/chat_template.jinja
+{% for arg in _model_cfg.vllm_extra_args | default([]) %}
+          - "{{ arg }}"
+{% endfor %}
+        env:
+          - name: HOME
+            value: /tmp
+          - name: LOGNAME
+            value: vllm
+          - name: TORCHINDUCTOR_CACHE_DIR
+            value: /tmp/torchinductor_cache
+          - name: HF_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: hf-token
+                key: HF_TOKEN
+        resources:
+          requests:
+            cpu: "500m"
+            memory: 4Gi
+            nvidia.com/gpu: "1"
+          limits:
+            cpu: "2"
+            memory: 8Gi
+            nvidia.com/gpu: "1"
+        startupProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTPS
+          failureThreshold: 120
+          periodSeconds: 10
+          timeoutSeconds: 1
+        volumeMounts:
+          - name: chat-template
+            mountPath: /chat-templates
+            readOnly: true
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    volumes:
+      - name: chat-template
+        configMap:
+          name: {{ _model_cfg.chat_template_configmap }}
+          items:
+            - key: chat_template.jinja
+              path: chat_template.jinja

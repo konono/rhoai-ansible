@@ -1,0 +1,258 @@
+---
+# roles/keycloak/tasks/manage_maas_access.yml
+# Manage MaaS access: Keycloak users/groups + MaaS AuthPolicy/Subscription from keycloak_groups / keycloak_users / models
+
+- name: Set Keycloak URL
+  ansible.builtin.set_fact:
+    keycloak_hostname: "keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}"
+    keycloak_url: "https://keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}"
+  when: keycloak_url is not defined
+
+- name: Get Keycloak admin token
+  ansible.builtin.include_tasks: _get_kc_token.yml
+
+- name: Set API base URL
+  ansible.builtin.set_fact:
+    _kc_api: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}"
+
+# ==================== Group sync ====================
+- name: Check existing groups
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/groups?search={{ item.key }}&exact=true"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+  register: _group_check
+  loop: "{{ keycloak_groups | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+
+- name: Create missing groups
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/groups"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      name: "{{ item.item.key }}"
+    validate_certs: false
+    status_code: [201, 409]
+  loop: "{{ _group_check.results }}"
+  loop_control:
+    label: "{{ item.item.key }}"
+  when: item.json | length == 0
+
+# ==================== User sync ====================
+- name: Check existing users
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/users?username={{ item.username }}&exact=true"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+  register: _user_check
+  loop: "{{ keycloak_users }}"
+  loop_control:
+    label: "{{ item.username }}"
+
+- name: Ensure .credentials directory exists
+  ansible.builtin.file:
+    path: "{{ ansible_root }}/.credentials"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+
+- name: Check existing password files for new users
+  ansible.builtin.stat:
+    path: "{{ ansible_root }}/.credentials/{{ item.item.username }}.password"
+  register: _pw_file_check
+  delegate_to: localhost
+  loop: "{{ _user_check.results }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  when: item.json | length == 0
+
+- name: Load existing passwords from files
+  ansible.builtin.set_fact:
+    _new_user_passwords: >-
+      {{ _new_user_passwords | default({}) | combine({
+        item.item.item.username: lookup('file', ansible_root ~ '/.credentials/' ~ item.item.item.username ~ '.password')
+      }) }}
+  loop: "{{ _pw_file_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.username | default('skip') }}"
+  when:
+    - item.stat is defined
+    - item.stat.exists
+
+- name: Generate temp passwords for truly new users
+  ansible.builtin.set_fact:
+    _new_user_passwords: >-
+      {{ _new_user_passwords | default({}) | combine({
+        item.item.username: lookup('password', '/dev/null length=12 chars=ascii_letters,digits')
+      }) }}
+  loop: "{{ _user_check.results }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  when:
+    - item.json | length == 0
+    - _new_user_passwords[item.item.username] is not defined
+
+- name: Create missing users with temp password
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/users"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      username: "{{ item.item.username }}"
+      email: "{{ item.item.email }}"
+      emailVerified: true
+      firstName: "{{ item.item.firstName | default(item.item.username) }}"
+      lastName: "{{ item.item.lastName | default('User') }}"
+      enabled: true
+      credentials:
+        - type: password
+          value: "{{ _new_user_passwords[item.item.username] }}"
+          temporary: false
+    validate_certs: false
+    status_code: [201, 409]
+  register: _user_create
+  loop: "{{ _user_check.results }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  when: item.json | length == 0
+
+- name: Save user password locally
+  ansible.builtin.copy:
+    content: "{{ _new_user_passwords[item.item.username] }}"
+    dest: "{{ ansible_root }}/.credentials/{{ item.item.username }}.password"
+    mode: "0600"
+  delegate_to: localhost
+  loop: "{{ _user_check.results }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  when:
+    - item.json | length == 0
+    - _new_user_passwords[item.item.username] is defined
+
+# Re-fetch users for IDs
+- name: Fetch user IDs
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/users?username={{ item.username }}&exact=true"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+  register: _user_ids
+  loop: "{{ keycloak_users }}"
+  loop_control:
+    label: "{{ item.username }}"
+
+# Fetch group IDs
+- name: Collect unique group names
+  ansible.builtin.set_fact:
+    _unique_groups: >-
+      {{ keycloak_users
+         | map(attribute='groups', default=[])
+         | flatten | unique | list }}
+
+- name: Fetch group IDs
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/groups?search={{ item }}&exact=true"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+  register: _group_ids
+  loop: "{{ _unique_groups }}"
+  loop_control:
+    label: "{{ item }}"
+
+- name: Build group name-to-id map
+  ansible.builtin.set_fact:
+    _group_id_map: >-
+      {{ dict(_group_ids.results
+              | map(attribute='item')
+              | zip(_group_ids.results
+                    | map(attribute='json')
+                    | map('json_query', '[0].id || `""`'))) }}
+
+- name: Get current group memberships for users
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/users/{{ item.json[0].id }}/groups"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    return_content: true
+  register: _user_groups
+  loop: "{{ _user_ids.results }}"
+  loop_control:
+    label: "{{ item.item.username }}"
+  when: item.json | length > 0
+  failed_when: false
+
+- name: Build user-to-groups membership map
+  ansible.builtin.set_fact:
+    _user_group_ids: >-
+      {{ dict(_user_groups.results | default([])
+             | selectattr('json', 'defined')
+             | map(attribute='item.item.username')
+             | zip(_user_groups.results | default([])
+                   | selectattr('json', 'defined')
+                   | map(attribute='json')
+                   | map('map', attribute='id')
+                   | map('list'))) }}
+
+- name: Assign users to groups (skip already assigned)
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/users/{{ item.0.json[0].id }}/groups/{{ _group_id_map[item.1] }}"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    status_code: [204, 409]
+  loop: "{{ _user_ids.results | subelements('item.groups', skip_missing=true) }}"
+  loop_control:
+    label: "{{ item.0.item.username }} -> {{ item.1 }}"
+  when:
+    - item.0.json | length > 0
+    - _group_id_map[item.1] | default('') | length > 0
+    - _group_id_map[item.1] not in (_user_group_ids[item.0.item.username] | default([]))
+  failed_when: false
+
+# ==================== MaaS Policies ====================
+- name: Ensure MaasTenantConfig exists
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: maas.opendatahub.io/v1alpha1
+      kind: MaasTenantConfig
+      metadata:
+        name: default-tenant
+        namespace: redhat-ods-applications
+      spec: {}
+  failed_when: false
+
+- name: Generate MaaS policy manifests
+  ansible.builtin.template:
+    src: maas-policies.yml.j2
+    dest: "{{ ansible_root }}/.maas-policies-generated.yaml"
+    mode: "0600"
+  register: _maas_policy_template
+
+- name: Apply MaaS policies
+  ansible.builtin.command: >-
+    oc apply --server-side --force-conflicts -f {{ ansible_root }}/.maas-policies-generated.yaml
+  register: _maas_policy_apply
+  changed_when: "'configured' in _maas_policy_apply.stdout or 'created' in _maas_policy_apply.stdout"
+
+- name: Sync complete
+  ansible.builtin.debug:
+    msg: "Keycloak user/group sync and MaaS policy generation complete"

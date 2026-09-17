@@ -1,0 +1,7 @@
+---
+- name: Install ServiceMesh Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: servicemeshoperator3
+    operator_namespace: openshift-servicemesh
+    operator_channel: "{{ operator_channels.servicemesh }}"

@@ -1,0 +1,3 @@
+---
+keycloak_namespace: keycloak
+keycloak_realm: maas

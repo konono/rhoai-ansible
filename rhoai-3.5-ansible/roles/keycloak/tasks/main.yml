@@ -1,0 +1,417 @@
+---
+# roles/keycloak/tasks/main.yml
+# Keycloak (RHBK) + Group Sync Operator deploy
+
+- name: Set Keycloak hostname
+  ansible.builtin.set_fact:
+    keycloak_hostname: "keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}"
+    keycloak_url: "https://keycloak-{{ keycloak_namespace }}.{{ cluster_domain }}"
+
+- name: Generate DB password (always needed)
+  ansible.builtin.set_fact:
+    keycloak_db_password: >-
+      {{ keycloak_db_password if (keycloak_db_password | default('') | length > 0)
+         else lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}
+
+- name: Set OAuth callback URL
+  ansible.builtin.set_fact:
+    keycloak_oauth_callback_url: "https://oauth-openshift.{{ cluster_domain }}/oauth2callback/keycloak"
+
+- name: Check if realm already imported
+  kubernetes.core.k8s_info:
+    api_version: k8s.keycloak.org/v2beta1
+    kind: KeycloakRealmImport
+    name: maas-realm
+    namespace: "{{ keycloak_namespace }}"
+  register: _existing_realm
+  failed_when: false
+
+- name: Generate oidc_client_secret if not set
+  ansible.builtin.set_fact:
+    oidc_client_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+  when: oidc_client_secret is not defined or oidc_client_secret | length == 0
+
+- name: Generate maas_oidc_client_secret if not set
+  ansible.builtin.set_fact:
+    maas_oidc_client_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+  when: maas_oidc_client_secret is not defined or maas_oidc_client_secret | length == 0
+
+- name: Generate group_sync_password if not set
+  ansible.builtin.set_fact:
+    group_sync_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
+  when: group_sync_password is not defined or group_sync_password | length == 0
+
+- name: Save OIDC secrets to generated-passwords file
+  ansible.builtin.lineinfile:
+    path: "{{ ansible_root }}/.generated-passwords.yml"
+    line: "{{ item.key }}: {{ item.value }}"
+    regexp: "^{{ item.key }}:"
+    create: true
+    mode: "0600"
+  delegate_to: localhost
+  loop:
+    - { key: oidc_client_secret, value: "{{ oidc_client_secret }}" }
+    - { key: maas_oidc_client_secret, value: "{{ maas_oidc_client_secret }}" }
+    - { key: group_sync_password, value: "{{ group_sync_password }}" }
+  loop_control:
+    label: "{{ item.key }}"
+
+# --- Namespace ---
+- name: Create keycloak namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ keycloak_namespace }}"
+
+- name: Check nonroot-v2 SCC RoleBinding
+  kubernetes.core.k8s_info:
+    api_version: rbac.authorization.k8s.io/v1
+    kind: RoleBinding
+    name: "system:openshift:scc:nonroot-v2"
+    namespace: "{{ keycloak_namespace }}"
+  register: _scc_rb
+
+- name: Add nonroot-v2 SCC to default SA
+  ansible.builtin.command: >-
+    oc adm policy add-scc-to-user nonroot-v2 -z default -n {{ keycloak_namespace }}
+  when: _scc_rb.resources | length == 0
+  changed_when: true
+  failed_when: false
+
+# --- RHBK Operator ---
+- name: Install RHBK Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: rhbk-operator
+    operator_namespace: "{{ keycloak_namespace }}"
+    operator_channel: "{{ operator_channels.keycloak }}"
+    operator_source: "{{ catalog_sources.redhat }}"
+    operator_target_namespaces:
+      - "{{ keycloak_namespace }}"
+
+# --- PostgreSQL ---
+- name: Check if Keycloak PostgreSQL StatefulSet exists
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: StatefulSet
+    name: postgres
+    namespace: "{{ keycloak_namespace }}"
+  register: _kc_postgres_sts
+
+- name: Deploy PostgreSQL
+  kubernetes.core.k8s:
+    state: present
+    template: postgres.yml.j2
+  when: _kc_postgres_sts.resources | length == 0
+
+# --- Wait for CRD ---
+- name: Wait for keycloaks CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: keycloaks.k8s.keycloak.org
+
+# --- Wait for PostgreSQL ---
+- name: Wait for PostgreSQL ready
+  ansible.builtin.command: >-
+    oc rollout status sts/postgres -n {{ keycloak_namespace }} --timeout=120s
+  changed_when: false
+
+# --- Keycloak Instance ---
+- name: Deploy Keycloak instance
+  kubernetes.core.k8s:
+    state: present
+    template: keycloak-instance.yml.j2
+
+# --- Wait for keycloak-service and add TLS annotation ---
+- name: Wait for keycloak-service
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    name: keycloak-service
+    namespace: "{{ keycloak_namespace }}"
+  register: _kc_svc
+  until: _kc_svc.resources | length > 0
+  retries: 24
+  delay: 5
+
+- name: Add TLS annotation to keycloak-service
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: keycloak-service
+        namespace: "{{ keycloak_namespace }}"
+        annotations:
+          service.beta.openshift.io/serving-cert-secret-name: keycloak-tls
+
+# --- Wait for Keycloak Ready ---
+- name: Wait for Keycloak Ready
+  kubernetes.core.k8s_info:
+    api_version: k8s.keycloak.org/v2beta1
+    kind: Keycloak
+    name: keycloak
+    namespace: "{{ keycloak_namespace }}"
+  register: _kc
+  until: >-
+    _kc.resources | length > 0 and
+    (_kc.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('')) == 'True'
+  retries: 60
+  delay: 10
+
+# --- service-ca-bundle ConfigMap ---
+- name: Check existing service-ca-bundle ConfigMap
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: service-ca-bundle
+    namespace: "{{ keycloak_namespace }}"
+  register: _ca_bundle_existing
+
+- name: Create service-ca-bundle ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    apply: true
+    server_side_apply:
+      field_manager: ansible
+      force_conflicts: true
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: service-ca-bundle
+        namespace: "{{ keycloak_namespace }}"
+        annotations:
+          service.beta.openshift.io/inject-cabundle: "true"
+      data: {}
+  when: _ca_bundle_existing.resources | length == 0
+
+- name: Wait for CA bundle injection
+  ansible.builtin.pause:
+    seconds: 3
+  when: _ca_bundle_existing.resources | length == 0
+
+# --- Route (reencrypt) ---
+- name: Get destination CA from service-ca-bundle
+  ansible.builtin.command: >-
+    oc get cm service-ca-bundle -n {{ keycloak_namespace }}
+    -o jsonpath='{.data.service-ca\.crt}'
+  changed_when: false
+  failed_when: false
+  register: _dest_ca
+
+- name: Create reencrypt Route
+  kubernetes.core.k8s:
+    state: present
+    template: keycloak-route.yml.j2
+
+- name: Delete auto-created Ingress
+  ansible.builtin.command: >-
+    oc delete ingress -n {{ keycloak_namespace }} -l app=keycloak
+  register: _delete_ingress
+  changed_when: "'deleted' in _delete_ingress.stdout"
+  failed_when: false
+
+# --- Realm Import (first-time only) ---
+- name: First-time realm setup
+  when: (_existing_realm.resources | default([]) | length) == 0
+  block:
+    - name: Import realm
+      kubernetes.core.k8s:
+        state: present
+        template: realm-import.yml.j2
+
+    - name: Wait for realm import
+      kubernetes.core.k8s_info:
+        api_version: k8s.keycloak.org/v2beta1
+        kind: KeycloakRealmImport
+        name: maas-realm
+        namespace: "{{ keycloak_namespace }}"
+      register: _realm
+      until: >-
+        _realm.resources | length > 0 and
+        (_realm.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Done') | map(attribute='status') | first | default('')) == 'True'
+      retries: 24
+      delay: 5
+
+# --- Configure group-sync-sa user via Keycloak API ---
+- name: Get Keycloak admin token
+  ansible.builtin.include_tasks: _get_kc_token.yml
+
+- name: Get group-sync-sa user ID
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users?username=group-sync-sa&exact=true"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    return_content: true
+  register: _sync_user
+  failed_when: false
+
+- name: Set group-sync-sa user ID fact
+  ansible.builtin.set_fact:
+    _sync_user_id: "{{ (_sync_user.json | default([]))[0].id | default('') }}"
+
+- name: Reset group-sync-sa password (first-time realm setup only)
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ _sync_user_id }}/reset-password"
+    method: PUT
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+      Content-Type: application/json
+    body_format: json
+    body:
+      type: password
+      value: "{{ group_sync_password }}"
+      temporary: false
+    validate_certs: false
+    status_code: [204]
+  when:
+    - _sync_user_id | length > 0
+    - group_sync_password is defined
+    - (_existing_realm.resources | default([]) | length) == 0
+  failed_when: false
+
+- name: Get realm-management client ID
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients?clientId=realm-management"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    return_content: true
+  register: _rm_client
+  when: _sync_user_id | length > 0
+  failed_when: false
+
+- name: Set realm-management client ID fact
+  ansible.builtin.set_fact:
+    _rm_client_id: "{{ (_rm_client.json | default([]))[0].id | default('') }}"
+  when: _sync_user_id | length > 0
+
+- name: Get realm-management roles
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/clients/{{ _rm_client_id }}/roles"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    return_content: true
+  register: _rm_roles
+  when: _sync_user_id | length > 0 and _rm_client_id | length > 0
+  failed_when: false
+
+- name: Get existing client role mappings for group-sync-sa
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ _sync_user_id }}/role-mappings/clients/{{ _rm_client_id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    return_content: true
+  register: _existing_role_mappings
+  when:
+    - _sync_user_id | length > 0
+    - _rm_client_id | default('') | length > 0
+  failed_when: false
+
+- name: Compute missing client roles for group-sync-sa
+  ansible.builtin.set_fact:
+    _missing_roles: >-
+      {{ _rm_roles.json | default([])
+         | selectattr('name', 'in', ['query-groups', 'query-users', 'view-users'])
+         | rejectattr('name', 'in', _existing_role_mappings.json | default([]) | map(attribute='name') | list)
+         | list }}
+  when:
+    - _sync_user_id | length > 0
+    - _rm_client_id | default('') | length > 0
+    - _rm_roles.json | default([]) | length > 0
+
+- name: Assign missing client roles to group-sync-sa
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/admin/realms/{{ keycloak_realm }}/users/{{ _sync_user_id }}/role-mappings/clients/{{ _rm_client_id }}"
+    method: POST
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+      Content-Type: application/json
+    body_format: json
+    body: "{{ _missing_roles }}"
+    validate_certs: false
+    status_code: [204]
+  when:
+    - _sync_user_id | length > 0
+    - _rm_client_id | default('') | length > 0
+    - _missing_roles | default([]) | length > 0
+  failed_when: false
+
+# --- Group Sync Operator ---
+- name: Install Group Sync Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: group-sync-operator
+    operator_namespace: group-sync-operator
+    operator_channel: "{{ operator_channels.group_sync }}"
+    operator_source: "{{ catalog_sources.community }}"
+    operator_target_namespaces:
+      - group-sync-operator
+
+- name: Wait for GroupSync CRD
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"
+  vars:
+    crd_name: groupsyncs.redhatcop.redhat.io
+
+# --- Group Sync Secret + CR ---
+- name: Create Group Sync secret
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: keycloak-group-sync
+        namespace: group-sync-operator
+      type: Opaque
+      data:
+        username: "{{ 'group-sync-sa' | b64encode }}"
+        password: "{{ group_sync_password | b64encode }}"
+  when: group_sync_password is defined
+
+- name: Create Group Sync CR
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: redhatcop.redhat.io/v1alpha1
+      kind: GroupSync
+      metadata:
+        name: keycloak-group-sync
+        namespace: group-sync-operator
+      spec:
+        schedule: "*/5 * * * *"
+        providers:
+          - name: keycloak
+            keycloak:
+              realm: "{{ keycloak_realm }}"
+              credentialsSecret:
+                name: keycloak-group-sync
+                namespace: group-sync-operator
+              url: "{{ keycloak_url }}"
+              loginRealm: "{{ keycloak_realm }}"
+              scope: sub
+
+# --- RBAC ---
+- name: Apply RBAC
+  kubernetes.core.k8s:
+    state: present
+    src: "{{ ansible_root }}/../manifests/06-keycloak/09-rbac.yaml"
+  failed_when: false
+
+- name: Display Keycloak info
+  ansible.builtin.debug:
+    msg:
+      - "Keycloak UI: {{ keycloak_url }}"
+      - "OIDC Client Secret: {{ oidc_client_secret | default('(既存 — 初回デプロイ時に生成済み)') }}"

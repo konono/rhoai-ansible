@@ -1,0 +1,94 @@
+apiVersion: k8s.keycloak.org/v2beta1
+kind: KeycloakRealmImport
+metadata:
+  name: maas-realm
+  namespace: {{ keycloak_namespace }}
+spec:
+  keycloakCRName: keycloak
+  realm:
+    realm: {{ keycloak_realm }}
+    enabled: true
+    registrationAllowed: false
+    loginWithEmailAllowed: true
+    duplicateEmailsAllowed: false
+    resetPasswordAllowed: true
+
+    groups:
+{% for group_name in keycloak_groups | default({}) %}
+      - name: {{ group_name }}
+{% endfor %}
+
+    clients:
+      - clientId: openshift-oidc
+        name: OpenShift OIDC
+        enabled: true
+        clientAuthenticatorType: client-secret
+        secret: {{ oidc_client_secret }}
+        standardFlowEnabled: true
+        directAccessGrantsEnabled: true
+        publicClient: false
+        protocol: openid-connect
+        redirectUris:
+          - "{{ keycloak_oauth_callback_url }}"
+        webOrigins:
+          - "+"
+        defaultClientScopes:
+          - openid
+          - email
+          - profile
+          - groups
+        protocolMappers:
+          - name: groups
+            protocol: openid-connect
+            protocolMapper: oidc-group-membership-mapper
+            config:
+              full.path: "false"
+              id.token.claim: "true"
+              access.token.claim: "true"
+              claim.name: "groups"
+              userinfo.token.claim: "true"
+
+      - clientId: maas-oidc
+        name: MaaS OIDC
+        enabled: true
+        clientAuthenticatorType: client-secret
+        secret: {{ maas_oidc_client_secret }}
+        standardFlowEnabled: false
+        directAccessGrantsEnabled: true
+        serviceAccountsEnabled: false
+        publicClient: false
+        protocol: openid-connect
+        defaultClientScopes:
+          - openid
+          - email
+          - profile
+          - groups
+        protocolMappers:
+          - name: groups
+            protocol: openid-connect
+            protocolMapper: oidc-group-membership-mapper
+            config:
+              full.path: "false"
+              id.token.claim: "true"
+              access.token.claim: "true"
+              claim.name: "groups"
+              userinfo.token.claim: "true"
+
+    users:
+      - username: group-sync-sa
+        enabled: true
+        email: group-sync-sa@internal
+        emailVerified: true
+        firstName: Group
+        lastName: Sync
+        credentials:
+          - type: password
+            value: {{ group_sync_password }}
+            temporary: false
+        realmRoles:
+          - default-roles-maas
+        clientRoles:
+          realm-management:
+            - query-groups
+            - query-users
+            - view-users

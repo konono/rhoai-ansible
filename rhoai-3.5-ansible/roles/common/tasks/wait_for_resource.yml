@@ -1,0 +1,16 @@
+---
+- name: "Wait for {{ res_kind }}/{{ res_name }} condition {{ res_condition_type }}={{ res_condition_status | default('True') }}"
+  kubernetes.core.k8s_info:
+    api_version: "{{ res_api }}"
+    kind: "{{ res_kind }}"
+    name: "{{ res_name }}"
+    namespace: "{{ res_namespace | default(omit) }}"
+  register: _res
+  until: >-
+    _res.resources | length > 0 and
+    (_res.resources[0].status.conditions | default([])
+     | selectattr('type', 'equalto', res_condition_type)
+     | selectattr('status', 'equalto', res_condition_status | default('True'))
+     | list | length > 0)
+  retries: "{{ ((res_timeout | default(300)) | int / 10) | int }}"
+  delay: 10

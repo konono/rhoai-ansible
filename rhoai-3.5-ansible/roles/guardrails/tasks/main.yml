@@ -1,0 +1,38 @@
+---
+# =============================================================================
+# Role: guardrails — NeMo Guardrails セットアップ
+# =============================================================================
+
+- name: Apply NeMo Guardrails config ConfigMap
+  kubernetes.core.k8s:
+    state: present
+    template: nemo-guardrails-config.yml.j2
+
+- name: Check existing NemoGuardrails CR
+  kubernetes.core.k8s_info:
+    api_version: trustyai.opendatahub.io/v1alpha1
+    kind: NemoGuardrails
+    name: nemo-guardrails
+    namespace: redhat-ods-applications
+  register: _guardrails_existing
+
+- name: Apply NemoGuardrails CR
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: trustyai.opendatahub.io/v1alpha1
+      kind: NemoGuardrails
+      metadata:
+        name: nemo-guardrails
+        namespace: redhat-ods-applications
+      spec:
+        replicas: 1
+        nemoConfigs:
+          - name: default-model
+            default: true
+            configMaps:
+              - nemo-guardrails-config
+        env: []
+  when: >-
+    _guardrails_existing.resources | length == 0 or
+    _guardrails_existing.resources[0].spec.replicas | default(0) != 1

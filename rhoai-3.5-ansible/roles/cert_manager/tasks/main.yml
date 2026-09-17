@@ -1,0 +1,7 @@
+---
+- name: Install cert-manager Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+  vars:
+    operator_name: openshift-cert-manager-operator
+    operator_namespace: cert-manager-operator
+    operator_channel: "{{ operator_channels.cert_manager }}"
