@@ -45,6 +45,14 @@ operator_channels:
   keycloak: stable-v26
   group_sync: alpha
 
+# ---- CatalogSource ----
+# オンライン環境ではデフォルトのまま使用
+# Disconnected 環境ではミラーカタログの CatalogSource 名に変更する
+catalog_sources:
+  redhat: redhat-operators
+  certified: certified-operators
+  community: community-operators
+
 # ---- DB パスワード ----
 # 空なら自動生成。rhoai, keycloak, ogx が参照
 maas_db_password: ""

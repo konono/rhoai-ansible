@@ -1,7 +1,9 @@
 ---
 # Uninstall playbook — reverse order of site.yml
 #
-# Uses uninstall_<role> variables (defaults to install_<role> from inventory).
+# Uses uninstall_<role> variables, falling back to install_<role> from inventory.
+# If neither is defined, defaults to false (safe — no accidental deletion).
+#
 # Example: uninstall only RHOAI + workloads:
 #   ansible-playbook playbooks/uninstall.yml -i inventory/xxx --tags platform,workload
 #
@@ -26,106 +28,113 @@
     # ==================== Workloads (reverse) ====================
     - name: "Uninstall: Observability"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/observability/tasks/uninstall.yml"
-      when: uninstall_observability | default(install_observability) | default(true)
+      when: uninstall_observability | default(install_observability) | default(false)
       tags: [workload, observability]
 
     - name: "Uninstall: NeMo Guardrails"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/guardrails/tasks/uninstall.yml"
-      when: uninstall_guardrails | default(install_guardrails) | default(true)
+      when: uninstall_guardrails | default(install_guardrails) | default(false)
       tags: [workload, guardrails]
 
     - name: "Uninstall: OGX Server"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/ogx/tasks/uninstall.yml"
-      when: uninstall_ogx | default(install_ogx) | default(true)
+      when: uninstall_ogx | default(install_ogx) | default(false)
       tags: [workload, ogx]
 
     - name: "Uninstall: RH MLflow"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/mlflow/tasks/uninstall.yml"
-      when: uninstall_mlflow | default(install_mlflow) | default(true)
+      when: uninstall_mlflow | default(install_mlflow) | default(false)
       tags: [workload, mlflow]
 
     - name: "Uninstall: MaaS Resources"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/maas_resources/tasks/uninstall.yml"
-      when: uninstall_maas_resources | default(install_maas_resources) | default(true)
+      when: uninstall_maas_resources | default(install_maas_resources) | default(false)
       tags: [workload, maas]
 
     - name: "Uninstall: LLM Serving"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/llm_serving/tasks/uninstall.yml"
-      when: uninstall_llm_serving | default(install_llm_serving) | default(true)
+      when: uninstall_llm_serving | default(install_llm_serving) | default(false)
       tags: [workload, llm]
 
     # ==================== Integration (reverse) ====================
     - name: "Uninstall: Keycloak → AITenant OIDC"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/integration_rhoai_oidc/tasks/uninstall.yml"
-      when: uninstall_rhoai_oidc | default(integrate_rhoai_oidc) | default(true)
+      when: >-
+        (uninstall_keycloak | default(install_keycloak) | default(false)) and
+        (uninstall_rhoai | default(install_rhoai) | default(false)) and
+        (uninstall_rhoai_oidc | default(integrate_rhoai_oidc) | default(false))
       tags: [integration, rhoai_oidc]
 
     - name: "Uninstall: Keycloak → MaaS Policies"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/integration_keycloak_maas/tasks/uninstall.yml"
-      when: uninstall_keycloak_maas | default(integrate_keycloak_maas) | default(true)
+      when: >-
+        (uninstall_keycloak | default(install_keycloak) | default(false)) and
+        (uninstall_keycloak_maas | default(integrate_keycloak_maas) | default(false))
       tags: [integration, keycloak_maas]
 
     - name: "Uninstall: Keycloak → OpenShift OAuth"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/integration_keycloak_oauth/tasks/uninstall.yml"
-      when: uninstall_keycloak_oauth | default(integrate_keycloak_oauth) | default(true)
+      when: >-
+        (uninstall_keycloak | default(install_keycloak) | default(false)) and
+        (uninstall_keycloak_oauth | default(integrate_keycloak_oauth) | default(false))
       tags: [integration, keycloak_oauth]
 
     # ==================== Platform (reverse) ====================
     - name: "Uninstall: Keycloak"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/keycloak/tasks/uninstall.yml"
-      when: uninstall_keycloak | default(install_keycloak) | default(true)
+      when: uninstall_keycloak | default(install_keycloak) | default(false)
       tags: [platform, keycloak]
 
     - name: "Uninstall: OpenShift AI (RHOAI)"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/rhoai/tasks/uninstall.yml"
-      when: uninstall_rhoai | default(install_rhoai) | default(true)
+      when: uninstall_rhoai | default(install_rhoai) | default(false)
       tags: [platform, rhoai]
 
     # ==================== Storage ====================
     - name: "Uninstall: ODF Object Storage"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/odf/tasks/uninstall.yml"
-      when: uninstall_odf | default(install_odf) | default(true)
+      when: uninstall_odf | default(install_odf) | default(false)
       tags: [storage, odf]
 
     # ==================== Dependency Operators (reverse) ====================
     - name: "Uninstall: LeaderWorkerSet"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/leaderworkerset/tasks/uninstall.yml"
-      when: uninstall_leaderworkerset | default(install_leaderworkerset) | default(true)
+      when: uninstall_leaderworkerset | default(install_leaderworkerset) | default(false)
       tags: [deps, leaderworkerset]
 
     - name: "Uninstall: JobSet"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/jobset/tasks/uninstall.yml"
-      when: uninstall_jobset | default(install_jobset) | default(true)
+      when: uninstall_jobset | default(install_jobset) | default(false)
       tags: [deps, jobset]
 
     - name: "Uninstall: Kueue"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/kueue/tasks/uninstall.yml"
-      when: uninstall_kueue | default(install_kueue) | default(true)
+      when: uninstall_kueue | default(install_kueue) | default(false)
       tags: [deps, kueue]
 
     - name: "Uninstall: RHCL (Kuadrant/Authorino)"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/rhcl/tasks/uninstall.yml"
-      when: uninstall_rhcl | default(install_rhcl) | default(true)
+      when: uninstall_rhcl | default(install_rhcl) | default(false)
       tags: [deps, rhcl]
 
     - name: "Uninstall: GPU Operator"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/gpu_operator/tasks/uninstall.yml"
-      when: uninstall_gpu_operator | default(install_gpu_operator) | default(true)
+      when: uninstall_gpu_operator | default(install_gpu_operator) | default(false)
       tags: [deps, gpu]
 
     - name: "Uninstall: Node Feature Discovery"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/nfd/tasks/uninstall.yml"
-      when: uninstall_nfd | default(install_nfd) | default(true)
+      when: uninstall_nfd | default(install_nfd) | default(false)
       tags: [deps, nfd]
 
     - name: "Uninstall: ServiceMesh"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/servicemesh/tasks/uninstall.yml"
-      when: uninstall_servicemesh | default(install_servicemesh) | default(true)
+      when: uninstall_servicemesh | default(install_servicemesh) | default(false)
       tags: [deps, servicemesh]
 
     - name: "Uninstall: cert-manager"
       ansible.builtin.include_tasks: "{{ playbook_dir }}/../roles/cert_manager/tasks/uninstall.yml"
-      when: uninstall_cert_manager | default(install_cert_manager) | default(true)
+      when: uninstall_cert_manager | default(install_cert_manager) | default(false)
       tags: [deps, cert_manager]
 
     # ==================== Infrastructure (reverse) ====================

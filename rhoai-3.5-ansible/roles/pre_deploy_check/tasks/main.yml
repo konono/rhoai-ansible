@@ -41,7 +41,7 @@
         | map(attribute='resources', default=[])
         | flatten
         | selectattr('status.phase', 'defined')
-        | rejectattr('status.phase', 'equalto', 'Succeeded')
+        | selectattr('status.phase', 'in', ['Failed', 'Replacing'])
         | list
       }}
 

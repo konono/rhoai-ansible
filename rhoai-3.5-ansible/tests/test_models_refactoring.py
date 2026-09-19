@@ -98,12 +98,14 @@ class TestDefaultsFile(unittest.TestCase):
 class TestComponentsYml(unittest.TestCase):
     """components.yml の検証"""
 
+    @unittest.skipUnless(COMPONENTS_MYENV.exists(), "inventory/myenv not available")
     def test_myenv_has_models(self):
         data = yaml.safe_load(COMPONENTS_MYENV.read_text())
         self.assertIn("models", data)
         self.assertIsInstance(data["models"], dict)
         self.assertGreater(len(data["models"]), 0)
 
+    @unittest.skipUnless(COMPONENTS_MYENV.exists(), "inventory/myenv not available")
     def test_myenv_no_old_variables(self):
         content = COMPONENTS_MYENV.read_text()
         old_vars = [
@@ -122,11 +124,13 @@ class TestComponentsYml(unittest.TestCase):
                 f"{var}:", content, f"Old variable {var} still in components.yml"
             )
 
+    @unittest.skipUnless(COMPONENTS_MYENV.exists(), "inventory/myenv not available")
     def test_myenv_models_have_hf_repo(self):
         data = yaml.safe_load(COMPONENTS_MYENV.read_text())
         for name, cfg in data["models"].items():
             self.assertIn("hf_repo", cfg, f"models.{name} missing hf_repo")
 
+    @unittest.skipUnless(COMPONENTS_MYENV.exists(), "inventory/myenv not available")
     def test_myenv_models_rfc1123(self):
         data = yaml.safe_load(COMPONENTS_MYENV.read_text())
         pattern = re.compile(r"^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
@@ -143,6 +147,7 @@ class TestComponentsYml(unittest.TestCase):
         content = COMPONENTS_SAMPLE.read_text()
         self.assertNotIn("keycloak_models:", content)
 
+    @unittest.skipUnless(COMPONENTS_MYENV.exists(), "inventory/myenv not available")
     def test_keycloak_groups_reference_models_keys(self):
         """keycloak_groups[].models の値が models の dict キーに含まれるか検証"""
         data = yaml.safe_load(COMPONENTS_MYENV.read_text())
@@ -625,6 +630,12 @@ os.execvp('{sys.executable}', ['{sys.executable}', '-m', 'ansible', 'playbook',
         r = self._syntax_check("playbooks/verify.yml")
         self.assertEqual(
             r.returncode, 0, f"Syntax error in verify.yml:\n{r.stderr}"
+        )
+
+    def test_uninstall(self):
+        r = self._syntax_check("playbooks/uninstall.yml")
+        self.assertEqual(
+            r.returncode, 0, f"Syntax error in uninstall.yml:\n{r.stderr}"
         )
 
 
