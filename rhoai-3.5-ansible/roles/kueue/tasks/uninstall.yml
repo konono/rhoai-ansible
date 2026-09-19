@@ -1,0 +1,8 @@
+---
+# Uninstall: kueue
+
+- name: Uninstall Kueue Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: kueue-operator
+    operator_namespace: openshift-kueue

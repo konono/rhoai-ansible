@@ -206,6 +206,18 @@
   changed_when: false
   when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
 
+- name: "Wait for llmisvc webhook endpoint ready ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc get endpoints llmisvc-webhook-server-service
+    -n redhat-ods-applications
+    -o jsonpath='{.subsets[0].addresses[0].ip}'
+  register: _webhook_ep
+  until: _webhook_ep.rc == 0 and _webhook_ep.stdout | length > 0
+  retries: 24
+  delay: 10
+  changed_when: false
+  when: not (_model_already_ready | bool)
+
 - name: "Apply LLMInferenceService for {{ _model_name }}"
   kubernetes.core.k8s:
     state: present

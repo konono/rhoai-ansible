@@ -1,0 +1,29 @@
+---
+# Uninstall: odf (NooBaa + ODF Operator)
+
+- name: Delete NooBaa
+  kubernetes.core.k8s:
+    state: absent
+    api_version: noobaa.io/v1alpha1
+    kind: NooBaa
+    name: noobaa
+    namespace: openshift-storage
+  failed_when: false
+
+- name: Wait for NooBaa deletion
+  kubernetes.core.k8s_info:
+    api_version: noobaa.io/v1alpha1
+    kind: NooBaa
+    name: noobaa
+    namespace: openshift-storage
+  register: _noobaa
+  until: _noobaa.resources | default([]) | length == 0
+  retries: 30
+  delay: 10
+  failed_when: false
+
+- name: Uninstall ODF Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: odf-operator
+    operator_namespace: openshift-storage

@@ -1,0 +1,165 @@
+---
+# =============================================================================
+# Role: pre_deploy_check — デプロイ前のクラスタ健全性チェック
+#
+# デプロイがハングまたは失敗する原因となる異常状態を事前に検知し、
+# 明確なエラーメッセージと修復手順を表示して早期に fail する。
+# 破壊的な操作は一切行わない。
+# =============================================================================
+
+- name: Define operator namespaces to check
+  ansible.builtin.set_fact:
+    _check_namespaces:
+      - redhat-ods-operator
+      - openshift-servicemesh
+      - openshift-nfd
+      - nvidia-gpu-operator
+      - openshift-rhcl
+      - openshift-kueue
+      - openshift-jobset
+      - openshift-leaderworkerset
+      - openshift-cert-manager-operator
+      - openshift-storage
+
+# =========================================================================
+# Check 1: 異常状態の CSV (Succeeded 以外)
+# =========================================================================
+- name: "Health check: Gather CSVs in operator namespaces"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    namespace: "{{ item }}"
+  register: _csv_results
+  loop: "{{ _check_namespaces }}"
+  failed_when: false
+
+- name: "Health check: Detect stuck CSVs"
+  ansible.builtin.set_fact:
+    _stuck_csvs: >-
+      {{
+        _csv_results.results
+        | map(attribute='resources', default=[])
+        | flatten
+        | selectattr('status.phase', 'defined')
+        | rejectattr('status.phase', 'equalto', 'Succeeded')
+        | list
+      }}
+
+- name: "Health check: FAIL — CSV が異常状態です"
+  ansible.builtin.fail:
+    msg: |
+      以下の CSV が Succeeded 以外の状態です。デプロイがハングする可能性があります。
+
+      {% for csv in _stuck_csvs %}
+      - {{ csv.metadata.namespace }}/{{ csv.metadata.name }}: {{ csv.status.phase }}
+      {% endfor %}
+
+      修復方法:
+        # 該当 CSV を削除して OLM に再インストールさせる
+        {% for csv in _stuck_csvs %}
+        oc delete csv {{ csv.metadata.name }} -n {{ csv.metadata.namespace }}
+        {% endfor %}
+  when: _stuck_csvs | length > 0
+
+# =========================================================================
+# Check 2: Deleting 状態で stuck しているリソース
+# =========================================================================
+- name: "Health check: Gather resources that may be stuck in Deleting"
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api }}"
+    kind: "{{ item.kind }}"
+  register: _deleting_results
+  loop:
+    - { api: "datasciencecluster.opendatahub.io/v1", kind: "DataScienceCluster" }
+    - { api: "dscinitialization.opendatahub.io/v1", kind: "DSCInitialization" }
+    - { api: "components.platform.opendatahub.io/v1alpha1", kind: "MLflowOperator" }
+    - { api: "mlflow.opendatahub.io/v1", kind: "MLflow" }
+  loop_control:
+    label: "{{ item.kind }}"
+  failed_when: false
+
+- name: "Health check: Detect resources stuck in Deleting"
+  ansible.builtin.set_fact:
+    _deleting_resources: >-
+      {{
+        _deleting_results.results
+        | map(attribute='resources', default=[])
+        | flatten
+        | selectattr('metadata.deletionTimestamp', 'defined')
+        | list
+      }}
+
+- name: "Health check: FAIL — リソースが Deleting 状態で停止しています"
+  ansible.builtin.fail:
+    msg: |
+      以下のリソースが削除中 (Deleting) のまま停止しています。
+      ファイナライザーがブロックしている可能性があります。
+
+      {% for r in _deleting_resources %}
+      - {{ r.kind }}/{{ r.metadata.name }} (deletionTimestamp: {{ r.metadata.deletionTimestamp }})
+        finalizers: {{ r.metadata.finalizers | default([]) | join(', ') }}
+      {% endfor %}
+
+      修復方法:
+        # MLflow CR が残っている場合は先に削除 (循環依存の解消)
+        oc delete mlflows.mlflow.opendatahub.io --all --wait=false
+        # ファイナライザーを強制削除する場合
+        {% for r in _deleting_resources %}
+        oc patch {{ r.kind | lower }} {{ r.metadata.name }} {{ '-n ' ~ r.metadata.namespace if r.metadata.namespace is defined else '' }} --type merge -p '{"metadata":{"finalizers":[]}}'
+        {% endfor %}
+  when: _deleting_resources | length > 0
+
+# =========================================================================
+# Check 3: Subscription が ResolutionFailed で installedCSV なし
+# =========================================================================
+- name: "Health check: Gather Subscriptions in operator namespaces"
+  kubernetes.core.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    namespace: "{{ item }}"
+  register: _sub_results
+  loop: "{{ _check_namespaces }}"
+  failed_when: false
+
+- name: "Health check: Detect broken Subscriptions"
+  ansible.builtin.set_fact:
+    _broken_subs: >-
+      {%- set result = [] -%}
+      {%- for sub in _sub_results.results | map(attribute='resources', default=[]) | flatten -%}
+        {%- if sub.status is defined
+            and (sub.status.installedCSV is not defined or sub.status.installedCSV | length == 0)
+            and sub.status.conditions is defined -%}
+          {%- for cond in sub.status.conditions -%}
+            {%- if cond.type == 'ResolutionFailed' and cond.status == 'True' -%}
+              {%- if result.append(sub) -%}{%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ result }}
+
+- name: "Health check: FAIL — Subscription が異常状態です"
+  ansible.builtin.fail:
+    msg: |
+      以下の Subscription が ResolutionFailed で installedCSV がありません。
+      OLM がオペレータを解決できない状態です。
+
+      {% for sub in _broken_subs %}
+      - {{ sub.metadata.namespace }}/{{ sub.metadata.name }}
+        {% for cond in sub.status.conditions | default([]) if cond.type == 'ResolutionFailed' %}
+        message: {{ cond.message | default('N/A') }}
+        {% endfor %}
+      {% endfor %}
+
+      修復方法:
+        # Subscription と残留 CSV を削除して再作成
+        {% for sub in _broken_subs %}
+        oc delete subscription {{ sub.metadata.name }} -n {{ sub.metadata.namespace }}
+        oc delete csv -n {{ sub.metadata.namespace }} --all
+        {% endfor %}
+        # その後 Ansible を再実行
+  when: _broken_subs | length > 0
+
+- name: "Health check: All pre-deploy checks passed"
+  ansible.builtin.debug:
+    msg: "クラスタ健全性チェック OK — 異常な CSV, Deleting リソース, 壊れた Subscription はありません"

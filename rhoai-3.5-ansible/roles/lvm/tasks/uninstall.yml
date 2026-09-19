@@ -1,0 +1,29 @@
+---
+# Uninstall: lvm
+
+- name: Delete LVMCluster
+  kubernetes.core.k8s:
+    state: absent
+    api_version: lvm.topolvm.io/v1alpha1
+    kind: LVMCluster
+    name: lvmcluster
+    namespace: openshift-lvm-storage
+  failed_when: false
+
+- name: Wait for LVMCluster deletion
+  kubernetes.core.k8s_info:
+    api_version: lvm.topolvm.io/v1alpha1
+    kind: LVMCluster
+    name: lvmcluster
+    namespace: openshift-lvm-storage
+  register: _lvm
+  until: _lvm.resources | default([]) | length == 0
+  retries: 30
+  delay: 10
+  failed_when: false
+
+- name: Uninstall LVM Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: lvms-operator
+    operator_namespace: openshift-lvm-storage

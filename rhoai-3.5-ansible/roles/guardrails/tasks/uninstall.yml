@@ -1,0 +1,20 @@
+---
+# Uninstall: guardrails
+
+- name: Delete NemoGuardrails CR
+  kubernetes.core.k8s:
+    state: absent
+    api_version: trustyai.opendatahub.io/v1alpha1
+    kind: NemoGuardrails
+    name: nemo-guardrails
+    namespace: redhat-ods-applications
+  failed_when: false
+
+- name: Delete guardrails config ConfigMap
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    name: nemo-guardrails-config
+    namespace: redhat-ods-applications
+  failed_when: false

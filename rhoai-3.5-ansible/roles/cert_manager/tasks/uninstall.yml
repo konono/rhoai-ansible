@@ -1,0 +1,8 @@
+---
+# Uninstall: cert_manager
+
+- name: Uninstall cert-manager Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: openshift-cert-manager-operator
+    operator_namespace: cert-manager-operator

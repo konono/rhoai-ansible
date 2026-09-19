@@ -1,0 +1,23 @@
+---
+# Uninstall: observability
+
+- name: Delete user-workload-monitoring ConfigMap
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    name: user-workload-monitoring-config
+    namespace: openshift-user-workload-monitoring
+  failed_when: false
+
+- name: Uninstall OpenTelemetry Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: opentelemetry-product
+    operator_namespace: openshift-opentelemetry-operator
+
+- name: Uninstall Cluster Observability Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: cluster-observability-operator
+    operator_namespace: openshift-cluster-observability-operator

@@ -1,0 +1,69 @@
+---
+# Uninstall: llm_serving
+# No operator — resources only (managed by rhoai)
+
+- name: Get all LLMInferenceServices
+  kubernetes.core.k8s_info:
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    namespace: "{{ llm_namespace | default('llm-serving') }}"
+  register: _all_lis
+  failed_when: false
+
+- name: Delete LLMInferenceServices
+  kubernetes.core.k8s:
+    state: absent
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+  loop: "{{ _all_lis.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+
+- name: Get all MaaSModelRef
+  kubernetes.core.k8s_info:
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: MaaSModelRef
+    namespace: "{{ llm_namespace | default('llm-serving') }}"
+  register: _all_refs
+  failed_when: false
+
+- name: Delete MaaSModelRef resources
+  kubernetes.core.k8s:
+    state: absent
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: MaaSModelRef
+    name: "{{ item.metadata.name }}"
+    namespace: "{{ item.metadata.namespace }}"
+  loop: "{{ _all_refs.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  failed_when: false
+
+- name: Delete ClusterStorageContainer
+  kubernetes.core.k8s:
+    state: absent
+    api_version: serving.kserve.io/v1alpha1
+    kind: ClusterStorageContainer
+    name: default
+  failed_when: false
+
+- name: Delete hf-token Secret
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: hf-token
+    namespace: "{{ llm_namespace | default('llm-serving') }}"
+  failed_when: false
+
+- name: Delete model-cache PVC
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: hf-model-cache
+    namespace: "{{ llm_namespace | default('llm-serving') }}"
+  failed_when: false

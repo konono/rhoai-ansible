@@ -1,0 +1,10 @@
+---
+# Uninstall: maas_resources
+
+- name: Delete Dashboard RBAC ClusterRoleBinding
+  kubernetes.core.k8s:
+    state: absent
+    api_version: rbac.authorization.k8s.io/v1
+    kind: ClusterRoleBinding
+    name: maas-admins-dashboard
+  failed_when: false

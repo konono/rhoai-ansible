@@ -16,6 +16,11 @@
         name: preflight
       tags: [always]
 
+    - name: Pre-deploy health checks
+      ansible.builtin.import_role:
+        name: pre_deploy_check
+      tags: [always]
+
     # ==================== Infrastructure ====================
     - name: LVM Operator
       ansible.builtin.import_role:
