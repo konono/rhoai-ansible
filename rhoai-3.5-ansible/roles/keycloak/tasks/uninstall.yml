@@ -1,0 +1,63 @@
+---
+# Uninstall: keycloak
+# Order: GroupSync → group-sync-operator → KeycloakRealmImport → Keycloak → rhbk-operator → namespace
+
+- name: Delete GroupSync
+  kubernetes.core.k8s:
+    state: absent
+    api_version: redhatcop.redhat.io/v1alpha1
+    kind: GroupSync
+    name: keycloak-group-sync
+    namespace: group-sync-operator
+  failed_when: false
+
+- name: Uninstall group-sync-operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: group-sync-operator
+    operator_namespace: group-sync-operator
+
+- name: Delete KeycloakRealmImport
+  kubernetes.core.k8s:
+    state: absent
+    api_version: k8s.keycloak.org/v2beta1
+    kind: KeycloakRealmImport
+    name: maas-realm
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  failed_when: false
+
+- name: Delete Keycloak instance
+  kubernetes.core.k8s:
+    state: absent
+    api_version: k8s.keycloak.org/v2beta1
+    kind: Keycloak
+    name: keycloak
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  failed_when: false
+
+- name: Wait for Keycloak deletion
+  kubernetes.core.k8s_info:
+    api_version: k8s.keycloak.org/v2beta1
+    kind: Keycloak
+    name: keycloak
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  register: _kc
+  until: _kc.resources | default([]) | length == 0
+  retries: 20
+  delay: 10
+  failed_when: false
+
+- name: Delete Keycloak PostgreSQL StatefulSet
+  kubernetes.core.k8s:
+    state: absent
+    api_version: apps/v1
+    kind: StatefulSet
+    name: postgres
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  failed_when: false
+
+- name: Uninstall rhbk-operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: rhbk-operator
+    operator_namespace: "{{ keycloak_namespace | default('keycloak') }}"

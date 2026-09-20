@@ -1,0 +1,20 @@
+---
+# Shared task: uninstall an OLM Operator (Subscription + CSV)
+# Required vars: operator_name, operator_namespace
+
+- name: "Delete Subscription {{ operator_name }}"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: operators.coreos.com/v1alpha1
+    kind: Subscription
+    name: "{{ operator_name }}"
+    namespace: "{{ operator_namespace }}"
+  failed_when: false
+
+- name: "Delete CSVs for {{ operator_name }}"
+  ansible.builtin.shell: >-
+    oc delete csv -n {{ operator_namespace }}
+    -l operators.coreos.com/{{ operator_name }}.{{ operator_namespace }}=
+    --wait=false 2>/dev/null || true
+  changed_when: true
+  failed_when: false

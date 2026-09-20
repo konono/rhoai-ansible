@@ -1,0 +1,47 @@
+---
+# Uninstall: metallb
+
+- name: Delete L2Advertisement
+  kubernetes.core.k8s:
+    state: absent
+    api_version: metallb.io/v1beta1
+    kind: L2Advertisement
+    name: default-l2
+    namespace: metallb-system
+  failed_when: false
+
+- name: Delete IPAddressPool
+  kubernetes.core.k8s:
+    state: absent
+    api_version: metallb.io/v1beta1
+    kind: IPAddressPool
+    name: default-pool
+    namespace: metallb-system
+  failed_when: false
+
+- name: Delete MetalLB instance
+  kubernetes.core.k8s:
+    state: absent
+    api_version: metallb.io/v1beta1
+    kind: MetalLB
+    name: metallb
+    namespace: metallb-system
+  failed_when: false
+
+- name: Wait for MetalLB deletion
+  kubernetes.core.k8s_info:
+    api_version: metallb.io/v1beta1
+    kind: MetalLB
+    name: metallb
+    namespace: metallb-system
+  register: _metallb
+  until: _metallb.resources | default([]) | length == 0
+  retries: 20
+  delay: 10
+  failed_when: false
+
+- name: Uninstall MetalLB Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: metallb-operator
+    operator_namespace: metallb-system

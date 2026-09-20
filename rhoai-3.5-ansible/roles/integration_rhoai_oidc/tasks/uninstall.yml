@@ -1,0 +1,11 @@
+---
+# Uninstall: integration_rhoai_oidc
+
+- name: Delete maas-oidc-client-secret from gateway namespace
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: maas-oidc-client-secret
+    namespace: redhat-ai-gateway-infra
+  failed_when: false

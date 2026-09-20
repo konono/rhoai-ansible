@@ -1,0 +1,37 @@
+---
+# Uninstall: integration_keycloak_oauth
+
+- name: Remove keycloak IdP from OAuth
+  ansible.builtin.shell: >-
+    oc get oauth cluster -o json |
+    python3 -c "
+    import sys, json
+    data = json.load(sys.stdin)
+    idps = data.get('spec', {}).get('identityProviders', [])
+    new_idps = [i for i in idps if i.get('name') != 'keycloak']
+    if len(new_idps) != len(idps):
+        data['spec']['identityProviders'] = new_idps
+        print(json.dumps(data))
+    else:
+        sys.exit(1)
+    " | oc apply -f - 2>/dev/null || true
+  failed_when: false
+  changed_when: true
+
+- name: Delete keycloak-oidc-client-secret
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: keycloak-oidc-client-secret
+    namespace: openshift-config
+  failed_when: false
+
+- name: Delete keycloak-ca ConfigMap
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    name: keycloak-ca
+    namespace: openshift-config
+  failed_when: false

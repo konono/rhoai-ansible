@@ -1,0 +1,16 @@
+---
+# Uninstall: jobset
+
+- name: Delete JobSetOperator CR
+  kubernetes.core.k8s:
+    state: absent
+    api_version: operator.openshift.io/v1
+    kind: JobSetOperator
+    name: cluster
+  failed_when: false
+
+- name: Uninstall JobSet Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: job-set
+    operator_namespace: openshift-jobset

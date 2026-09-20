@@ -1,0 +1,29 @@
+---
+# Uninstall: nfd
+
+- name: Delete NodeFeatureDiscovery
+  kubernetes.core.k8s:
+    state: absent
+    api_version: nfd.openshift.io/v1
+    kind: NodeFeatureDiscovery
+    name: nfd-instance
+    namespace: openshift-nfd
+  failed_when: false
+
+- name: Wait for NodeFeatureDiscovery deletion
+  kubernetes.core.k8s_info:
+    api_version: nfd.openshift.io/v1
+    kind: NodeFeatureDiscovery
+    name: nfd-instance
+    namespace: openshift-nfd
+  register: _nfd
+  until: _nfd.resources | default([]) | length == 0
+  retries: 20
+  delay: 10
+  failed_when: false
+
+- name: Uninstall NFD Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: nfd
+    operator_namespace: openshift-nfd

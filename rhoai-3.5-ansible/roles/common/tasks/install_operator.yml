@@ -51,6 +51,7 @@
     namespace: "{{ operator_namespace }}"
   register: _sub
   until: >-
+    _sub.resources is defined and
     _sub.resources | length > 0 and
     _sub.resources[0].status is defined and
     _sub.resources[0].status.installedCSV is defined and
@@ -70,6 +71,7 @@
     namespace: "{{ operator_namespace }}"
   register: _csv
   until: >-
+    _csv.resources is defined and
     _csv.resources | length > 0 and
     _csv.resources[0].status is defined and
     _csv.resources[0].status.phase is defined and

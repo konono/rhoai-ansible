@@ -1,0 +1,28 @@
+---
+# Uninstall: mlflow
+
+- name: Delete MLflow S3 config Secret
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: mlflow-s3-config
+    namespace: redhat-ods-applications
+  failed_when: false
+
+- name: Delete ObjectBucketClaim
+  kubernetes.core.k8s:
+    state: absent
+    api_version: objectbucket.io/v1alpha1
+    kind: ObjectBucketClaim
+    name: mlflow-obc
+    namespace: mlflow-workspace
+  failed_when: false
+
+- name: Delete mlflow-workspace namespace
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Namespace
+    name: mlflow-workspace
+  failed_when: false

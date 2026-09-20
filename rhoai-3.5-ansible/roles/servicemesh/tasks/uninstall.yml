@@ -1,0 +1,8 @@
+---
+# Uninstall: servicemesh
+
+- name: Uninstall ServiceMesh Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: servicemeshoperator3
+    operator_namespace: openshift-servicemesh

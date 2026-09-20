@@ -1,0 +1,27 @@
+---
+# Uninstall: gpu_operator
+
+- name: Delete ClusterPolicy
+  kubernetes.core.k8s:
+    state: absent
+    api_version: nvidia.com/v1
+    kind: ClusterPolicy
+    name: gpu-cluster-policy
+  failed_when: false
+
+- name: Wait for ClusterPolicy deletion
+  kubernetes.core.k8s_info:
+    api_version: nvidia.com/v1
+    kind: ClusterPolicy
+    name: gpu-cluster-policy
+  register: _cp
+  until: _cp.resources | default([]) | length == 0
+  retries: 30
+  delay: 10
+  failed_when: false
+
+- name: Uninstall GPU Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: gpu-operator-certified
+    operator_namespace: nvidia-gpu-operator

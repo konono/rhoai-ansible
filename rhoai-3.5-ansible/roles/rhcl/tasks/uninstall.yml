@@ -1,0 +1,29 @@
+---
+# Uninstall: rhcl (Kuadrant/Authorino)
+
+- name: Delete Kuadrant CR
+  kubernetes.core.k8s:
+    state: absent
+    api_version: kuadrant.io/v1beta1
+    kind: Kuadrant
+    name: kuadrant
+    namespace: openshift-rhcl
+  failed_when: false
+
+- name: Wait for Kuadrant deletion
+  kubernetes.core.k8s_info:
+    api_version: kuadrant.io/v1beta1
+    kind: Kuadrant
+    name: kuadrant
+    namespace: openshift-rhcl
+  register: _kuadrant
+  until: _kuadrant.resources | default([]) | length == 0
+  retries: 20
+  delay: 10
+  failed_when: false
+
+- name: Uninstall RHCL Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: rhcl-operator
+    operator_namespace: openshift-rhcl

@@ -1,0 +1,8 @@
+---
+# Uninstall: leaderworkerset
+
+- name: Uninstall LeaderWorkerSet Operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: leader-worker-set
+    operator_namespace: openshift-leaderworkerset

@@ -1,0 +1,74 @@
+---
+# Uninstall: rhoai (OpenShift AI)
+# Order: MLflow CR → MLflowOperator (finalizer) → DSC → DSCI → Operator
+
+- name: Delete MLflow CR (prevents MLflowOperator finalizer deadlock)
+  kubernetes.core.k8s:
+    state: absent
+    api_version: mlflow.opendatahub.io/v1
+    kind: MLflow
+    name: mlflow
+  failed_when: false
+
+- name: Wait for MLflow CR deletion
+  kubernetes.core.k8s_info:
+    api_version: mlflow.opendatahub.io/v1
+    kind: MLflow
+    name: mlflow
+  register: _mlflow_cr
+  until: _mlflow_cr.resources | default([]) | length == 0
+  retries: 12
+  delay: 10
+  failed_when: false
+
+- name: Delete MLflowOperator CR
+  kubernetes.core.k8s:
+    state: absent
+    api_version: components.platform.opendatahub.io/v1alpha1
+    kind: MLflowOperator
+    name: default-mlflowoperator
+  failed_when: false
+
+- name: Delete DataScienceCluster
+  kubernetes.core.k8s:
+    state: absent
+    api_version: datasciencecluster.opendatahub.io/v1
+    kind: DataScienceCluster
+    name: default-dsc
+  failed_when: false
+
+- name: Wait for DataScienceCluster deletion
+  kubernetes.core.k8s_info:
+    api_version: datasciencecluster.opendatahub.io/v1
+    kind: DataScienceCluster
+    name: default-dsc
+  register: _dsc
+  until: _dsc.resources | default([]) | length == 0
+  retries: 30
+  delay: 10
+  failed_when: false
+
+- name: Delete DSCInitialization
+  kubernetes.core.k8s:
+    state: absent
+    api_version: dscinitialization.opendatahub.io/v1
+    kind: DSCInitialization
+    name: default-dsci
+  failed_when: false
+
+- name: Wait for DSCInitialization deletion
+  kubernetes.core.k8s_info:
+    api_version: dscinitialization.opendatahub.io/v1
+    kind: DSCInitialization
+    name: default-dsci
+  register: _dsci
+  until: _dsci.resources | default([]) | length == 0
+  retries: 20
+  delay: 10
+  failed_when: false
+
+- name: Uninstall rhods-operator
+  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+  vars:
+    operator_name: rhods-operator
+    operator_namespace: redhat-ods-operator
