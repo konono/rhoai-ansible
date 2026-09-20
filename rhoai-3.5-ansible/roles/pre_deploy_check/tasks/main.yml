@@ -22,7 +22,7 @@
       - openshift-storage
 
 # =========================================================================
-# Check 1: 異常状態の CSV (Succeeded 以外)
+# Check 1: 異常状態の CSV (Failed / Replacing)
 # =========================================================================
 - name: "Health check: Gather CSVs in operator namespaces"
   kubernetes.core.k8s_info:
@@ -48,7 +48,7 @@
 - name: "Health check: FAIL — CSV が異常状態です"
   ansible.builtin.fail:
     msg: |
-      以下の CSV が Succeeded 以外の状態です。デプロイがハングする可能性があります。
+      以下の CSV が Failed / Replacing 状態です。デプロイがハングする可能性があります。
 
       {% for csv in _stuck_csvs %}
       - {{ csv.metadata.namespace }}/{{ csv.metadata.name }}: {{ csv.status.phase }}

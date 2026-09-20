@@ -7,6 +7,9 @@
 # Example: uninstall only RHOAI + workloads:
 #   ansible-playbook playbooks/uninstall.yml -i inventory/xxx --tags platform,workload
 #
+# To uninstall a specific role not enabled in inventory:
+#   ansible-playbook playbooks/uninstall.yml -i inventory/xxx --tags platform,rhoai -e uninstall_rhoai=true
+#
 # WARNING: This playbook deletes resources. Use with care.
 
 - hosts: localhost
