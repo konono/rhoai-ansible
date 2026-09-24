@@ -4,7 +4,7 @@
   vars:
     operator_name: metallb-operator
     operator_namespace: metallb-system
-    operator_channel: "{{ operator_channels.metallb }}"
+    operator_channel: "{{ operator_channels.metallb_operator }}"
 
 - name: Wait for MetalLB CRD
   ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"

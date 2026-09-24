@@ -28,22 +28,22 @@ cluster_proxy:
 # ---- Operator チャネル ----
 # 全 Operator のバージョンを一元管理
 operator_channels:
-  lvm: stable-4.22
-  metallb: stable
-  cert_manager: stable-v1
-  servicemesh: stable
+  lvms_operator: stable-4.22
+  metallb_operator: stable
+  openshift_cert_manager_operator: stable-v1
+  servicemeshoperator3: stable
   nfd: stable
-  gpu: stable
-  rhcl: stable
-  kueue: stable-v1.4
-  jobset: stable-v1.0
-  leaderworkerset: stable-v1.0
-  coo: stable
-  opentelemetry: stable
-  odf: stable-4.22
-  rhoai: stable-3.5
-  keycloak: stable-v26
-  group_sync: alpha
+  gpu_operator_certified: stable
+  rhcl_operator: stable
+  kueue_operator: stable-v1.4
+  job_set: stable-v1.0
+  leader_worker_set: stable-v1.0
+  cluster_observability_operator: stable
+  opentelemetry_product: stable
+  odf_operator: stable-4.22
+  rhods_operator: stable-3.5
+  rhbk_operator: stable-v26
+  group_sync_operator: alpha
 
 # ---- CatalogSource ----
 # オンライン環境ではデフォルトのまま使用

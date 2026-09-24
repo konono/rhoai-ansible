@@ -4,7 +4,7 @@
   vars:
     operator_name: job-set
     operator_namespace: openshift-jobset
-    operator_channel: "{{ operator_channels.jobset }}"
+    operator_channel: "{{ operator_channels.job_set }}"
     operator_target_namespaces:
       - openshift-jobset
 

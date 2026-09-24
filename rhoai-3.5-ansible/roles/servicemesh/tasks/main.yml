@@ -4,4 +4,4 @@
   vars:
     operator_name: servicemeshoperator3
     operator_namespace: openshift-servicemesh
-    operator_channel: "{{ operator_channels.servicemesh }}"
+    operator_channel: "{{ operator_channels.servicemeshoperator3 }}"

@@ -4,4 +4,4 @@
   vars:
     operator_name: kueue-operator
     operator_namespace: openshift-kueue
-    operator_channel: "{{ operator_channels.kueue }}"
+    operator_channel: "{{ operator_channels.kueue_operator }}"

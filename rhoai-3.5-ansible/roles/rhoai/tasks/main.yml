@@ -11,7 +11,7 @@
   vars:
     operator_name: rhods-operator
     operator_namespace: redhat-ods-operator
-    operator_channel: "{{ operator_channels.rhoai }}"
+    operator_channel: "{{ operator_channels.rhods_operator }}"
     operator_target_namespaces: []
 
 - name: Get cluster domain

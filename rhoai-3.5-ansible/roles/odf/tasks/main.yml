@@ -4,7 +4,7 @@
   vars:
     operator_name: odf-operator
     operator_namespace: openshift-storage
-    operator_channel: "{{ operator_channels.odf }}"
+    operator_channel: "{{ operator_channels.odf_operator }}"
     operator_target_namespaces:
       - openshift-storage
 

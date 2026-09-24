@@ -32,7 +32,7 @@
   vars:
     operator_name: lvms-operator
     operator_namespace: openshift-lvm-storage
-    operator_channel: "{{ operator_channels.lvm }}"
+    operator_channel: "{{ operator_channels.lvms_operator }}"
     operator_target_namespaces:
       - openshift-lvm-storage
 

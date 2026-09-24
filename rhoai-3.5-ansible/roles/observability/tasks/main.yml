@@ -4,14 +4,14 @@
   vars:
     operator_name: cluster-observability-operator
     operator_namespace: openshift-cluster-observability-operator
-    operator_channel: "{{ operator_channels.coo }}"
+    operator_channel: "{{ operator_channels.cluster_observability_operator }}"
 
 - name: Install OpenTelemetry Operator
   ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
   vars:
     operator_name: opentelemetry-product
     operator_namespace: openshift-opentelemetry-operator
-    operator_channel: "{{ operator_channels.opentelemetry }}"
+    operator_channel: "{{ operator_channels.opentelemetry_product }}"
 
 - name: Ensure openshift-user-workload-monitoring namespace exists
   kubernetes.core.k8s:

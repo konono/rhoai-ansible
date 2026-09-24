@@ -4,7 +4,7 @@
   vars:
     operator_name: gpu-operator-certified
     operator_namespace: nvidia-gpu-operator
-    operator_channel: "{{ operator_channels.gpu }}"
+    operator_channel: "{{ operator_channels.gpu_operator_certified }}"
     operator_target_namespaces:
       - nvidia-gpu-operator
     operator_source: "{{ catalog_sources.certified }}"

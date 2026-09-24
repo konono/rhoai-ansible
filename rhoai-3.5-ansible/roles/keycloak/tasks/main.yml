@@ -87,7 +87,7 @@
   vars:
     operator_name: rhbk-operator
     operator_namespace: "{{ keycloak_namespace }}"
-    operator_channel: "{{ operator_channels.keycloak }}"
+    operator_channel: "{{ operator_channels.rhbk_operator }}"
     operator_source: "{{ catalog_sources.redhat }}"
     operator_target_namespaces:
       - "{{ keycloak_namespace }}"
@@ -355,7 +355,7 @@
   vars:
     operator_name: group-sync-operator
     operator_namespace: group-sync-operator
-    operator_channel: "{{ operator_channels.group_sync }}"
+    operator_channel: "{{ operator_channels.group_sync_operator }}"
     operator_source: "{{ catalog_sources.community }}"
     operator_target_namespaces:
       - group-sync-operator

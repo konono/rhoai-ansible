@@ -4,7 +4,7 @@
   vars:
     operator_name: rhcl-operator
     operator_namespace: openshift-rhcl
-    operator_channel: "{{ operator_channels.rhcl }}"
+    operator_channel: "{{ operator_channels.rhcl_operator }}"
 
 - name: Wait for Kuadrant CRD
   ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/wait_for_crd.yml"

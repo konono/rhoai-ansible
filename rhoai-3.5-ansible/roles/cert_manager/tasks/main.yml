@@ -4,4 +4,4 @@
   vars:
     operator_name: openshift-cert-manager-operator
     operator_namespace: cert-manager-operator
-    operator_channel: "{{ operator_channels.cert_manager }}"
+    operator_channel: "{{ operator_channels.openshift_cert_manager_operator }}"

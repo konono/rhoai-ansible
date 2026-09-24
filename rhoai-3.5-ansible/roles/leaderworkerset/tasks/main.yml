@@ -4,6 +4,6 @@
   vars:
     operator_name: leader-worker-set
     operator_namespace: openshift-leaderworkerset
-    operator_channel: "{{ operator_channels.leaderworkerset }}"
+    operator_channel: "{{ operator_channels.leader_worker_set }}"
     operator_target_namespaces:
       - openshift-leaderworkerset
