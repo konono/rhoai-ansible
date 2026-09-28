@@ -1,29 +1,38 @@
 ---
 # Uninstall: odf (NooBaa + ODF Operator)
+# Ref: https://docs.redhat.com/en/documentation/red_hat_openshift_data_foundation/4.18/html/deploying_openshift_data_foundation_on_vmware_vsphere/uninstalling_openshift_data_foundation
+# Order: NooBaa → Operator + namespace
 
-- name: Delete NooBaa
-  kubernetes.core.k8s:
-    state: absent
-    api_version: noobaa.io/v1alpha1
-    kind: NooBaa
-    name: noobaa
-    namespace: openshift-storage
-  failed_when: false
+- block:
+    - name: Delete NooBaa
+      kubernetes.core.k8s:
+        state: absent
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: noobaa
+        namespace: openshift-storage
+      failed_when: false
 
-- name: Wait for NooBaa deletion
-  kubernetes.core.k8s_info:
-    api_version: noobaa.io/v1alpha1
-    kind: NooBaa
-    name: noobaa
-    namespace: openshift-storage
-  register: _noobaa
-  until: _noobaa.resources | default([]) | length == 0
-  retries: 30
-  delay: 10
-  failed_when: false
+    - name: Wait for NooBaa deletion
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: noobaa
+        namespace: openshift-storage
+      register: _noobaa
+      until: _noobaa.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
+      failed_when: false
 
-- name: Uninstall ODF Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: odf-operator
-    operator_namespace: openshift-storage
+    - name: Uninstall ODF Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: odf-operator
+        operator_namespace: openshift-storage
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          ODF Object Storage のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags storage,odf -e uninstall_odf=true

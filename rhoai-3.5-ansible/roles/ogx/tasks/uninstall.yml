@@ -1,47 +1,54 @@
 ---
 # Uninstall: ogx
 
-- name: Delete OGX vllm connection Secret
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: Secret
-    name: ogx-vllm-connection
-    namespace: redhat-ods-applications
-  failed_when: false
+- block:
+    - name: Delete OGX vllm connection Secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: ogx-vllm-connection
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Delete OGX PostgreSQL credentials Secret
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: Secret
-    name: ogx-postgres-credentials
-    namespace: redhat-ods-applications
-  failed_when: false
+    - name: Delete OGX PostgreSQL credentials Secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: ogx-postgres-credentials
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Delete OGX PostgreSQL Service
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: Service
-    name: ogx-postgres
-    namespace: redhat-ods-applications
-  failed_when: false
+    - name: Delete OGX PostgreSQL Service
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Service
+        name: ogx-postgres
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Delete OGX PostgreSQL StatefulSet
-  kubernetes.core.k8s:
-    state: absent
-    api_version: apps/v1
-    kind: StatefulSet
-    name: ogx-postgres
-    namespace: redhat-ods-applications
-  failed_when: false
+    - name: Delete OGX PostgreSQL StatefulSet
+      kubernetes.core.k8s:
+        state: absent
+        api_version: apps/v1
+        kind: StatefulSet
+        name: ogx-postgres
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Delete OGX PostgreSQL PVC
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: PersistentVolumeClaim
-    name: ogx-postgres-data
-    namespace: redhat-ods-applications
-  failed_when: false
+    - name: Delete OGX PostgreSQL PVC
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: ogx-postgres-data
+        namespace: redhat-ods-applications
+      failed_when: false
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          OGX Server のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,ogx -e uninstall_ogx=true

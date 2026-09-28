@@ -1,23 +1,31 @@
 ---
 # Uninstall: observability
+# Order: ConfigMap → OpenTelemetry Operator → Cluster Observability Operator
 
-- name: Delete user-workload-monitoring ConfigMap
-  kubernetes.core.k8s:
-    state: absent
-    api_version: v1
-    kind: ConfigMap
-    name: user-workload-monitoring-config
-    namespace: openshift-user-workload-monitoring
-  failed_when: false
+- block:
+    - name: Delete user-workload-monitoring ConfigMap
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: user-workload-monitoring-config
+        namespace: openshift-user-workload-monitoring
+      failed_when: false
 
-- name: Uninstall OpenTelemetry Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: opentelemetry-product
-    operator_namespace: openshift-opentelemetry-operator
+    - name: Uninstall OpenTelemetry Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: opentelemetry-product
+        operator_namespace: openshift-opentelemetry-operator
 
-- name: Uninstall Cluster Observability Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: cluster-observability-operator
-    operator_namespace: openshift-cluster-observability-operator
+    - name: Uninstall Cluster Observability Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: cluster-observability-operator
+        operator_namespace: openshift-cluster-observability-operator
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          Observability のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,observability -e uninstall_observability=true

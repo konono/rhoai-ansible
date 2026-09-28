@@ -1,9 +1,16 @@
 ---
-- name: Install LeaderWorkerSet Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
-  vars:
-    operator_name: leader-worker-set
-    operator_namespace: openshift-leaderworkerset
-    operator_channel: "{{ operator_channels.leader_worker_set }}"
-    operator_target_namespaces:
-      - openshift-leaderworkerset
+- block:
+    - name: Install LeaderWorkerSet Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+      vars:
+        operator_name: leader-worker-set
+        operator_namespace: openshift-leaderworkerset
+        operator_channel: "{{ operator_channels.leader_worker_set }}"
+        operator_target_namespaces:
+          - openshift-leaderworkerset
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          LeaderWorkerSet のインストールに失敗しました。
+          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,leaderworkerset

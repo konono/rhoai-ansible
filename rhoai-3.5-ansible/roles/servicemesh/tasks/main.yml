@@ -1,7 +1,14 @@
 ---
-- name: Install ServiceMesh Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
-  vars:
-    operator_name: servicemeshoperator3
-    operator_namespace: openshift-servicemesh
-    operator_channel: "{{ operator_channels.servicemeshoperator3 }}"
+- block:
+    - name: Install ServiceMesh Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+      vars:
+        operator_name: servicemeshoperator3
+        operator_namespace: openshift-servicemesh
+        operator_channel: "{{ operator_channels.servicemeshoperator3 }}"
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          ServiceMesh のインストールに失敗しました。
+          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,servicemesh

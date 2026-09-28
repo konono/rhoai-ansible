@@ -1,74 +1,258 @@
 ---
 # Uninstall: rhoai (OpenShift AI)
-# Order: MLflow CR → MLflowOperator (finalizer) → DSC → DSCI → Operator
+# Based on official docs: https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/3.5/html/installing_and_uninstalling_openshift_ai_self-managed/uninstalling-openshift-ai-self-managed_uninstalling-openshift-ai-self-managed
+#
+# Order:
+#   1. Clean up install-role resources (MaaS PostgreSQL, Gateway, etc.)
+#   2. Trigger official uninstall via ConfigMap + label
+#   3. Wait for namespace cleanup
+#   4. Delete operator namespace
+#   5. Verify
 
-- name: Delete MLflow CR (prevents MLflowOperator finalizer deadlock)
-  kubernetes.core.k8s:
-    state: absent
-    api_version: mlflow.opendatahub.io/v1
-    kind: MLflow
-    name: mlflow
-  failed_when: false
+- block:
+    # ---------------------------------------------------------------------------
+    # Step 1: Clean up resources created by the install role
+    # ---------------------------------------------------------------------------
+    - name: Delete MaaS Gateway
+      kubernetes.core.k8s:
+        state: absent
+        api_version: gateway.networking.k8s.io/v1
+        kind: Gateway
+        name: maas-default-gateway
+        namespace: openshift-ingress
+      failed_when: false
 
-- name: Wait for MLflow CR deletion
-  kubernetes.core.k8s_info:
-    api_version: mlflow.opendatahub.io/v1
-    kind: MLflow
-    name: mlflow
-  register: _mlflow_cr
-  until: _mlflow_cr.resources | default([]) | length == 0
-  retries: 12
-  delay: 10
-  failed_when: false
+    - name: Delete Gateway ConfigMap
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: maas-gateway-options
+        namespace: openshift-ingress
+      failed_when: false
 
-- name: Delete MLflowOperator CR
-  kubernetes.core.k8s:
-    state: absent
-    api_version: components.platform.opendatahub.io/v1alpha1
-    kind: MLflowOperator
-    name: default-mlflowoperator
-  failed_when: false
+    - name: Delete Authorino NetworkPolicy
+      kubernetes.core.k8s:
+        state: absent
+        api_version: networking.k8s.io/v1
+        kind: NetworkPolicy
+        name: maas-authorino-allow-rhcl
+        namespace: redhat-ai-gateway-infra
+      failed_when: false
 
-- name: Delete DataScienceCluster
-  kubernetes.core.k8s:
-    state: absent
-    api_version: datasciencecluster.opendatahub.io/v1
-    kind: DataScienceCluster
-    name: default-dsc
-  failed_when: false
+    - name: Delete HardwareProfile
+      kubernetes.core.k8s:
+        state: absent
+        api_version: infrastructure.opendatahub.io/v1alpha1
+        kind: HardwareProfile
+        name: nvidia-gpu-1
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Wait for DataScienceCluster deletion
-  kubernetes.core.k8s_info:
-    api_version: datasciencecluster.opendatahub.io/v1
-    kind: DataScienceCluster
-    name: default-dsc
-  register: _dsc
-  until: _dsc.resources | default([]) | length == 0
-  retries: 30
-  delay: 10
-  failed_when: false
+    - name: Delete MaaS PostgreSQL Deployment
+      kubernetes.core.k8s:
+        state: absent
+        api_version: apps/v1
+        kind: Deployment
+        name: maas-postgres
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Delete DSCInitialization
-  kubernetes.core.k8s:
-    state: absent
-    api_version: dscinitialization.opendatahub.io/v1
-    kind: DSCInitialization
-    name: default-dsci
-  failed_when: false
+    - name: Delete MaaS PostgreSQL Service
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Service
+        name: maas-postgres
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Wait for DSCInitialization deletion
-  kubernetes.core.k8s_info:
-    api_version: dscinitialization.opendatahub.io/v1
-    kind: DSCInitialization
-    name: default-dsci
-  register: _dsci
-  until: _dsci.resources | default([]) | length == 0
-  retries: 20
-  delay: 10
-  failed_when: false
+    - name: Delete MaaS PostgreSQL PVC
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: PersistentVolumeClaim
+        name: maas-postgres-data
+        namespace: redhat-ods-applications
+      failed_when: false
 
-- name: Uninstall rhods-operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: rhods-operator
-    operator_namespace: redhat-ods-operator
+    - name: Delete maas-db-config Secret (redhat-ods-applications)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: maas-db-config
+        namespace: redhat-ods-applications
+      failed_when: false
+
+    - name: Delete maas-db-config Secret (redhat-ai-gateway-infra)
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: maas-db-config
+        namespace: redhat-ai-gateway-infra
+      failed_when: false
+
+    - name: Delete llm-serving namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: llm-serving
+      failed_when: false
+
+    # ---------------------------------------------------------------------------
+    # Step 2: Delete MLflow CRs (prevents finalizer deadlock)
+    # ---------------------------------------------------------------------------
+    - name: Delete MLflow CR
+      kubernetes.core.k8s:
+        state: absent
+        api_version: mlflow.opendatahub.io/v1
+        kind: MLflow
+        name: mlflow
+      failed_when: false
+
+    - name: Wait for MLflow CR deletion
+      kubernetes.core.k8s_info:
+        api_version: mlflow.opendatahub.io/v1
+        kind: MLflow
+        name: mlflow
+      register: _mlflow_cr
+      until: _mlflow_cr.resources | default([]) | length == 0
+      retries: 12
+      delay: 10
+      failed_when: false
+
+    - name: Delete MLflowOperator CR
+      kubernetes.core.k8s:
+        state: absent
+        api_version: components.platform.opendatahub.io/v1alpha1
+        kind: MLflowOperator
+        name: default-mlflowoperator
+      failed_when: false
+
+    # ---------------------------------------------------------------------------
+    # Step 3: Trigger official uninstall via ConfigMap + label
+    # ---------------------------------------------------------------------------
+    - name: Create delete-self-managed-odh ConfigMap
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: delete-self-managed-odh
+            namespace: redhat-ods-operator
+      failed_when: false
+
+    - name: Label ConfigMap to trigger uninstall
+      ansible.builtin.command: >-
+        oc label configmap/delete-self-managed-odh
+        api.openshift.com/addon-managed-odh-delete=true
+        -n redhat-ods-operator --overwrite
+      register: _label_result
+      changed_when: "'labeled' in _label_result.stdout"
+      failed_when: false
+
+    # ---------------------------------------------------------------------------
+    # Step 4: Wait for namespace cleanup
+    # ---------------------------------------------------------------------------
+    - name: Wait for redhat-ods-applications namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: redhat-ods-applications
+      register: _rhoai_apps_ns
+      until: _rhoai_apps_ns.resources | default([]) | length == 0
+      retries: 60
+      delay: 10
+      failed_when: false
+
+    - name: Wait for redhat-ods-monitoring namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: redhat-ods-monitoring
+      register: _rhoai_mon_ns
+      until: _rhoai_mon_ns.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    - name: Wait for rhods-notebooks namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: rhods-notebooks
+      register: _rhoai_nb_ns
+      until: _rhoai_nb_ns.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    - name: Wait for redhat-ai-gateway-infra namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: redhat-ai-gateway-infra
+      register: _gw_ns
+      until: _gw_ns.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    # ---------------------------------------------------------------------------
+    # Step 5: Delete operator namespace
+    # ---------------------------------------------------------------------------
+    - name: Delete redhat-ods-operator namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: redhat-ods-operator
+      failed_when: false
+
+    - name: Wait for redhat-ods-operator namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: redhat-ods-operator
+      register: _rhoai_op_ns
+      until: _rhoai_op_ns.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
+      failed_when: false
+
+    # ---------------------------------------------------------------------------
+    # Step 6: Verify
+    # ---------------------------------------------------------------------------
+    - name: Verify no RHOAI subscriptions remain
+      ansible.builtin.shell: >-
+        oc get subscriptions --all-namespaces --no-headers 2>/dev/null | grep rhods-operator || true
+      register: _verify_sub
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if RHOAI subscription still exists
+      ansible.builtin.debug:
+        msg: "WARNING: rhods-operator subscription still exists: {{ _verify_sub.stdout }}"
+      when: _verify_sub.stdout | length > 0
+
+    - name: Verify no RHOAI namespaces remain
+      ansible.builtin.shell: >-
+        oc get namespaces --no-headers 2>/dev/null | grep -E 'redhat-ods|rhods' || true
+      register: _verify_ns
+      changed_when: false
+      failed_when: false
+
+    - name: Warn if RHOAI namespaces still exist
+      ansible.builtin.debug:
+        msg: "WARNING: RHOAI namespaces still exist: {{ _verify_ns.stdout }}"
+      when: _verify_ns.stdout | length > 0
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          OpenShift AI (RHOAI) のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags platform,rhoai -e uninstall_rhoai=true

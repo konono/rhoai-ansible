@@ -1,8 +1,65 @@
 ---
 # Uninstall: servicemesh
+# Ref: https://docs.redhat.com/en/documentation/red_hat_openshift_service_mesh/3.0/html/uninstalling/ossm-uninstalling-openshift-service-mesh
+# Order: Istio CR → IstioCNI CR → namespaces → Operator
 
-- name: Uninstall ServiceMesh Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: servicemeshoperator3
-    operator_namespace: openshift-servicemesh
+- block:
+    - name: Delete all Istio CRs
+      ansible.builtin.shell: >-
+        oc delete istio --all --all-namespaces --wait=false 2>/dev/null || true
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for Istio CR deletion
+      ansible.builtin.shell: >-
+        oc get istio --all-namespaces --no-headers 2>/dev/null | wc -l
+      register: _istio_count
+      until: _istio_count.stdout | trim | int == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Delete all IstioCNI CRs
+      ansible.builtin.shell: >-
+        oc delete istiocni --all --all-namespaces --wait=false 2>/dev/null || true
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for IstioCNI CR deletion
+      ansible.builtin.shell: >-
+        oc get istiocni --all-namespaces --no-headers 2>/dev/null | wc -l
+      register: _istiocni_count
+      until: _istiocni_count.stdout | trim | int == 0
+      retries: 20
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Delete istio-system namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: istio-system
+      failed_when: false
+
+    - name: Delete istio-cni namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Namespace
+        name: istio-cni
+      failed_when: false
+
+    - name: Uninstall ServiceMesh Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: servicemeshoperator3
+        operator_namespace: openshift-servicemesh
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          ServiceMesh のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,servicemesh -e uninstall_servicemesh=true

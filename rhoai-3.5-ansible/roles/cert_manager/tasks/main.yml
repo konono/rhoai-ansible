@@ -1,7 +1,14 @@
 ---
-- name: Install cert-manager Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
-  vars:
-    operator_name: openshift-cert-manager-operator
-    operator_namespace: cert-manager-operator
-    operator_channel: "{{ operator_channels.openshift_cert_manager_operator }}"
+- block:
+    - name: Install cert-manager Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+      vars:
+        operator_name: openshift-cert-manager-operator
+        operator_namespace: cert-manager-operator
+        operator_channel: "{{ operator_channels.openshift_cert_manager_operator }}"
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          cert-manager のインストールに失敗しました。
+          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,cert_manager

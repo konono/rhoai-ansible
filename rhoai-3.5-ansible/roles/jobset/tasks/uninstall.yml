@@ -1,16 +1,35 @@
 ---
 # Uninstall: jobset
+# Order: JobSetOperator CR → Operator + namespace
 
-- name: Delete JobSetOperator CR
-  kubernetes.core.k8s:
-    state: absent
-    api_version: operator.openshift.io/v1
-    kind: JobSetOperator
-    name: cluster
-  failed_when: false
+- block:
+    - name: Delete JobSetOperator CR
+      kubernetes.core.k8s:
+        state: absent
+        api_version: operator.openshift.io/v1
+        kind: JobSetOperator
+        name: cluster
+      failed_when: false
 
-- name: Uninstall JobSet Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: job-set
-    operator_namespace: openshift-jobset
+    - name: Wait for JobSetOperator CR deletion
+      kubernetes.core.k8s_info:
+        api_version: operator.openshift.io/v1
+        kind: JobSetOperator
+        name: cluster
+      register: _jobset
+      until: _jobset.resources | default([]) | length == 0
+      retries: 12
+      delay: 10
+      failed_when: false
+
+    - name: Uninstall JobSet Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: job-set
+        operator_namespace: openshift-jobset
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          JobSet のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,jobset -e uninstall_jobset=true

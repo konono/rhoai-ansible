@@ -1,29 +1,70 @@
 ---
 # Uninstall: rhcl (Kuadrant/Authorino)
+# Ref: https://docs.kuadrant.io/ (Red Hat Connectivity Link)
+# Order: AuthConfig → Authorino → Kuadrant → Operator + namespace
 
-- name: Delete Kuadrant CR
-  kubernetes.core.k8s:
-    state: absent
-    api_version: kuadrant.io/v1beta1
-    kind: Kuadrant
-    name: kuadrant
-    namespace: openshift-rhcl
-  failed_when: false
+- block:
+    - name: Delete all AuthConfig CRs
+      ansible.builtin.shell: >-
+        oc delete authconfigs --all --all-namespaces --wait=false 2>/dev/null || true
+      changed_when: true
+      failed_when: false
 
-- name: Wait for Kuadrant deletion
-  kubernetes.core.k8s_info:
-    api_version: kuadrant.io/v1beta1
-    kind: Kuadrant
-    name: kuadrant
-    namespace: openshift-rhcl
-  register: _kuadrant
-  until: _kuadrant.resources | default([]) | length == 0
-  retries: 20
-  delay: 10
-  failed_when: false
+    - name: Wait for AuthConfig CRs deletion
+      ansible.builtin.shell: >-
+        oc get authconfigs --all-namespaces --no-headers 2>/dev/null | wc -l
+      register: _ac_count
+      until: _ac_count.stdout | trim | int == 0
+      retries: 12
+      delay: 10
+      changed_when: false
+      failed_when: false
 
-- name: Uninstall RHCL Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: rhcl-operator
-    operator_namespace: openshift-rhcl
+    - name: Delete Authorino CR
+      ansible.builtin.shell: >-
+        oc delete authorino --all -n openshift-rhcl --wait=false 2>/dev/null || true
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for Authorino CR deletion
+      ansible.builtin.shell: >-
+        oc get authorino -n openshift-rhcl --no-headers 2>/dev/null | wc -l
+      register: _authorino_count
+      until: _authorino_count.stdout | trim | int == 0
+      retries: 20
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Delete Kuadrant CR
+      kubernetes.core.k8s:
+        state: absent
+        api_version: kuadrant.io/v1beta1
+        kind: Kuadrant
+        name: kuadrant
+        namespace: openshift-rhcl
+      failed_when: false
+
+    - name: Wait for Kuadrant deletion
+      kubernetes.core.k8s_info:
+        api_version: kuadrant.io/v1beta1
+        kind: Kuadrant
+        name: kuadrant
+        namespace: openshift-rhcl
+      register: _kuadrant
+      until: _kuadrant.resources | default([]) | length == 0
+      retries: 20
+      delay: 10
+      failed_when: false
+
+    - name: Uninstall RHCL Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: rhcl-operator
+        operator_namespace: openshift-rhcl
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          RHCL (Kuadrant/Authorino) のアンインストールに失敗しました。
+          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,rhcl -e uninstall_rhcl=true
