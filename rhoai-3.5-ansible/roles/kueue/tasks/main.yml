@@ -11,4 +11,4 @@
     - ansible.builtin.fail:
         msg: |
           Kueue のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,kueue
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags deps,kueue

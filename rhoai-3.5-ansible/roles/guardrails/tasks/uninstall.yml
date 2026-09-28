@@ -24,4 +24,4 @@
     - ansible.builtin.fail:
         msg: |
           NeMo Guardrails のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,guardrails -e uninstall_guardrails=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,guardrails -e uninstall_guardrails=true

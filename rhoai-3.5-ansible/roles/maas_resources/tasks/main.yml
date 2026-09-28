@@ -31,4 +31,4 @@
     - ansible.builtin.fail:
         msg: |
           MaaS Resources のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags workload,maas
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags workload,maas

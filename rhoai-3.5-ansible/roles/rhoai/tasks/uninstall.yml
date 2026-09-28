@@ -167,7 +167,6 @@
       until: _rhoai_apps_ns.resources | default([]) | length == 0
       retries: 60
       delay: 10
-      failed_when: false
 
     - name: Wait for redhat-ods-monitoring namespace deletion
       kubernetes.core.k8s_info:
@@ -222,7 +221,6 @@
       until: _rhoai_op_ns.resources | default([]) | length == 0
       retries: 30
       delay: 10
-      failed_when: false
 
     # ---------------------------------------------------------------------------
     # Step 6: Verify
@@ -232,11 +230,10 @@
         oc get subscriptions --all-namespaces --no-headers 2>/dev/null | grep rhods-operator || true
       register: _verify_sub
       changed_when: false
-      failed_when: false
 
-    - name: Warn if RHOAI subscription still exists
-      ansible.builtin.debug:
-        msg: "WARNING: rhods-operator subscription still exists: {{ _verify_sub.stdout }}"
+    - name: Fail if RHOAI subscription still exists
+      ansible.builtin.fail:
+        msg: "RHOAI subscription がまだ残っています: {{ _verify_sub.stdout }}"
       when: _verify_sub.stdout | length > 0
 
     - name: Verify no RHOAI namespaces remain
@@ -244,15 +241,14 @@
         oc get namespaces --no-headers 2>/dev/null | grep -E 'redhat-ods|rhods' || true
       register: _verify_ns
       changed_when: false
-      failed_when: false
 
-    - name: Warn if RHOAI namespaces still exist
-      ansible.builtin.debug:
-        msg: "WARNING: RHOAI namespaces still exist: {{ _verify_ns.stdout }}"
+    - name: Fail if RHOAI namespaces still exist
+      ansible.builtin.fail:
+        msg: "RHOAI namespace がまだ残っています: {{ _verify_ns.stdout }}"
       when: _verify_ns.stdout | length > 0
 
   rescue:
     - ansible.builtin.fail:
         msg: |
           OpenShift AI (RHOAI) のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags platform,rhoai -e uninstall_rhoai=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags platform,rhoai -e uninstall_rhoai=true

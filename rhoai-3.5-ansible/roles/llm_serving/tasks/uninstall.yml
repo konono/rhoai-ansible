@@ -7,9 +7,14 @@
     # -----------------------------------------------------------------------
     # Step 1: Backup user resources before deletion
     # -----------------------------------------------------------------------
+    - name: Generate timestamp for backup directory
+      ansible.builtin.command: date +%Y%m%dT%H%M%S
+      register: _timestamp
+      changed_when: false
+
     - name: Set backup directory
       ansible.builtin.set_fact:
-        _backup_dir: "{{ playbook_dir }}/../.uninstall-backup/llm_serving/{{ ansible_date_time.iso8601_basic_short }}"
+        _backup_dir: "{{ playbook_dir }}/../.uninstall-backup/llm_serving/{{ _timestamp.stdout }}"
 
     - name: Create backup directory
       ansible.builtin.file:
@@ -96,7 +101,6 @@
       until: _lis_remaining.resources | default([]) | length == 0
       retries: 30
       delay: 10
-      failed_when: false
       when: _all_lis.resources | default([]) | length > 0
 
     # -----------------------------------------------------------------------
@@ -148,4 +152,4 @@
         msg: |
           LLM Serving のアンインストールに失敗しました。
           バックアップ: {{ _backup_dir | default('(未作成)') }}
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,llm -e uninstall_llm_serving=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,llm -e uninstall_llm_serving=true

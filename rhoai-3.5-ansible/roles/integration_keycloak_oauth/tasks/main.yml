@@ -177,4 +177,4 @@
     - ansible.builtin.fail:
         msg: |
           Keycloak → OpenShift OAuth のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags integration,keycloak_oauth
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags integration,keycloak_oauth

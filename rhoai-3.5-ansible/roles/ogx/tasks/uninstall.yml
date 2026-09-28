@@ -51,4 +51,4 @@
     - ansible.builtin.fail:
         msg: |
           OGX Server のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,ogx -e uninstall_ogx=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,ogx -e uninstall_ogx=true

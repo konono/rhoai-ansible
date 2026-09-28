@@ -93,4 +93,4 @@
     - ansible.builtin.fail:
         msg: |
           Keycloak → AITenant OIDC のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags integration,rhoai_oidc
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags integration,rhoai_oidc

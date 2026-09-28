@@ -74,4 +74,4 @@
     - ansible.builtin.fail:
         msg: |
           Keycloak のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags platform,keycloak -e uninstall_keycloak=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags platform,keycloak -e uninstall_keycloak=true

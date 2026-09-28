@@ -15,4 +15,4 @@
     - ansible.builtin.fail:
         msg: |
           Keycloak → AITenant OIDC のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags integration,rhoai_oidc
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags integration,rhoai_oidc

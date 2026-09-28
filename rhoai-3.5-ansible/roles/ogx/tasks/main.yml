@@ -363,4 +363,4 @@
     - ansible.builtin.fail:
         msg: |
           OGX Server のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags workload,ogx
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags workload,ogx

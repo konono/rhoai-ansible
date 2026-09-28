@@ -575,4 +575,4 @@
     - ansible.builtin.fail:
         msg: |
           OpenShift AI (RHOAI) のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags platform,rhoai
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags platform,rhoai

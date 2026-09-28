@@ -53,4 +53,4 @@
     - ansible.builtin.fail:
         msg: |
           MetalLB のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,metallb -e uninstall_metallb=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,metallb -e uninstall_metallb=true

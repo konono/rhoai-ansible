@@ -51,4 +51,4 @@
     - ansible.builtin.fail:
         msg: |
           GPU Operator のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,gpu
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags deps,gpu

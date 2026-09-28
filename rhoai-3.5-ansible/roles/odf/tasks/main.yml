@@ -58,4 +58,4 @@
     - ansible.builtin.fail:
         msg: |
           ODF Object Storage のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags storage,odf
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags storage,odf

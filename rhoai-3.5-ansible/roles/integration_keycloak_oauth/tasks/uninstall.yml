@@ -41,4 +41,4 @@
     - ansible.builtin.fail:
         msg: |
           Keycloak → OpenShift OAuth のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags integration,keycloak_oauth
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags integration,keycloak_oauth

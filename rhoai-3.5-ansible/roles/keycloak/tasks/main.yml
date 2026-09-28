@@ -422,4 +422,4 @@
     - ansible.builtin.fail:
         msg: |
           Keycloak のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags platform,keycloak
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags platform,keycloak

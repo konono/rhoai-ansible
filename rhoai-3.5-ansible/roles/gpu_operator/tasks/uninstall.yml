@@ -33,4 +33,4 @@
     - ansible.builtin.fail:
         msg: |
           GPU Operator のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,gpu -e uninstall_gpu_operator=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,gpu -e uninstall_gpu_operator=true

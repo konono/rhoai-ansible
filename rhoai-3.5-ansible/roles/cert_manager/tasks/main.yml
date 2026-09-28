@@ -11,4 +11,4 @@
     - ansible.builtin.fail:
         msg: |
           cert-manager のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,cert_manager
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags deps,cert_manager

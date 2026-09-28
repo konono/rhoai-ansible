@@ -66,4 +66,4 @@
     - ansible.builtin.fail:
         msg: |
           cert-manager のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,cert_manager -e uninstall_cert_manager=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,cert_manager -e uninstall_cert_manager=true

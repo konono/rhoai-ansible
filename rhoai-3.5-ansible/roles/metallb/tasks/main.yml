@@ -85,4 +85,4 @@
     - ansible.builtin.fail:
         msg: |
           MetalLB のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags infra,metallb
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags infra,metallb

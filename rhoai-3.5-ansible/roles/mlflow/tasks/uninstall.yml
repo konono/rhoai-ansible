@@ -32,4 +32,4 @@
     - ansible.builtin.fail:
         msg: |
           RH MLflow のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,mlflow -e uninstall_mlflow=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,mlflow -e uninstall_mlflow=true

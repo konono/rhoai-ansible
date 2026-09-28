@@ -102,4 +102,4 @@
     - ansible.builtin.fail:
         msg: |
           LVM Operator のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags infra,lvm
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags infra,lvm

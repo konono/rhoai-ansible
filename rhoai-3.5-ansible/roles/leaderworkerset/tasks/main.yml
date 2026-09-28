@@ -13,4 +13,4 @@
     - ansible.builtin.fail:
         msg: |
           LeaderWorkerSet のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,leaderworkerset
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags deps,leaderworkerset

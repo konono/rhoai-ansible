@@ -14,7 +14,7 @@
 
     - name: Wait for Kueue CRs deletion
       ansible.builtin.shell: >-
-        oc get clusterqueues,localqueues,resourceflavors --all-namespaces --no-headers 2>/dev/null | wc -l
+        oc get clusterqueues,localqueues,resourceflavors,workloads --all-namespaces --no-headers 2>/dev/null | wc -l
       register: _kueue_count
       until: _kueue_count.stdout | trim | int == 0
       retries: 12
@@ -22,12 +22,31 @@
       changed_when: false
       failed_when: false
 
-    - name: Remove stuck finalizers from Kueue CRs
+    - name: Remove stuck finalizers from cluster-scoped Kueue CRs
       ansible.builtin.shell: |
-        for kind in clusterqueues localqueues resourceflavors workloads; do
-          for resource in $(oc get $kind --all-namespaces -o jsonpath='{range .items[*]}{.metadata.name}{" -n "}{.metadata.namespace}{"\n"}{end}' 2>/dev/null); do
-            oc patch $kind $resource --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+        for kind in clusterqueues resourceflavors; do
+          for name in $(oc get $kind -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            oc patch $kind "$name" --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
           done
+        done
+      changed_when: true
+      failed_when: false
+      when: _kueue_count.stdout | trim | int > 0
+
+    - name: Remove stuck finalizers from namespaced Kueue CRs
+      ansible.builtin.shell: |
+        for kind in localqueues workloads; do
+          oc get $kind --all-namespaces -o json 2>/dev/null | \
+            python3 -c "
+        import sys, json
+        data = json.load(sys.stdin)
+        for item in data.get('items', []):
+            name = item['metadata']['name']
+            ns = item['metadata']['namespace']
+            print(f'{kind} {name} -n {ns}')
+        " 2>/dev/null | while read kind_name name flag ns; do
+              oc patch "$kind_name" "$name" $flag "$ns" --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+            done
         done
       changed_when: true
       failed_when: false
@@ -43,4 +62,4 @@
     - ansible.builtin.fail:
         msg: |
           Kueue のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,kueue -e uninstall_kueue=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,kueue -e uninstall_kueue=true

@@ -27,4 +27,4 @@
     - ansible.builtin.fail:
         msg: |
           RHCL (Kuadrant/Authorino) のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags deps,rhcl
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags deps,rhcl

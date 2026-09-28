@@ -35,4 +35,4 @@
     - ansible.builtin.fail:
         msg: |
           ODF Object Storage のアンインストールに失敗しました。
-          再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags storage,odf -e uninstall_odf=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags storage,odf -e uninstall_odf=true

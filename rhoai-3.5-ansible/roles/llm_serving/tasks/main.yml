@@ -218,4 +218,4 @@
     - ansible.builtin.fail:
         msg: |
           LLM Serving のインストールに失敗しました。
-          再実行: ansible-playbook site.yml -i inventory/<env> --tags workload,llm
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags workload,llm
