@@ -37,8 +37,9 @@
       ansible.builtin.shell: |
         for kind in localqueues workloads; do
           oc get $kind --all-namespaces -o json 2>/dev/null | \
-            python3 -c "
-        import sys, json
+            KIND="$kind" python3 -c "
+        import os, sys, json
+        kind = os.environ['KIND']
         data = json.load(sys.stdin)
         for item in data.get('items', []):
             name = item['metadata']['name']
