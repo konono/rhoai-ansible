@@ -405,13 +405,6 @@
                   loginRealm: "{{ keycloak_realm }}"
                   scope: sub
     
-    # --- RBAC ---
-    - name: Apply RBAC
-      kubernetes.core.k8s:
-        state: present
-        src: "{{ ansible_root }}/../manifests/06-keycloak/09-rbac.yaml"
-      failed_when: false
-    
     - name: Display Keycloak info
       ansible.builtin.debug:
         msg:

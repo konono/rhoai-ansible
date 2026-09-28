@@ -123,6 +123,7 @@ Keycloak のグループは MaaS のアクセス制御に直結します。グ�
 | `models` | MaaSAuthPolicy | このグループのユーザーがアクセスできるモデル一覧 |
 | `priority` | MaaSSubscription | リクエスト競合時の優先度（数値が大きいほど優先） |
 | `quota_tokens_24h` | MaaSSubscription | 24時間あたりのトークン使用上限 |
+| `cluster_role` | ClusterRoleBinding | このグループに付与する K8s ClusterRole（省略時は `maas-model-access` のみ） |
 
 ### グループの追加
 
@@ -130,6 +131,7 @@ Keycloak のグループは MaaS のアクセス制御に直結します。グ�
 1. Keycloak に新しいグループが作成される
 2. `models-as-a-service` namespace に MaaSAuthPolicy が作成される（モデルへのアクセス許可）
 3. `models-as-a-service` namespace に MaaSSubscription が作成される（クォータ設定）
+4. K8s RBAC が自動生成される（`ClusterRole/maas-model-access` + 各グループの `ClusterRoleBinding`）
 
 ```yaml
 keycloak_groups:
@@ -137,10 +139,12 @@ keycloak_groups:
     models: ["*"]               # "*" は全モデルへのアクセスを許可
     priority: 20
     quota_tokens_24h: 5000000
+    cluster_role: cluster-admin  # K8s RBAC: cluster-admin 権限を付与
   maas-qwen3-06b-users:
     models: ["qwen3-06b"]       # 特定モデルのみ許可
     priority: 10
     quota_tokens_24h: 1000000
+    # cluster_role 未指定 → maas-model-access のみ付与
   maas-researchers:              # ← 追加
     models: ["qwen3-06b"]
     priority: 15                 # admins より低く、一般ユーザーより高い
