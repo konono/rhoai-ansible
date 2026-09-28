@@ -1,0 +1,26 @@
+# RHOAI Prometheus が kuadrant-system 内の PodMonitor を参照しないため、
+# redhat-ods-monitoring に同名ターゲット用 PodMonitor を置く（Kuadrant PodMonitor と重複スクレイプしないよう MaaS SM は未使用）。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: maas-limitador
+  namespace: redhat-ods-monitoring
+  labels:
+    app.kubernetes.io/part-of: maas-gateway
+    monitoring.opendatahub.io/scrape: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  jobLabel: app
+  namespaceSelector:
+    matchNames:
+      - openshift-rhcl
+  selector:
+    matchLabels:
+      app: limitador
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+
+

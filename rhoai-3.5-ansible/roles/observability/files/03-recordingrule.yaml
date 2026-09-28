@@ -1,0 +1,49 @@
+---
+# COO Perses (Thanos) 向け — platform Prometheus でも *_total エイリアスを提供
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: maas-limitador-recording-rules
+  namespace: openshift-rhcl
+  labels:
+    app: limitador
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  groups:
+    - name: maas.limitador.compat
+      interval: 30s
+      rules:
+        - record: authorized_hits_total
+          expr: authorized_hits
+        - record: authorized_calls_total
+          expr: authorized_calls
+        - record: limited_calls_total
+          expr: limited_calls
+---
+# RHOAI Usage ダッシュボード (dashboard-3-maas-usage-admin) は authorized_*_total を参照するが、
+# Limitador は authorized_hits / authorized_calls / limited_calls を export する。
+# ラベルはそのまま引き継ぐ（subscription, model, user 等）。
+# upstream: opendatahub-io/models-as-a-service observability docs
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: maas-limitador-recording-rules
+  namespace: redhat-ods-monitoring
+  labels:
+    app: limitador
+    monitoring.opendatahub.io/scrape: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  groups:
+    - name: maas.limitador.compat
+      interval: 30s
+      rules:
+        - record: authorized_hits_total
+          expr: authorized_hits
+        - record: authorized_calls_total
+          expr: authorized_calls
+        - record: limited_calls_total
+          expr: limited_calls
+

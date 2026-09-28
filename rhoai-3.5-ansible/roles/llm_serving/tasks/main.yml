@@ -133,7 +133,7 @@
     
     - name: Read chat template file
       ansible.builtin.slurp:
-        src: "{{ ansible_root }}/../manifests/07-llm-serving/chat_template.jinja"
+        src: "{{ role_path }}/files/chat_template.jinja"
       register: _chat_template
     
     - name: Collect unique chat template ConfigMap names
