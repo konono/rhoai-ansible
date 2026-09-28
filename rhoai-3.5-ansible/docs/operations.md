@@ -123,7 +123,10 @@ Keycloak のグループは MaaS のアクセス制御に直結します。グ�
 | `models` | MaaSAuthPolicy | このグループのユーザーがアクセスできるモデル一覧 |
 | `priority` | MaaSSubscription | リクエスト競合時の優先度（数値が大きいほど優先） |
 | `quota_tokens_24h` | MaaSSubscription | 24時間あたりのトークン使用上限 |
-| `cluster_role` | ClusterRoleBinding | このグループに付与する K8s ClusterRole（省略時は `maas-model-access` のみ） |
+| `cluster_role` | ClusterRoleBinding | このグループに追加で付与する K8s ClusterRole（省略可） |
+
+> **K8s RBAC の自動生成**: `manage_maas_access.yml` は全グループに `ClusterRole/maas-model-access`（llminferenceservices get/list）を自動付与します。`cluster_role` はそれに加えて付与する追加の ClusterRole です。
+> なお `maas-admins` → `cluster-admin` の Dashboard 用 RBAC は `maas_resources` role が適用するため、`cluster_role: cluster-admin` の指定は不要です。
 
 ### グループの追加
 
@@ -139,12 +142,10 @@ keycloak_groups:
     models: ["*"]               # "*" は全モデルへのアクセスを許可
     priority: 20
     quota_tokens_24h: 5000000
-    cluster_role: cluster-admin  # K8s RBAC: cluster-admin 権限を付与
   maas-qwen3-06b-users:
     models: ["qwen3-06b"]       # 特定モデルのみ許可
     priority: 10
     quota_tokens_24h: 1000000
-    # cluster_role 未指定 → maas-model-access のみ付与
   maas-researchers:              # ← 追加
     models: ["qwen3-06b"]
     priority: 15                 # admins より低く、一般ユーザーより高い
@@ -547,6 +548,26 @@ oc get route --all-namespaces | grep HostAlreadyClaimed
 ```
 
 不要な Route を削除してください。
+
+#### Gateway 経由のモデルアクセスが拒否される
+
+K8s RBAC が正しく設定されているか確認:
+
+```bash
+# manage_maas_access で生成された RBAC を確認
+oc get clusterrolebinding -l app.kubernetes.io/managed-by=ansible-maas-access
+
+# maas_resources が適用した Dashboard RBAC を確認
+oc get clusterrolebinding maas-admins-dashboard
+```
+
+RBAC がない場合は `manage_maas_access.yml` を再実行してください。
+
+> **移行ノート**: 旧 `09-rbac.yaml` で作成された ClusterRoleBinding（`maas-model-access-qwen3`, `maas-users-basic` 等）は自動削除されません。`manage_maas_access.yml` 実行後、旧 CRB を手動で確認・削除できます:
+> ```bash
+> oc get clusterrolebinding | grep maas-
+> oc delete clusterrolebinding maas-model-access-qwen3 maas-users-basic  # 不要なら削除
+> ```
 
 #### API Key 発行に失敗する
 

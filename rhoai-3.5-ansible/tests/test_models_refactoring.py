@@ -221,28 +221,38 @@ class TestMaasPoliciesTemplate(unittest.TestCase):
         self.assertNotIn("maas-qwen3-06b-users-subscription", names)
 
     def test_all_present(self):
-        """全モデル present の場合、全グループのポリシーが生成される"""
+        """全モデル present の場合、全グループのポリシー + RBAC が生成される"""
         models = {
             "qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "present"},
             "qwen3-4b": {"hf_repo": "Qwen/Qwen3-4B", "state": "present"},
         }
         docs = self._render(models)
         names = [d["metadata"]["name"] for d in docs]
-        self.assertEqual(len(docs), 6)
+        kinds = [d["kind"] for d in docs]
+        # MaaS policies (6) + ClusterRole (1) + ClusterRoleBinding all-groups (1) = 8
+        self.assertEqual(len(docs), 8)
         self.assertIn("admin-auth-policy", names)
         self.assertIn("maas-qwen3-06b-users-auth-policy", names)
         self.assertIn("maas-qwen3-4b-users-auth-policy", names)
         self.assertIn("maas-admins-subscription", names)
+        self.assertIn("maas-model-access", names)
+        self.assertIn("maas-model-access-all-groups", names)
+        self.assertIn("ClusterRole", kinds)
+        self.assertIn("ClusterRoleBinding", kinds)
 
     def test_all_absent(self):
-        """全モデル absent の場合、admin-auth-policy のみ（modelRefs 空）"""
+        """全モデル absent の場合、admin-auth-policy + RBAC のみ"""
         models = {
             "qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "absent"},
             "qwen3-4b": {"hf_repo": "Qwen/Qwen3-4B", "state": "absent"},
         }
         docs = self._render(models)
-        self.assertEqual(len(docs), 1)
-        self.assertEqual(docs[0]["metadata"]["name"], "admin-auth-policy")
+        # admin-auth-policy (1) + ClusterRole (1) + ClusterRoleBinding all-groups (1) = 3
+        self.assertEqual(len(docs), 3)
+        names = [d["metadata"]["name"] for d in docs]
+        self.assertIn("admin-auth-policy", names)
+        self.assertIn("maas-model-access", names)
+        self.assertIn("maas-model-access-all-groups", names)
 
     def test_wildcard_expands_to_present_only(self):
         """'*' は present モデルのみに展開される"""
@@ -300,6 +310,58 @@ class TestMaasPoliciesTemplate(unittest.TestCase):
                 self.assertIn("apiVersion", doc)
                 self.assertIn("kind", doc)
                 self.assertIn("metadata", doc)
+
+    def test_rbac_clusterrole_rules(self):
+        """ClusterRole/maas-model-access の rules が正しい"""
+        models = {"qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "present"}}
+        docs = self._render(models)
+        cr = [d for d in docs if d["kind"] == "ClusterRole" and d["metadata"]["name"] == "maas-model-access"]
+        self.assertEqual(len(cr), 1)
+        rules = cr[0]["rules"]
+        api_groups = [r["apiGroups"][0] for r in rules]
+        self.assertIn("serving.kserve.io", api_groups)
+        self.assertIn("serving.opendatahub.io", api_groups)
+
+    def test_rbac_all_groups_in_binding(self):
+        """全グループが maas-model-access-all-groups に含まれる"""
+        models = {"qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "present"}}
+        docs = self._render(models)
+        crb = [d for d in docs if d["metadata"]["name"] == "maas-model-access-all-groups"]
+        self.assertEqual(len(crb), 1)
+        subjects = [s["name"] for s in crb[0]["subjects"]]
+        for group_name in self.keycloak_groups:
+            self.assertIn(group_name, subjects)
+
+    def test_rbac_cluster_role_creates_individual_crb(self):
+        """cluster_role 指定グループに個別 ClusterRoleBinding が生成される"""
+        self.keycloak_groups["maas-admins"]["cluster_role"] = "cluster-admin"
+        models = {"qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "present"}}
+        docs = self._render(models)
+        crb = [d for d in docs if d["metadata"]["name"] == "maas-maas-admins-role"]
+        self.assertEqual(len(crb), 1)
+        self.assertEqual(crb[0]["roleRef"]["name"], "cluster-admin")
+        subjects = [s["name"] for s in crb[0]["subjects"]]
+        self.assertIn("maas-admins", subjects)
+
+    def test_rbac_no_individual_crb_without_cluster_role(self):
+        """cluster_role 未指定グループに個別 CRB は生成されない"""
+        models = {"qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "present"}}
+        docs = self._render(models)
+        crb_names = [d["metadata"]["name"] for d in docs if d["kind"] == "ClusterRoleBinding"]
+        for name in crb_names:
+            if name == "maas-model-access-all-groups":
+                continue
+            self.fail(f"Unexpected individual CRB: {name}")
+
+    def test_rbac_model_defaults_fallback(self):
+        """model_defaults が未定義でもテンプレートが動作する"""
+        rendered = self.template.render(
+            models={"qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "present"}},
+            keycloak_groups=self.keycloak_groups,
+        )
+        docs = [d for d in yaml.safe_load_all(rendered) if d]
+        names = [d["metadata"]["name"] for d in docs]
+        self.assertIn("maas-model-access", names)
 
     def test_quota_values(self):
         """トークンクォータ値が正しく設定される"""
