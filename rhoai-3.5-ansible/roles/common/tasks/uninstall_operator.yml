@@ -1,6 +1,7 @@
 ---
-# Shared task: uninstall an OLM Operator (Subscription + CSV)
+# Shared task: uninstall an OLM Operator (Subscription + CSV + namespace)
 # Required vars: operator_name, operator_namespace
+# Optional vars: delete_namespace (default: true)
 
 - name: "Delete Subscription {{ operator_name }}"
   kubernetes.core.k8s:
@@ -18,3 +19,24 @@
     --wait=false 2>/dev/null || true
   changed_when: true
   failed_when: false
+
+- name: "Delete namespace {{ operator_namespace }}"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Namespace
+    name: "{{ operator_namespace }}"
+  failed_when: false
+  when: delete_namespace | default(true)
+
+- name: "Wait for namespace {{ operator_namespace }} deletion"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ operator_namespace }}"
+  register: _ns
+  until: _ns.resources | default([]) | length == 0
+  retries: 30
+  delay: 10
+  failed_when: false
+  when: delete_namespace | default(true)

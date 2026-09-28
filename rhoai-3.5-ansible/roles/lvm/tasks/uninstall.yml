@@ -1,29 +1,75 @@
 ---
 # Uninstall: lvm
+# Ref: https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/storage/configuring-persistent-storage#uninstalling-lvms-operator-using-cli_persistent-storage-using-lvms
+# Order: PVC pre-check → LVMCluster → Operator + namespace
+# Note: LVM Operator does NOT clean up LVM resources (VG/LV) on nodes
 
-- name: Delete LVMCluster
-  kubernetes.core.k8s:
-    state: absent
-    api_version: lvm.topolvm.io/v1alpha1
-    kind: LVMCluster
-    name: lvmcluster
-    namespace: openshift-lvm-storage
+# ---------------------------------------------------------------------------
+# Pre-check: Fail if PVCs using LVM StorageClass still exist
+# (Outside block so the detailed message is not overwritten by rescue)
+# ---------------------------------------------------------------------------
+- name: Check for PVCs using lvms-vg1 StorageClass
+  ansible.builtin.shell: >-
+    oc get pvc --all-namespaces -o json 2>/dev/null |
+    python3 -c "
+    import sys, json
+    data = json.load(sys.stdin)
+    pvcs = [
+      '{}/{}'.format(i['metadata']['namespace'], i['metadata']['name'])
+      for i in data.get('items', [])
+      if i['spec'].get('storageClassName') == 'lvms-vg1'
+    ]
+    if pvcs:
+      print('\n'.join(pvcs))
+      sys.exit(1)
+    " 2>/dev/null
+  register: _lvms_pvcs
+  changed_when: false
   failed_when: false
 
-- name: Wait for LVMCluster deletion
-  kubernetes.core.k8s_info:
-    api_version: lvm.topolvm.io/v1alpha1
-    kind: LVMCluster
-    name: lvmcluster
-    namespace: openshift-lvm-storage
-  register: _lvm
-  until: _lvm.resources | default([]) | length == 0
-  retries: 30
-  delay: 10
-  failed_when: false
+- name: Fail if PVCs using lvms-vg1 still exist
+  ansible.builtin.fail:
+    msg: |
+      LVM Operator のアンインストールを中止しました。
+      以下の PVC が lvms-vg1 StorageClass を使用中です。
+      先にこれらの PVC を削除してから再実行してください。
+      再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
 
-- name: Uninstall LVM Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: lvms-operator
-    operator_namespace: openshift-lvm-storage
+      {{ _lvms_pvcs.stdout }}
+  when: _lvms_pvcs.rc != 0
+
+# ---------------------------------------------------------------------------
+# LVMCluster → Operator
+# ---------------------------------------------------------------------------
+- block:
+    - name: Delete LVMCluster
+      kubernetes.core.k8s:
+        state: absent
+        api_version: lvm.topolvm.io/v1alpha1
+        kind: LVMCluster
+        name: lvmcluster
+        namespace: openshift-lvm-storage
+      failed_when: false
+
+    - name: Wait for LVMCluster deletion
+      kubernetes.core.k8s_info:
+        api_version: lvm.topolvm.io/v1alpha1
+        kind: LVMCluster
+        name: lvmcluster
+        namespace: openshift-lvm-storage
+      register: _lvm
+      until: _lvm.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
+
+    - name: Uninstall LVM Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: lvms-operator
+        operator_namespace: openshift-lvm-storage
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          LVM Operator のアンインストールに失敗しました。
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true

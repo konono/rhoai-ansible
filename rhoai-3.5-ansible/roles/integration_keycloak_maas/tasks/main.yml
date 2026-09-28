@@ -1,5 +1,12 @@
 ---
-- name: Manage MaaS access
-  ansible.builtin.include_role:
-    name: keycloak
-    tasks_from: manage_maas_access
+- block:
+    - name: Manage MaaS access
+      ansible.builtin.include_role:
+        name: keycloak
+        tasks_from: manage_maas_access
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          Keycloak → MaaS Policies のインストールに失敗しました。
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags integration,keycloak_maas

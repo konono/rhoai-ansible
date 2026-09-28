@@ -1,29 +1,44 @@
 ---
 # Uninstall: nfd
+# Ref: https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html/specialized_hardware_and_driver_enablement/psap-node-feature-discovery-operator
+# Order: NodeFeatureRule → NodeFeatureDiscovery → Operator + namespace
 
-- name: Delete NodeFeatureDiscovery
-  kubernetes.core.k8s:
-    state: absent
-    api_version: nfd.openshift.io/v1
-    kind: NodeFeatureDiscovery
-    name: nfd-instance
-    namespace: openshift-nfd
-  failed_when: false
+- block:
+    - name: Delete all NodeFeatureRule CRs
+      ansible.builtin.shell: >-
+        oc delete nodefeaturerules --all --all-namespaces --wait=false 2>/dev/null || true
+      changed_when: true
+      failed_when: false
 
-- name: Wait for NodeFeatureDiscovery deletion
-  kubernetes.core.k8s_info:
-    api_version: nfd.openshift.io/v1
-    kind: NodeFeatureDiscovery
-    name: nfd-instance
-    namespace: openshift-nfd
-  register: _nfd
-  until: _nfd.resources | default([]) | length == 0
-  retries: 20
-  delay: 10
-  failed_when: false
+    - name: Delete NodeFeatureDiscovery
+      kubernetes.core.k8s:
+        state: absent
+        api_version: nfd.openshift.io/v1
+        kind: NodeFeatureDiscovery
+        name: nfd-instance
+        namespace: openshift-nfd
+      failed_when: false
 
-- name: Uninstall NFD Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: nfd
-    operator_namespace: openshift-nfd
+    - name: Wait for NodeFeatureDiscovery deletion
+      kubernetes.core.k8s_info:
+        api_version: nfd.openshift.io/v1
+        kind: NodeFeatureDiscovery
+        name: nfd-instance
+        namespace: openshift-nfd
+      register: _nfd
+      until: _nfd.resources | default([]) | length == 0
+      retries: 20
+      delay: 10
+      failed_when: false
+
+    - name: Uninstall NFD Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: nfd
+        operator_namespace: openshift-nfd
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          Node Feature Discovery のアンインストールに失敗しました。
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,nfd -e uninstall_nfd=true

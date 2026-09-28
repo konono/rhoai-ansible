@@ -1,8 +1,16 @@
 ---
 # Uninstall: leaderworkerset
+# Order: Operator + namespace
 
-- name: Uninstall LeaderWorkerSet Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: leader-worker-set
-    operator_namespace: openshift-leaderworkerset
+- block:
+    - name: Uninstall LeaderWorkerSet Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: leader-worker-set
+        operator_namespace: openshift-leaderworkerset
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          LeaderWorkerSet のアンインストールに失敗しました。
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,leaderworkerset -e uninstall_leaderworkerset=true

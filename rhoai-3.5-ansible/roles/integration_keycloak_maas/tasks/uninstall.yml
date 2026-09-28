@@ -2,8 +2,15 @@
 # Uninstall: integration_keycloak_maas
 # MaaS policies are managed by the Keycloak role; nothing extra to clean up here.
 
-- name: Delete generated MaaS policies file
-  ansible.builtin.file:
-    path: "{{ ansible_root | default(playbook_dir) }}/.maas-policies-generated.yaml"
-    state: absent
-  failed_when: false
+- block:
+    - name: Delete generated MaaS policies file
+      ansible.builtin.file:
+        path: "{{ ansible_root | default(playbook_dir) }}/.maas-policies-generated.yaml"
+        state: absent
+      failed_when: false
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          Keycloak → MaaS Policies のアンインストールに失敗しました。
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags integration,keycloak_maas

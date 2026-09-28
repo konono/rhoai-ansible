@@ -16,6 +16,7 @@ inventory/*
 # Generated files
 .generated-passwords.yml
 .maas-policies-generated.yaml
+.uninstall-backup/
 
 # Secrets / credentials
 .credentials/

@@ -1,7 +1,14 @@
 ---
-- name: Install Kueue Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
-  vars:
-    operator_name: kueue-operator
-    operator_namespace: openshift-kueue
-    operator_channel: "{{ operator_channels.kueue_operator }}"
+- block:
+    - name: Install Kueue Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
+      vars:
+        operator_name: kueue-operator
+        operator_namespace: openshift-kueue
+        operator_channel: "{{ operator_channels.kueue_operator }}"
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          Kueue のインストールに失敗しました。
+          再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags deps,kueue

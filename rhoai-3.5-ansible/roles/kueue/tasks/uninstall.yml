@@ -1,8 +1,66 @@
 ---
 # Uninstall: kueue
+# Ref: https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/ai_workloads/red-hat-build-of-kueue
+# Known issue: CRs may get stuck with "Resource is being deleted" — workaround is finalizer removal
+# Order: Kueue CRs → Operator + namespace
 
-- name: Uninstall Kueue Operator
-  ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
-  vars:
-    operator_name: kueue-operator
-    operator_namespace: openshift-kueue
+- block:
+    - name: Delete all Kueue CRs
+      ansible.builtin.shell: >-
+        oc delete clusterqueues,localqueues,resourceflavors,workloads
+        --all --all-namespaces --wait=false 2>/dev/null || true
+      changed_when: true
+      failed_when: false
+
+    - name: Wait for Kueue CRs deletion
+      ansible.builtin.shell: >-
+        oc get clusterqueues,localqueues,resourceflavors,workloads --all-namespaces --no-headers 2>/dev/null | wc -l
+      register: _kueue_count
+      until: _kueue_count.stdout | trim | int == 0
+      retries: 12
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Remove stuck finalizers from cluster-scoped Kueue CRs
+      ansible.builtin.shell: |
+        for kind in clusterqueues resourceflavors; do
+          for name in $(oc get $kind -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            oc patch $kind "$name" --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+          done
+        done
+      changed_when: true
+      failed_when: false
+      when: _kueue_count.stdout | trim | int > 0
+
+    - name: Remove stuck finalizers from namespaced Kueue CRs
+      ansible.builtin.shell: |
+        for kind in localqueues workloads; do
+          oc get $kind --all-namespaces -o json 2>/dev/null | \
+            KIND="$kind" python3 -c "
+        import os, sys, json
+        kind = os.environ['KIND']
+        data = json.load(sys.stdin)
+        for item in data.get('items', []):
+            name = item['metadata']['name']
+            ns = item['metadata']['namespace']
+            print(f'{kind} {name} -n {ns}')
+        " 2>/dev/null | while read kind_name name flag ns; do
+              oc patch "$kind_name" "$name" $flag "$ns" --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+            done
+        done
+      changed_when: true
+      failed_when: false
+      when: _kueue_count.stdout | trim | int > 0
+
+    - name: Uninstall Kueue Operator
+      ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"
+      vars:
+        operator_name: kueue-operator
+        operator_namespace: openshift-kueue
+
+  rescue:
+    - ansible.builtin.fail:
+        msg: |
+          Kueue のアンインストールに失敗しました。
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,kueue -e uninstall_kueue=true
