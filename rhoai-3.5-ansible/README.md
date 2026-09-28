@@ -805,6 +805,7 @@ ansible/
 │   │       └── vault.yml.sample
 │   └── myenv/                    # 環境固有の設定 (.gitignore 対象)
 ├── playbooks/
+│   ├── uninstall.yml             # アンインストール（site.yml の逆順）
 │   ├── verify.yml                # デプロイ検証 + 環境サマリー
 │   ├── manage_maas_access.yml    # MaaS アクセス管理 (ユーザー + ポリシー)
 │   ├── llm_add_model.yml         # モデル追加 (deploy + MaaS + Keycloak)
@@ -825,6 +826,7 @@ ansible/
 │   ├── common/                   # Operator install/wait 共通タスク
 │   │   └── tasks/
 │   │       ├── install_operator.yml
+│   │       ├── uninstall_operator.yml
 │   │       ├── create_if_absent.yml
 │   │       ├── wait_for_crd.yml
 │   │       ├── wait_for_field.yml
@@ -862,7 +864,99 @@ ansible/
 
 ---
 
-## 12. 関連ドキュメント
+## 12. アンインストール
+
+### 12.1 フルアンインストール
+
+```bash
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv
+```
+
+インストールの逆順で全コンポーネントを削除します。各 Operator の公式アンインストール手順に基づいて、CR → Operator → Namespace の順で安全に削除します。
+
+### 12.2 特定コンポーネントのアンインストール
+
+```bash
+# RHOAI + ワークロードのみ
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags platform,workload
+
+# 特定のロールのみ（inventory で無効でも実行可能）
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags deps,gpu -e uninstall_gpu_operator=true
+```
+
+### 12.3 使用可能なタグ
+
+| タグ | 対象 |
+|---|---|
+| `infra, lvm` | LVM Operator |
+| `infra, metallb` | MetalLB |
+| `deps, cert_manager` | cert-manager |
+| `deps, servicemesh` | ServiceMesh |
+| `deps, nfd` | Node Feature Discovery |
+| `deps, gpu` | GPU Operator |
+| `deps, rhcl` | RHCL (Kuadrant/Authorino) |
+| `deps, kueue` | Kueue |
+| `deps, jobset` | JobSet |
+| `deps, leaderworkerset` | LeaderWorkerSet |
+| `storage, odf` | ODF (NooBaa) |
+| `platform, rhoai` | OpenShift AI |
+| `platform, keycloak` | Keycloak |
+| `integration, keycloak_oauth` | Keycloak → OpenShift OAuth |
+| `integration, keycloak_maas` | Keycloak → MaaS Policies |
+| `integration, rhoai_oidc` | AITenant OIDC |
+| `workload, llm` | LLM Serving |
+| `workload, maas` | MaaS Resources |
+| `workload, mlflow` | MLflow |
+| `workload, ogx` | OGX Server |
+| `workload, guardrails` | NeMo Guardrails |
+| `workload, observability` | Observability |
+
+### 12.4 アンインストール変数
+
+`uninstall_<role>` 変数で個別制御できます。未指定の場合は `install_<role>` の値にフォールバックします。
+
+```bash
+# RHOAI だけアンインストール（他の install_* が true でも無視）
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv \
+  --tags platform,rhoai -e uninstall_rhoai=true
+```
+
+### 12.5 エラー時のリトライ
+
+途中で失敗した場合、エラーメッセージにリトライ用のコマンドが表示されます：
+
+```
+TASK [Fail if PVCs using lvms-vg1 still exist] ********************************
+fatal: [localhost]: FAILED! =>
+  msg: |-
+    LVM Operator のアンインストールに失敗しました。
+    再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
+```
+
+表示されたコマンドの `inventory/<env>` を実際のインベントリパスに置き換えて実行してください。
+
+### 12.6 アンインストールの動作
+
+各 Operator は公式ドキュメントに基づいた手順で削除されます：
+
+| ロール | アンインストール方式 |
+|---|---|
+| **RHOAI** | 公式の ConfigMap+label トリガー方式。install で作成した全リソース（MaaS PostgreSQL, Gateway, HardwareProfile 等）を先に削除し、`delete-self-managed-odh` ConfigMap で Operator の自動クリーンアップをトリガー。namespace 削除完了を待機し、検証を実施 |
+| **ServiceMesh** | Istio CR → IstioCNI CR → namespace → Operator の順で削除 |
+| **GPU Operator** | ClusterPolicy CR 削除 → 削除完了待機 → Operator + namespace 削除 |
+| **cert-manager** | Certificate/Issuer/ClusterIssuer CR 一括削除 → 削除完了待機 → Operator + namespace 削除 |
+| **Kueue** | Kueue CRs 一括削除 → finalizer stuck 自動対処 → Operator + namespace 削除 |
+| **LVM** | PVC プリチェック（lvms-vg1 使用中の PVC があれば停止）→ LVMCluster 削除 → Operator + namespace 削除 |
+| **その他** | CR 削除 → 削除完了待機 → Operator + namespace 削除 の共通パターン |
+
+> **注意事項**:
+> - アンインストール前に PVC で使用される永続ディスクのバックアップを推奨します
+> - LVM Operator はノード上の LVM リソース（VG/LV）を自動削除しません。必要に応じて手動で対処してください
+> - cert-manager リソースの削除により、関連する TLS Secret も削除されます
+
+---
+
+## 13. 関連ドキュメント
 
 | ドキュメント | 内容 |
 |---|---|
