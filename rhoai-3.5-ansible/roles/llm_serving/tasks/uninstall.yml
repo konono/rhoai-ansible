@@ -1,8 +1,22 @@
 ---
 # Uninstall: llm_serving
 # No operator — resources only (managed by rhoai)
+# Order: Backup → LLMInferenceService → MaaSModelRef → ClusterStorageContainer → Secret → PVC
 
 - block:
+    # -----------------------------------------------------------------------
+    # Step 1: Backup user resources before deletion
+    # -----------------------------------------------------------------------
+    - name: Set backup directory
+      ansible.builtin.set_fact:
+        _backup_dir: "{{ playbook_dir }}/../.uninstall-backup/llm_serving/{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ _backup_dir }}"
+        state: directory
+        mode: "0750"
+
     - name: Get all LLMInferenceServices
       kubernetes.core.k8s_info:
         api_version: serving.kserve.io/v1alpha2
@@ -11,6 +25,56 @@
       register: _all_lis
       failed_when: false
 
+    - name: Backup LLMInferenceServices
+      ansible.builtin.copy:
+        content: "{{ item | to_nice_yaml }}"
+        dest: "{{ _backup_dir }}/llminferenceservice-{{ item.metadata.name }}.yml"
+        mode: "0640"
+      loop: "{{ _all_lis.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: _all_lis.resources | default([]) | length > 0
+
+    - name: Get all MaaSModelRef
+      kubernetes.core.k8s_info:
+        api_version: maas.opendatahub.io/v1alpha1
+        kind: MaaSModelRef
+        namespace: "{{ llm_namespace | default('llm-serving') }}"
+      register: _all_refs
+      failed_when: false
+
+    - name: Backup MaaSModelRef resources
+      ansible.builtin.copy:
+        content: "{{ item | to_nice_yaml }}"
+        dest: "{{ _backup_dir }}/maasmodelref-{{ item.metadata.name }}.yml"
+        mode: "0640"
+      loop: "{{ _all_refs.resources | default([]) }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when: _all_refs.resources | default([]) | length > 0
+
+    - name: Get ClusterStorageContainer
+      kubernetes.core.k8s_info:
+        api_version: serving.kserve.io/v1alpha1
+        kind: ClusterStorageContainer
+        name: default
+      register: _csc
+      failed_when: false
+
+    - name: Backup ClusterStorageContainer
+      ansible.builtin.copy:
+        content: "{{ _csc.resources[0] | to_nice_yaml }}"
+        dest: "{{ _backup_dir }}/clusterstoragecontainer-default.yml"
+        mode: "0640"
+      when: _csc.resources | default([]) | length > 0
+
+    - name: Show backup location
+      ansible.builtin.debug:
+        msg: "リソースのバックアップを保存しました: {{ _backup_dir }}"
+
+    # -----------------------------------------------------------------------
+    # Step 2: Delete LLMInferenceServices
+    # -----------------------------------------------------------------------
     - name: Delete LLMInferenceServices
       kubernetes.core.k8s:
         state: absent
@@ -23,14 +87,21 @@
         label: "{{ item.metadata.name }}"
       failed_when: false
 
-    - name: Get all MaaSModelRef
+    - name: Wait for LLMInferenceService deletion
       kubernetes.core.k8s_info:
-        api_version: maas.opendatahub.io/v1alpha1
-        kind: MaaSModelRef
+        api_version: serving.kserve.io/v1alpha2
+        kind: LLMInferenceService
         namespace: "{{ llm_namespace | default('llm-serving') }}"
-      register: _all_refs
+      register: _lis_remaining
+      until: _lis_remaining.resources | default([]) | length == 0
+      retries: 30
+      delay: 10
       failed_when: false
+      when: _all_lis.resources | default([]) | length > 0
 
+    # -----------------------------------------------------------------------
+    # Step 3: Delete MaaSModelRef resources
+    # -----------------------------------------------------------------------
     - name: Delete MaaSModelRef resources
       kubernetes.core.k8s:
         state: absent
@@ -43,6 +114,9 @@
         label: "{{ item.metadata.name }}"
       failed_when: false
 
+    # -----------------------------------------------------------------------
+    # Step 4: Delete remaining resources
+    # -----------------------------------------------------------------------
     - name: Delete ClusterStorageContainer
       kubernetes.core.k8s:
         state: absent
@@ -73,4 +147,5 @@
     - ansible.builtin.fail:
         msg: |
           LLM Serving のアンインストールに失敗しました。
+          バックアップ: {{ _backup_dir | default('(未作成)') }}
           再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,llm -e uninstall_llm_serving=true
