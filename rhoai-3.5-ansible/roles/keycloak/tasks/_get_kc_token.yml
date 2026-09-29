@@ -1,35 +1,89 @@
 ---
 # Get Keycloak admin token and set _kc_token fact
-- name: Get Keycloak admin username
-  ansible.builtin.command: >-
-    oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
-    -o jsonpath='{.data.username}'
-  changed_when: false
-  register: _kc_admin_user_b64
+# If the initial-admin credentials are stale (e.g. after DB rebuild),
+# automatically regenerate them by deleting the Secret and restarting the Keycloak Pod.
+- name: Get Keycloak admin token
+  block:
+    - name: Get Keycloak admin username
+      ansible.builtin.command: >-
+        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+        -o jsonpath='{.data.username}'
+      changed_when: false
+      register: _kc_admin_user_b64
 
-- name: Get Keycloak admin password
-  ansible.builtin.command: >-
-    oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
-    -o jsonpath='{.data.password}'
-  changed_when: false
-  register: _kc_admin_pass_b64
+    - name: Get Keycloak admin password
+      ansible.builtin.command: >-
+        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+        -o jsonpath='{.data.password}'
+      changed_when: false
+      register: _kc_admin_pass_b64
 
-- name: Obtain Keycloak admin token
-  ansible.builtin.uri:
-    url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
-    method: POST
-    body_format: form-urlencoded
-    body:
-      client_id: admin-cli
-      username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
-      password: "{{ _kc_admin_pass_b64.stdout | b64decode }}"
-      grant_type: password
-    validate_certs: false
-    return_content: true
-  register: _kc_token_response
-  retries: 5
-  delay: 10
-  until: _kc_token_response.status == 200
+    - name: Obtain Keycloak admin token
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
+          password: "{{ _kc_admin_pass_b64.stdout | b64decode }}"
+          grant_type: password
+        validate_certs: false
+        return_content: true
+      register: _kc_token_response
+      retries: 5
+      delay: 10
+      until: _kc_token_response.status == 200
+
+  rescue:
+    - name: "Recovery: Delete stale keycloak-initial-admin Secret"
+      ansible.builtin.command: >-
+        oc delete secret keycloak-initial-admin -n {{ keycloak_namespace }}
+      changed_when: true
+
+    - name: "Recovery: Restart Keycloak Pod to regenerate admin credentials"
+      ansible.builtin.command: >-
+        oc delete pod -n {{ keycloak_namespace }} -l app=keycloak --wait=false
+      changed_when: true
+
+    - name: "Recovery: Wait for Keycloak Pod to be Ready"
+      ansible.builtin.command: >-
+        oc rollout status statefulset/keycloak -n {{ keycloak_namespace }} --timeout=180s
+      changed_when: false
+
+    - name: "Recovery: Wait for new keycloak-initial-admin Secret"
+      ansible.builtin.command: >-
+        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+        -o jsonpath='{.data.password}'
+      changed_when: false
+      register: _kc_new_pass_b64
+      retries: 30
+      delay: 10
+      until: _kc_new_pass_b64.rc == 0 and _kc_new_pass_b64.stdout | length > 0
+
+    - name: "Recovery: Get new admin username"
+      ansible.builtin.command: >-
+        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+        -o jsonpath='{.data.username}'
+      changed_when: false
+      register: _kc_admin_user_b64
+
+    - name: "Recovery: Obtain Keycloak admin token with new credentials"
+      ansible.builtin.uri:
+        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
+          password: "{{ _kc_new_pass_b64.stdout | b64decode }}"
+          grant_type: password
+        validate_certs: false
+        return_content: true
+      register: _kc_token_response
+      retries: 5
+      delay: 10
+      until: _kc_token_response.status == 200
 
 - name: Set Keycloak token fact
   ansible.builtin.set_fact:
