@@ -1,0 +1,31 @@
+# ODH observability ADR: kuadrant-system からのスクレイプには redhat-ods-monitoring からの到達を許可する。
+# 加えて MaaS Gateway (openshift-ingress) から Limitador gRPC (8081) への到達も許可する。
+# app=limitador を selector にした NP があると他 ingress は全拒否になるため、8081 も明示が必要。
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-rhoai-monitoring-scrape
+  namespace: openshift-rhcl
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+spec:
+  podSelector:
+    matchLabels:
+      app: limitador
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: redhat-ods-monitoring
+      ports:
+        - protocol: TCP
+          port: 8080
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-ingress
+      ports:
+        - protocol: TCP
+          port: 8081

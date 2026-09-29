@@ -1,0 +1,789 @@
+---
+apiVersion: observability.openshift.io/v1alpha1
+kind: UIPlugin
+metadata:
+  name: monitoring
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  type: Monitoring
+  monitoring:
+    perses:
+      enabled: true
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: maas-gateway-istio-metrics
+  namespace: openshift-ingress
+  labels:
+    app: maas-gateway
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  selector:
+    matchLabels:
+      gateway.networking.k8s.io/gateway-name: maas-default-gateway
+  podMetricsEndpoints:
+    - port: http-envoy-prom
+      path: /stats/prometheus
+      interval: 15s
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: perses-cluster-monitoring-view
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+subjects:
+  - kind: ServiceAccount
+    name: perses-sa
+    namespace: openshift-cluster-observability-operator
+
+---
+apiVersion: perses.dev/v1alpha2
+kind: PersesGlobalDatasource
+metadata:
+  name: thanos-querier-datasource
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  config:
+    display:
+      name: Thanos Querier
+    default: true
+    plugin:
+      kind: PrometheusDatasource
+      spec:
+        proxy:
+          kind: HTTPProxy
+          spec:
+            url: https://thanos-querier.openshift-monitoring.svc.cluster.local:9091
+            secret: thanos-querier-datasource-secret
+  client:
+    tls:
+      enable: true
+      caCert:
+        type: file
+        certPath: /ca/service-ca.crt
+
+---
+apiVersion: perses.dev/v1alpha2
+kind: PersesDashboard
+metadata:
+  name: maas-gateway-performance
+  namespace: openshift-cluster-observability-operator
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+spec:
+  config:
+    display:
+      name: MaaS Gateway Performance
+      description: "MaaS Gateway request performance dashboard"
+    duration: 1h
+    refreshInterval: 30s
+    layouts:
+      - kind: Grid
+        spec:
+          display:
+            title: Overview
+          items:
+            - x: 0
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-rps'
+            - x: 6
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-error-rate'
+            - x: 12
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-p95-latency'
+            - x: 18
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-rate-limited'
+      - kind: Grid
+        spec:
+          display:
+            title: Request Performance
+          items:
+            - x: 0
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/rps-by-model'
+            - x: 12
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/latency-by-model'
+      - kind: Grid
+        spec:
+          display:
+            title: Errors & Rate Limiting
+          items:
+            - x: 0
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/errors-by-code'
+            - x: 12
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/rate-limit-status'
+      - kind: Grid
+        spec:
+          display:
+            title: Traffic Volume
+          items:
+            - x: 0
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/request-size'
+            - x: 12
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/response-size'
+    panels:
+      stat-rps:
+        kind: Panel
+        spec:
+          display:
+            name: Total Req/Sec
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: decimal
+                decimalPlaces: 1
+              sparkline:
+                color: '#2196f3'
+                width: 1.5
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'sum(rate(istio_requests_total{destination_service=~".*maas.*"}[5m]))'
+      stat-error-rate:
+        kind: Panel
+        spec:
+          display:
+            name: Error Rate
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: percent-decimal
+                decimalPlaces: 2
+              sparkline:
+                color: '#f44336'
+                width: 1.5
+              thresholds:
+                steps:
+                  - value: 0.01
+                  - value: 0.05
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      sum(rate(istio_requests_total{destination_service=~".*maas.*",response_code!~"2.."}[5m]))
+                      /
+                      sum(rate(istio_requests_total{destination_service=~".*maas.*"}[5m]))
+      stat-p95-latency:
+        kind: Panel
+        spec:
+          display:
+            name: P95 Latency
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: milliseconds
+                decimalPlaces: 0
+              sparkline:
+                color: '#ff9800'
+                width: 1.5
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.95,
+                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+      stat-rate-limited:
+        kind: Panel
+        spec:
+          display:
+            name: Rate Limited
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: decimal
+                decimalPlaces: 0
+              sparkline:
+                color: '#9c27b0'
+                width: 1.5
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'sum(rate(limited_calls_total[5m])) or vector(0)'
+      rps-by-model:
+        kind: Panel
+        spec:
+          display:
+            name: Req/Sec by Model
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: req/s
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      sum by (destination_service_name) (
+                        rate(istio_requests_total{destination_service=~".*maas.*"}[5m])
+                      )
+                    seriesNameFormat: '{{destination_service_name}}'
+      latency-by-model:
+        kind: Panel
+        spec:
+          display:
+            name: Latency by Model (p50 / p95 / p99)
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: ms
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.50,
+                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p50'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.95,
+                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p95'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.99,
+                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p99'
+      errors-by-code:
+        kind: Panel
+        spec:
+          display:
+            name: Errors by Response Code
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: req/s
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      sum by (response_code) (
+                        rate(istio_requests_total{destination_service=~".*maas.*",response_code!~"2.."}[5m])
+                      )
+                    seriesNameFormat: 'HTTP {{response_code}}'
+      rate-limit-status:
+        kind: Panel
+        spec:
+          display:
+            name: Rate Limit Decisions
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: decisions/s
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      sum(rate(authorized_calls_total[5m])) or vector(0)
+                    seriesNameFormat: 'authorized'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      sum(rate(limited_calls_total[5m])) or vector(0)
+                    seriesNameFormat: 'limited'
+      request-size:
+        kind: Panel
+        spec:
+          display:
+            name: Request Size (p50 / p95)
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              yAxis:
+                show: true
+                label: bytes
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.50,
+                        sum(rate(istio_request_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p50'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.95,
+                        sum(rate(istio_request_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p95'
+      response-size:
+        kind: Panel
+        spec:
+          display:
+            name: Response Size (p50 / p95)
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              yAxis:
+                show: true
+                label: bytes
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.50,
+                        sum(rate(istio_response_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p50'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      histogram_quantile(0.95,
+                        sum(rate(istio_response_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                      )
+                    seriesNameFormat: 'p95'
+
+---
+apiVersion: perses.dev/v1alpha2
+kind: PersesDashboard
+metadata:
+  name: maas-gateway-gpu-resources
+  namespace: openshift-cluster-observability-operator
+  annotations:
+    argocd.argoproj.io/sync-wave: "3"
+    perses.dev/tags: "gpu,nvidia,dcgm,maas,serving"
+    perses.dev/display-name: "MaaS Gateway GPU Resources"
+spec:
+  config:
+    display:
+      name: MaaS Gateway GPU Resources
+      description: >-
+        NVIDIA DCGM Exporter メトリクスと Kubernetes GPU リソース割当。
+        DCGM メトリクスは GPU Operator の ServiceMonitor 経由で収集される。
+    duration: 1h
+    refreshInterval: 30s
+    layouts:
+      - kind: Grid
+        spec:
+          display:
+            title: Overview
+          items:
+            - x: 0
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-gpu-count'
+            - x: 6
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-gpu-util'
+            - x: 12
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-gpu-mem-used'
+            - x: 18
+              "y": 0
+              width: 6
+              height: 4
+              content:
+                $ref: '#/spec/panels/stat-gpu-temp'
+      - kind: Grid
+        spec:
+          display:
+            title: Utilization & Memory
+          items:
+            - x: 0
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/gpu-util-by-device'
+            - x: 12
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/gpu-mem-by-device'
+      - kind: Grid
+        spec:
+          display:
+            title: Thermals & Power
+          items:
+            - x: 0
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/gpu-temp-by-device'
+            - x: 12
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/gpu-power-by-device'
+      - kind: Grid
+        spec:
+          display:
+            title: Kubernetes GPU Allocation
+          items:
+            - x: 0
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/gpu-allocatable-by-node'
+            - x: 12
+              "y": 0
+              width: 12
+              height: 8
+              content:
+                $ref: '#/spec/panels/gpu-requests-by-namespace'
+    panels:
+      stat-gpu-count:
+        kind: Panel
+        spec:
+          display:
+            name: GPU Devices
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: decimal
+                decimalPlaces: 0
+              sparkline:
+                color: '#76d275'
+                width: 1.5
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'count(DCGM_FI_DEV_GPU_UTIL) or vector(0)'
+      stat-gpu-util:
+        kind: Panel
+        spec:
+          display:
+            name: Avg GPU Utilization
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: percent
+                decimalPlaces: 1
+              sparkline:
+                color: '#2196f3'
+                width: 1.5
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'avg(DCGM_FI_DEV_GPU_UTIL) or vector(0)'
+      stat-gpu-mem-used:
+        kind: Panel
+        spec:
+          display:
+            name: Total FB Memory Used
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: bytes
+                decimalPlaces: 0
+              sparkline:
+                color: '#ff9800'
+                width: 1.5
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'sum(DCGM_FI_DEV_FB_USED * 1024 * 1024) or vector(0)'
+      stat-gpu-temp:
+        kind: Panel
+        spec:
+          display:
+            name: Max GPU Temperature
+          plugin:
+            kind: StatChart
+            spec:
+              calculation: last-number
+              format:
+                unit: celsius
+                decimalPlaces: 0
+              sparkline:
+                color: '#f44336'
+                width: 1.5
+              thresholds:
+                steps:
+                  - value: 80
+                  - value: 90
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'max(DCGM_FI_DEV_GPU_TEMP) or vector(0)'
+      gpu-util-by-device:
+        kind: Panel
+        spec:
+          display:
+            name: GPU Utilization by Device
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: '%'
+                min: 0
+                max: 100
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'DCGM_FI_DEV_GPU_UTIL'
+                    seriesNameFormat: '{{Hostname}} GPU {{gpu}}'
+      gpu-mem-by-device:
+        kind: Panel
+        spec:
+          display:
+            name: Framebuffer Memory by Device
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: MiB
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'DCGM_FI_DEV_FB_USED'
+                    seriesNameFormat: '{{Hostname}} GPU {{gpu}} used'
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'DCGM_FI_DEV_FB_FREE'
+                    seriesNameFormat: '{{Hostname}} GPU {{gpu}} free'
+      gpu-temp-by-device:
+        kind: Panel
+        spec:
+          display:
+            name: GPU Temperature by Device
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: '°C'
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'DCGM_FI_DEV_GPU_TEMP'
+                    seriesNameFormat: '{{Hostname}} GPU {{gpu}}'
+      gpu-power-by-device:
+        kind: Panel
+        spec:
+          display:
+            name: Power Usage by Device
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: W
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'DCGM_FI_DEV_POWER_USAGE'
+                    seriesNameFormat: '{{Hostname}} GPU {{gpu}}'
+      gpu-allocatable-by-node:
+        kind: Panel
+        spec:
+          display:
+            name: GPU Allocatable by Node
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: GPUs
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: 'kube_node_status_allocatable{resource="nvidia_com_gpu"}'
+                    seriesNameFormat: '{{node}}'
+      gpu-requests-by-namespace:
+        kind: Panel
+        spec:
+          display:
+            name: GPU Requests by Namespace
+          plugin:
+            kind: TimeSeriesChart
+            spec:
+              legend:
+                position: bottom
+              yAxis:
+                show: true
+                label: GPUs
+          queries:
+            - kind: TimeSeriesQuery
+              spec:
+                plugin:
+                  kind: PrometheusTimeSeriesQuery
+                  spec:
+                    query: >-
+                      sum by (namespace) (
+                        kube_pod_container_resource_requests{resource="nvidia_com_gpu"}
+                      )
+                    seriesNameFormat: '{{namespace}}'
+

@@ -1,0 +1,23 @@
+# RHOAI MonitoringStack (redhat-ods-monitoring) が Kuadrant PodMonitor を拾わない場合の明示スクレイプ。
+# Usage ダッシュボード (data-science-prometheus-datasource) はこの Prometheus を参照する。
+# upstream: opendatahub-io/models-as-a-service observability; ODH ADR target namespace labeling
+apiVersion: monitoring.rhobs/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: maas-limitador
+  namespace: redhat-ods-monitoring
+  labels:
+    app.kubernetes.io/part-of: maas-gateway
+    monitoring.opendatahub.io/scrape: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  scrapeInterval: 30s
+  metricsPath: /metrics
+  staticConfigs:
+    - targets:
+        # Kuadrant operator が作成する Limitador Service（環境で名前が異なる場合は PodMonitor を優先）
+        - limitador-limitador.openshift-rhcl.svc:8080
+      labels:
+        job: limitador
+

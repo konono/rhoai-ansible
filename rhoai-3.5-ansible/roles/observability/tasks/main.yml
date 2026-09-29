@@ -54,7 +54,7 @@
       kubernetes.core.k8s:
         state: present
         src: "{{ item }}"
-      loop: "{{ lookup('fileglob', role_path + '/../../../manifests/12-rhoai-observability/*.yaml', wantlist=True) | sort }}"
+      loop: "{{ lookup('fileglob', role_path + '/files/*.yaml', wantlist=True) | sort }}"
       when:
         - item | basename != 'kustomization.yaml'
         - item | basename != '05-gpu-utilization.yaml' or _clusterpolicy_existing.resources | length == 0
