@@ -59,6 +59,8 @@ keycloak_groups:
     models: ["*"]
     priority: 20
     quota_tokens_24h: 5000000
+    # cluster_role: cluster-admin  # 追加の ClusterRole を付与する場合に指定
+    # 注: maas-admins → cluster-admin は maas_resources role が別途適用済み
   # グループ名は maas-<モデル名>-users に合わせる
   maas-qwen3-06b-users:
     models: ["qwen3-06b"]
