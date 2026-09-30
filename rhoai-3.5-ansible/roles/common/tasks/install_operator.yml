@@ -51,11 +51,9 @@
     namespace: "{{ operator_namespace }}"
   register: _sub
   until: >-
-    _sub.resources is defined and
-    _sub.resources | length > 0 and
-    _sub.resources[0].status is defined and
-    _sub.resources[0].status.installedCSV is defined and
-    _sub.resources[0].status.installedCSV | length > 0
+    _sub is not failed and
+    (_sub.resources | default([])) | length > 0 and
+    (_sub.resources[0].status | default({})).installedCSV | default('') | length > 0
   retries: 40
   delay: 15
 
@@ -71,11 +69,9 @@
     namespace: "{{ operator_namespace }}"
   register: _csv
   until: >-
-    _csv.resources is defined and
-    _csv.resources | length > 0 and
-    _csv.resources[0].status is defined and
-    _csv.resources[0].status.phase is defined and
-    _csv.resources[0].status.phase == "Succeeded"
+    _csv is not failed and
+    (_csv.resources | default([])) | length > 0 and
+    (_csv.resources[0].status | default({})).phase | default('') == "Succeeded"
   retries: 40
   delay: 15
 

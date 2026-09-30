@@ -57,7 +57,9 @@
         kind: Namespace
         name: cert-manager
       register: _cm_ns
-      until: _cm_ns.resources | default([]) | length == 0
+      until: >-
+        _cm_ns is not failed and
+        (_cm_ns.resources | default([])) | length == 0
       retries: 20
       delay: 10
       failed_when: false

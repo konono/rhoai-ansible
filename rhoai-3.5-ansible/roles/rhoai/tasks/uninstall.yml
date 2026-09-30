@@ -119,7 +119,9 @@
         kind: MLflow
         name: mlflow
       register: _mlflow_cr
-      until: _mlflow_cr.resources | default([]) | length == 0
+      until: >-
+        _mlflow_cr is not failed and
+        (_mlflow_cr.resources | default([])) | length == 0
       retries: 12
       delay: 10
       failed_when: false
@@ -164,7 +166,9 @@
         kind: Namespace
         name: redhat-ods-applications
       register: _rhoai_apps_ns
-      until: _rhoai_apps_ns.resources | default([]) | length == 0
+      until: >-
+        _rhoai_apps_ns is not failed and
+        (_rhoai_apps_ns.resources | default([])) | length == 0
       retries: 60
       delay: 10
 
@@ -174,7 +178,9 @@
         kind: Namespace
         name: redhat-ods-monitoring
       register: _rhoai_mon_ns
-      until: _rhoai_mon_ns.resources | default([]) | length == 0
+      until: >-
+        _rhoai_mon_ns is not failed and
+        (_rhoai_mon_ns.resources | default([])) | length == 0
       retries: 30
       delay: 10
       failed_when: false
@@ -185,7 +191,9 @@
         kind: Namespace
         name: rhods-notebooks
       register: _rhoai_nb_ns
-      until: _rhoai_nb_ns.resources | default([]) | length == 0
+      until: >-
+        _rhoai_nb_ns is not failed and
+        (_rhoai_nb_ns.resources | default([])) | length == 0
       retries: 30
       delay: 10
       failed_when: false
@@ -196,7 +204,9 @@
         kind: Namespace
         name: redhat-ai-gateway-infra
       register: _gw_ns
-      until: _gw_ns.resources | default([]) | length == 0
+      until: >-
+        _gw_ns is not failed and
+        (_gw_ns.resources | default([])) | length == 0
       retries: 30
       delay: 10
       failed_when: false
@@ -218,7 +228,9 @@
         kind: Namespace
         name: redhat-ods-operator
       register: _rhoai_op_ns
-      until: _rhoai_op_ns.resources | default([]) | length == 0
+      until: >-
+        _rhoai_op_ns is not failed and
+        (_rhoai_op_ns.resources | default([])) | length == 0
       retries: 30
       delay: 10
 

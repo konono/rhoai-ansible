@@ -18,7 +18,9 @@
         kind: ClusterPolicy
         name: gpu-cluster-policy
       register: _cp
-      until: _cp.resources | default([]) | length == 0
+      until: >-
+        _cp is not failed and
+        (_cp.resources | default([])) | length == 0
       retries: 30
       delay: 10
       failed_when: false

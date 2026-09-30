@@ -52,7 +52,9 @@
         name: kuadrant
         namespace: openshift-rhcl
       register: _kuadrant
-      until: _kuadrant.resources | default([]) | length == 0
+      until: >-
+        _kuadrant is not failed and
+        (_kuadrant.resources | default([])) | length == 0
       retries: 20
       delay: 10
       failed_when: false

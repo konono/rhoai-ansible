@@ -135,7 +135,9 @@
         name: keycloak-service
         namespace: "{{ keycloak_namespace }}"
       register: _kc_svc
-      until: _kc_svc.resources | length > 0
+      until: >-
+        _kc_svc is not failed and
+        (_kc_svc.resources | default([])) | length > 0
       retries: 24
       delay: 5
     
@@ -160,8 +162,9 @@
         namespace: "{{ keycloak_namespace }}"
       register: _kc
       until: >-
-        _kc.resources | length > 0 and
-        (_kc.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('')) == 'True'
+        _kc is not failed and
+        (_kc.resources | default([])) | length > 0 and
+        ((_kc.resources[0].status | default({})).conditions | default([]) | selectattr('type', 'equalto', 'Ready') | map(attribute='status') | first | default('')) == 'True'
       retries: 60
       delay: 10
     
@@ -235,8 +238,9 @@
             namespace: "{{ keycloak_namespace }}"
           register: _realm
           until: >-
-            _realm.resources | length > 0 and
-            (_realm.resources[0].status.conditions | default([]) | selectattr('type', 'equalto', 'Done') | map(attribute='status') | first | default('')) == 'True'
+            _realm is not failed and
+            (_realm.resources | default([])) | length > 0 and
+            ((_realm.resources[0].status | default({})).conditions | default([]) | selectattr('type', 'equalto', 'Done') | map(attribute='status') | first | default('')) == 'True'
           retries: 24
           delay: 5
     

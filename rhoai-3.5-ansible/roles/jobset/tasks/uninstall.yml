@@ -17,7 +17,9 @@
         kind: JobSetOperator
         name: cluster
       register: _jobset
-      until: _jobset.resources | default([]) | length == 0
+      until: >-
+        _jobset is not failed and
+        (_jobset.resources | default([])) | length == 0
       retries: 12
       delay: 10
       failed_when: false
