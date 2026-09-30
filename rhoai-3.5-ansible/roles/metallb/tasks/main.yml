@@ -32,7 +32,9 @@
         field_selectors:
           - status.phase=Running
       register: _speaker
-      until: _speaker.resources | length > 0
+      until: >-
+        _speaker is not failed and
+        (_speaker.resources | default([])) | length > 0
       retries: 12
       delay: 10
 

@@ -26,7 +26,9 @@
         name: nfd-instance
         namespace: openshift-nfd
       register: _nfd
-      until: _nfd.resources | default([]) | length == 0
+      until: >-
+        _nfd is not failed and
+        (_nfd.resources | default([])) | length == 0
       retries: 20
       delay: 10
       failed_when: false
