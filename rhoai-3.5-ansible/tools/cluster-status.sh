@@ -34,7 +34,7 @@ echo "--- Dashboard URLs ---"
 
 OCP_CONSOLE=$(oc get route console -n openshift-console -o jsonpath='https://{.spec.host}' 2>/dev/null) || true
 RHOAI_DASHBOARD=$(oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='https://{.spec.host}' 2>/dev/null) || true
-MAAS_HOST=$(oc get route maas-passthrough -n openshift-ingress -o jsonpath='{.spec.host}' 2>/dev/null) || true
+MAAS_HOST="maas.${CLUSTER_DOMAIN}"
 DS_GATEWAY_HOST=$(oc get route -n openshift-ingress -o jsonpath='{range .items[*]}{.spec.host}{"\n"}{end}' 2>/dev/null | grep "^rh-ai\." | head -1) || true
 
 MLFLOW_READY=$(oc get mlflow mlflow -n redhat-ods-applications -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null) || true
@@ -87,7 +87,7 @@ echo
 
 # --- 推論エンドポイント ---
 echo "--- 推論エンドポイント ---"
-if [[ -n "${MAAS_HOST}" ]]; then
+if [[ -n "${CLUSTER_DOMAIN}" ]]; then
     # デプロイ済みモデルを動的に検出
     MODEL_NAMES=$(oc get llminferenceservice --all-namespaces --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null) || MODEL_NAMES=""
     if [[ -n "${MODEL_NAMES}" ]]; then
