@@ -589,7 +589,7 @@ uv run ansible-playbook site.yml -i inventory/myenv
 # restore the required roles first and then run verification separately:
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
 
-# API key issuance verification creates a key, so it runs only when explicitly enabled:
+# API key issuance verification creates and revokes a test key, so it runs only when explicitly enabled:
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv -e verify_maas_api_key_issuance=true
 
 # Specific phase only
