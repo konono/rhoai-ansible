@@ -8,7 +8,7 @@
 #   ansible-playbook playbooks/uninstall.yml -i inventory/xxx --tags platform,workload
 #
 # To uninstall a specific role not enabled in inventory:
-#   ansible-playbook playbooks/uninstall.yml -i inventory/xxx --tags platform,rhoai -e uninstall_rhoai=true
+#   ansible-playbook playbooks/uninstall.yml -i inventory/xxx --tags rhoai -e '{"uninstall_rhoai": true}'
 #
 # WARNING: Back up PVC-backed data before running. Red Hat's RHOAI uninstall
 # procedure requires this; the playbook cannot verify that a backup exists.
@@ -32,6 +32,8 @@
     # ==================== Workloads (reverse) ====================
     - name: "Uninstall: Observability"
       ansible.builtin.include_role:
+        apply:
+          tags: [workload, observability]
         name: observability
         tasks_from: uninstall
       when: uninstall_observability | default(install_observability) | default(false)
@@ -39,6 +41,8 @@
 
     - name: "Uninstall: NeMo Guardrails"
       ansible.builtin.include_role:
+        apply:
+          tags: [workload, guardrails]
         name: guardrails
         tasks_from: uninstall
       when: uninstall_guardrails | default(install_guardrails) | default(false)
@@ -46,6 +50,8 @@
 
     - name: "Uninstall: OGX Server"
       ansible.builtin.include_role:
+        apply:
+          tags: [workload, ogx]
         name: ogx
         tasks_from: uninstall
       when: uninstall_ogx | default(install_ogx) | default(false)
@@ -53,6 +59,8 @@
 
     - name: "Uninstall: RH MLflow"
       ansible.builtin.include_role:
+        apply:
+          tags: [workload, mlflow]
         name: mlflow
         tasks_from: uninstall
       when: uninstall_mlflow | default(install_mlflow) | default(false)
@@ -60,6 +68,8 @@
 
     - name: "Uninstall: MaaS Resources"
       ansible.builtin.include_role:
+        apply:
+          tags: [workload, maas]
         name: maas_resources
         tasks_from: uninstall
       when: uninstall_maas_resources | default(install_maas_resources) | default(false)
@@ -67,6 +77,8 @@
 
     - name: "Uninstall: LLM Serving"
       ansible.builtin.include_role:
+        apply:
+          tags: [workload, llm]
         name: llm_serving
         tasks_from: uninstall
       when: uninstall_llm_serving | default(install_llm_serving) | default(false)
@@ -75,6 +87,8 @@
     # ==================== Integration (reverse) ====================
     - name: "Uninstall: Keycloak → AITenant OIDC"
       ansible.builtin.include_role:
+        apply:
+          tags: [integration, rhoai_oidc]
         name: integration_rhoai_oidc
         tasks_from: uninstall
       when: >-
@@ -85,6 +99,8 @@
 
     - name: "Uninstall: Keycloak → MaaS Policies"
       ansible.builtin.include_role:
+        apply:
+          tags: [integration, keycloak_maas]
         name: integration_keycloak_maas
         tasks_from: uninstall
       when: >-
@@ -94,6 +110,8 @@
 
     - name: "Uninstall: Keycloak → OpenShift OAuth"
       ansible.builtin.include_role:
+        apply:
+          tags: [integration, keycloak_oauth]
         name: integration_keycloak_oauth
         tasks_from: uninstall
       when: >-
@@ -104,6 +122,8 @@
     # ==================== Platform (reverse) ====================
     - name: "Uninstall: Keycloak"
       ansible.builtin.include_role:
+        apply:
+          tags: [platform, keycloak]
         name: keycloak
         tasks_from: uninstall
       when: uninstall_keycloak | default(install_keycloak) | default(false)
@@ -111,6 +131,8 @@
 
     - name: "Uninstall: OpenShift AI (RHOAI)"
       ansible.builtin.include_role:
+        apply:
+          tags: [platform, rhoai]
         name: rhoai
         tasks_from: uninstall
       when: uninstall_rhoai | default(install_rhoai) | default(false)
@@ -119,6 +141,8 @@
     # ==================== Storage ====================
     - name: "Uninstall: ODF Object Storage"
       ansible.builtin.include_role:
+        apply:
+          tags: [storage, odf]
         name: odf
         tasks_from: uninstall
       when: uninstall_odf | default(install_odf) | default(false)
@@ -127,6 +151,8 @@
     # ==================== Dependency Operators (reverse) ====================
     - name: "Uninstall: LeaderWorkerSet"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, leaderworkerset]
         name: leaderworkerset
         tasks_from: uninstall
       when: uninstall_leaderworkerset | default(install_leaderworkerset) | default(false)
@@ -134,6 +160,8 @@
 
     - name: "Uninstall: JobSet"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, jobset]
         name: jobset
         tasks_from: uninstall
       when: uninstall_jobset | default(install_jobset) | default(false)
@@ -141,6 +169,8 @@
 
     - name: "Uninstall: Kueue"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, kueue]
         name: kueue
         tasks_from: uninstall
       when: uninstall_kueue | default(install_kueue) | default(false)
@@ -148,6 +178,8 @@
 
     - name: "Uninstall: RHCL (Kuadrant/Authorino)"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, rhcl]
         name: rhcl
         tasks_from: uninstall
       when: uninstall_rhcl | default(install_rhcl) | default(false)
@@ -155,6 +187,8 @@
 
     - name: "Uninstall: GPU Operator"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, gpu]
         name: gpu_operator
         tasks_from: uninstall
       when: uninstall_gpu_operator | default(install_gpu_operator) | default(false)
@@ -162,6 +196,8 @@
 
     - name: "Uninstall: Node Feature Discovery"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, nfd]
         name: nfd
         tasks_from: uninstall
       when: uninstall_nfd | default(install_nfd) | default(false)
@@ -169,6 +205,8 @@
 
     - name: "Uninstall: ServiceMesh"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, servicemesh]
         name: servicemesh
         tasks_from: uninstall
       when: uninstall_servicemesh | default(install_servicemesh) | default(false)
@@ -176,6 +214,8 @@
 
     - name: "Uninstall: cert-manager"
       ansible.builtin.include_role:
+        apply:
+          tags: [deps, cert_manager]
         name: cert_manager
         tasks_from: uninstall
       when: uninstall_cert_manager | default(install_cert_manager) | default(false)
@@ -184,6 +224,8 @@
     # ==================== Infrastructure (reverse) ====================
     - name: "Uninstall: MetalLB"
       ansible.builtin.include_role:
+        apply:
+          tags: [infra, metallb]
         name: metallb
         tasks_from: uninstall
       when: uninstall_metallb | default(install_metallb) | default(false)
@@ -191,6 +233,8 @@
 
     - name: "Uninstall: LVM Operator"
       ansible.builtin.include_role:
+        apply:
+          tags: [infra, lvm]
         name: lvm
         tasks_from: uninstall
       when: uninstall_lvm | default(install_lvm) | default(false)

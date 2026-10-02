@@ -63,4 +63,4 @@
     - ansible.builtin.fail:
         msg: |
           Kueue のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,kueue -e uninstall_kueue=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags kueue -e '{"uninstall_kueue": true}'

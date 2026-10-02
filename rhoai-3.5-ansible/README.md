@@ -887,7 +887,7 @@ Removes enabled components in reverse installation order. The RHOAI role uses Re
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags platform,workload
 
 # Specific roles only (can run even if disabled in inventory)
-uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags deps,gpu -e uninstall_gpu_operator=true
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags gpu -e '{"uninstall_gpu_operator": true}'
 ```
 
 ### 12.3 Available Tags
@@ -924,7 +924,7 @@ Individual control is available via `uninstall_<role>` variables. When not speci
 ```bash
 # Uninstall only RHOAI (ignores other install_* even if true)
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv \
-  --tags platform,rhoai -e uninstall_rhoai=true
+  --tags rhoai -e '{"uninstall_rhoai": true}'
 ```
 
 ### 12.5 Retrying on Errors
@@ -936,7 +936,7 @@ TASK [Fail if PVCs using lvms-vg1 still exist] ********************************
 fatal: [localhost]: FAILED! =>
   msg: |-
     LVM Operator uninstall failed.
-    Retry: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
+    Retry: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags lvm -e '{"uninstall_lvm": true}'
 ```
 
 Replace `inventory/<env>` with your actual inventory path and run the command.
@@ -947,7 +947,8 @@ The roles use these removal steps:
 
 | Role | Uninstall Method |
 |---|---|
-| **RHOAI** | Official ConfigMap+label trigger method. First deletes all resources created during install (MaaS PostgreSQL, Gateway, HardwareProfile, etc.), then triggers Operator auto-cleanup via `delete-self-managed-odh` ConfigMap. Waits for namespace deletion and runs verification |
+| **RHOAI** | Official ConfigMap+label trigger method. Deletes install-created resources, then triggers Operator cleanup via `delete-self-managed-odh`. If namespaces remain, recovers only CRs already being deleted, with no pods and only known finalizers; confirms namespace deletion |
+| **ODF** | Waits for all OBCs to be removed, enables NooBaa `spec.cleanupPolicy.allowNoobaaDeletion`, then deletes NooBaa and its Operator |
 | **ServiceMesh** | Istio CR → IstioCNI CR → namespace → Operator in order |
 | **GPU Operator** | Delete ClusterPolicy CR → wait for deletion → delete Operator + namespace |
 | **cert-manager** | Bulk delete Certificate/Issuer/ClusterIssuer CRs → wait for deletion → delete Operator + namespace |
@@ -958,6 +959,7 @@ The roles use these removal steps:
 > **Notes**:
 > - Back up persistent disks used by PVCs before uninstalling. This is a prerequisite in Red Hat's RHOAI uninstall procedure; the playbook cannot verify that a backup exists.
 > - Remove ODF-backed PVCs and OBCs before removing NooBaa. The ODF role waits for all OBCs to disappear and stops if any remain.
+> - The playbook sets the NooBaa deletion policy after OBC removal, following [Red Hat's procedure](https://access.redhat.com/solutions/5948631).
 > - LVM Operator does not automatically delete LVM resources (VG/LV) on nodes. Handle manually if needed
 > - Deleting cert-manager resources also deletes associated TLS Secrets
 

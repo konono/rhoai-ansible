@@ -281,7 +281,11 @@
         validate_certs: false
         return_content: true
       register: _maas_health
-      failed_when: "'healthy' not in (_maas_health.content | default(''))"
+      until: >-
+        _maas_health.status | default(0) == 200 and
+        'healthy' in (_maas_health.content | default(''))
+      retries: 12
+      delay: 5
       when: install_rhoai | default(true)
       tags: [workload, maas]
 

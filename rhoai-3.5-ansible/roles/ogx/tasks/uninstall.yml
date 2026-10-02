@@ -2,6 +2,17 @@
 # Uninstall: ogx
 
 - block:
+    - name: Check OGX object storage CRDs
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: "{{ item }}"
+      loop:
+        - objectbucketclaims.objectbucket.io
+        - bucketclasses.noobaa.io
+        - backingstores.noobaa.io
+      register: _ogx_storage_crds
+
     - name: Delete OGX ObjectBucketClaim before RHOAI namespace cleanup
       kubernetes.core.k8s:
         state: absent
@@ -9,7 +20,65 @@
         kind: ObjectBucketClaim
         name: ogx-obc
         namespace: redhat-ods-applications
-      failed_when: false
+      when: (_ogx_storage_crds.results[0].resources | default([])) | length > 0
+
+    - name: Wait for OGX ObjectBucketClaim deletion before deleting its bucket class
+      kubernetes.core.k8s_info:
+        api_version: objectbucket.io/v1alpha1
+        kind: ObjectBucketClaim
+        name: ogx-obc
+        namespace: redhat-ods-applications
+      register: _ogx_obc
+      until: (_ogx_obc.resources | default([])) | length == 0
+      retries: 30
+      delay: 10
+      when: (_ogx_storage_crds.results[0].resources | default([])) | length > 0
+
+    - name: Delete OGX BucketClass
+      kubernetes.core.k8s:
+        state: absent
+        api_version: noobaa.io/v1alpha1
+        kind: BucketClass
+        name: ogx-bucket-class
+        namespace: openshift-storage
+      when: (_ogx_storage_crds.results[1].resources | default([])) | length > 0
+
+    - name: Wait for OGX BucketClass deletion
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BucketClass
+        name: ogx-bucket-class
+        namespace: openshift-storage
+      register: _ogx_bucket_class
+      until: (_ogx_bucket_class.resources | default([])) | length == 0
+      retries: 30
+      delay: 10
+      when: (_ogx_storage_crds.results[1].resources | default([])) | length > 0
+
+    - name: Delete OGX BackingStore
+      kubernetes.core.k8s:
+        state: absent
+        api_version: noobaa.io/v1alpha1
+        kind: BackingStore
+        name: ogx-pv-backing-store
+        namespace: openshift-storage
+      register: _ogx_backing_store_delete
+      until: _ogx_backing_store_delete is not failed
+      retries: 30
+      delay: 10
+      when: (_ogx_storage_crds.results[2].resources | default([])) | length > 0
+
+    - name: Wait for OGX BackingStore deletion
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: BackingStore
+        name: ogx-pv-backing-store
+        namespace: openshift-storage
+      register: _ogx_backing_store
+      until: (_ogx_backing_store.resources | default([])) | length == 0
+      retries: 30
+      delay: 10
+      when: (_ogx_storage_crds.results[2].resources | default([])) | length > 0
 
     - name: Delete OGX vllm connection Secret
       kubernetes.core.k8s:
@@ -60,4 +129,4 @@
     - ansible.builtin.fail:
         msg: |
           OGX Server のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,ogx -e uninstall_ogx=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags ogx -e '{"uninstall_ogx": true}'

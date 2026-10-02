@@ -34,4 +34,4 @@
     - ansible.builtin.fail:
         msg: |
           JobSet のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,jobset -e uninstall_jobset=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags jobset -e '{"uninstall_jobset": true}'

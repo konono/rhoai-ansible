@@ -62,4 +62,4 @@
     - ansible.builtin.fail:
         msg: |
           ServiceMesh のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,servicemesh -e uninstall_servicemesh=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags servicemesh -e '{"uninstall_servicemesh": true}'

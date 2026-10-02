@@ -66,4 +66,4 @@
     - ansible.builtin.fail:
         msg: |
           Observability のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,observability -e uninstall_observability=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags observability -e '{"uninstall_observability": true}'

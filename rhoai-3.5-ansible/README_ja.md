@@ -877,7 +877,7 @@ uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags platform,workload
 
 # 特定のロールのみ（inventory で無効でも実行可能）
-uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags deps,gpu -e uninstall_gpu_operator=true
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags gpu -e '{"uninstall_gpu_operator": true}'
 ```
 
 ### 12.3 使用可能なタグ
@@ -914,7 +914,7 @@ uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags deps,g
 ```bash
 # RHOAI だけアンインストール（他の install_* が true でも無視）
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv \
-  --tags platform,rhoai -e uninstall_rhoai=true
+  --tags rhoai -e '{"uninstall_rhoai": true}'
 ```
 
 ### 12.5 エラー時のリトライ
@@ -926,7 +926,7 @@ TASK [Fail if PVCs using lvms-vg1 still exist] ********************************
 fatal: [localhost]: FAILED! =>
   msg: |-
     LVM Operator のアンインストールに失敗しました。
-    再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
+    再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags lvm -e '{"uninstall_lvm": true}'
 ```
 
 表示されたコマンドの `inventory/<env>` を実際のインベントリパスに置き換えて実行してください。
@@ -937,7 +937,8 @@ fatal: [localhost]: FAILED! =>
 
 | ロール | アンインストール方式 |
 |---|---|
-| **RHOAI** | 公式の ConfigMap+label トリガー方式。install で作成した全リソース（MaaS PostgreSQL, Gateway, HardwareProfile 等）を先に削除し、`delete-self-managed-odh` ConfigMap で Operator の自動クリーンアップをトリガー。namespace 削除完了を待機し、検証を実施 |
+| **RHOAI** | 公式の ConfigMap+label トリガー方式。install で作成したリソースを先に削除し、`delete-self-managed-odh` ConfigMap で Operator の自動クリーンアップをトリガー。namespace が残る場合は、削除要求済み・Pod 不在・既知 finalizer の CR に限定して回復し、namespace 削除を確認 |
+| **ODF** | 全 OBC の削除を確認し、NooBaa の `spec.cleanupPolicy.allowNoobaaDeletion` を有効にしてから NooBaa と Operator を削除 |
 | **ServiceMesh** | Istio CR → IstioCNI CR → namespace → Operator の順で削除 |
 | **GPU Operator** | ClusterPolicy CR 削除 → 削除完了待機 → Operator + namespace 削除 |
 | **cert-manager** | Certificate/Issuer/ClusterIssuer CR 一括削除 → 削除完了待機 → Operator + namespace 削除 |
@@ -948,6 +949,7 @@ fatal: [localhost]: FAILED! =>
 > **注意事項**:
 > - アンインストール前に PVC で使用される永続ディスクをバックアップしてください。Red Hat の RHOAI 削除手順の前提条件ですが、playbook はバックアップの有無を確認できません。
 > - NooBaa を削除する前に ODF を利用する PVC と OBC を削除してください。ODF ロールは全 OBC の消滅を待ち、残っていれば停止します。
+> - NooBaa の削除許可設定は [Red Hat の手順](https://access.redhat.com/solutions/5948631) に従い、OBC の消滅後に playbook が設定します。
 > - LVM Operator はノード上の LVM リソース（VG/LV）を自動削除しません。必要に応じて手動で対処してください
 > - cert-manager リソースの削除により、関連する TLS Secret も削除されます
 

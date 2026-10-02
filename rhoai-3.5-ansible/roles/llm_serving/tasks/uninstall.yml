@@ -165,4 +165,4 @@
         msg: |
           LLM Serving のアンインストールに失敗しました。
           バックアップ: {{ _backup_dir | default('(未作成)') }}
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags workload,llm -e uninstall_llm_serving=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags llm -e '{"uninstall_llm_serving": true}'
