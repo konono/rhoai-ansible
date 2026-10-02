@@ -522,11 +522,18 @@
       failed_when: false
       tags: [always]
 
+    - name: Check saved credentials directory
+      ansible.builtin.stat:
+        path: "{{ ansible_root }}/.credentials"
+      register: _cred_dir
+      tags: [always]
+
     - name: Check for saved credentials
       ansible.builtin.find:
         paths: "{{ ansible_root }}/.credentials"
         patterns: "*.password"
       register: _cred_files
+      when: _cred_dir.stat.isdir | default(false)
       tags: [always]
 
     - name: Get Dashboard URL
@@ -558,10 +565,11 @@
 
     - name: Get MaaS endpoint
       ansible.builtin.command: >-
-        oc get route maas-gateway -n openshift-ingress -o jsonpath='https://{.spec.host}'
+        oc get gateway maas-default-gateway -n openshift-ingress
+        -o jsonpath='https://{.spec.listeners[0].hostname}'
       register: _maas_url
       changed_when: false
-      failed_when: false
+      when: install_rhoai | default(true)
       tags: [always]
 
     - name: Get MLflow URL
