@@ -97,6 +97,12 @@
       when: install_rhoai
       tags: [platform, rhoai]
 
+    - name: Recover stale Keycloak admin credentials
+      ansible.builtin.import_role:
+        name: keycloak_admin_recovery
+      when: install_keycloak and keycloak_admin_recovery | default(false) | bool
+      tags: [platform, keycloak, keycloak_recovery]
+
     - name: Keycloak
       ansible.builtin.import_role:
         name: keycloak
@@ -178,3 +184,9 @@
           手動で実行: bash scripts/setup-opencode.sh setup
       when: _opencode.rc | default(0) != 0
       tags: [post_deploy, opencode]
+
+# A full deployment is complete only after the unscoped verification passes.
+# Tagged recovery runs verify their selected components separately; they must
+# not claim that the whole cluster has been restored.
+- import_playbook: playbooks/verify.yml
+  when: "'all' in ansible_run_tags"

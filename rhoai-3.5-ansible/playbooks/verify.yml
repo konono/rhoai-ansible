@@ -272,7 +272,7 @@
         label: "{{ item.key }}"
       when:
         - install_llm_serving | default(true)
-        - (item.value.state | default('present')) == 'present'
+        - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
       tags: [workload, llm]
 
     - name: "Verify: MaaS API healthy"
@@ -292,28 +292,53 @@
         name: "{{ item.key }}"
         namespace: "{{ item.value.namespace | default(model_defaults.namespace | default('llm-serving')) }}"
       register: _modelref
-      failed_when: _modelref.resources | length == 0
+      failed_when: >-
+        _modelref.resources | length == 0 or
+        _modelref.resources[0].status.phase | default('') != 'Ready'
       loop: "{{ models | default({}) | dict2items }}"
       loop_control:
         label: "{{ item.key }}"
       when:
         - install_maas_resources | default(true)
-        - (item.value.state | default('present')) == 'present'
+        - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
       tags: [workload, maas]
 
-    - name: "Verify: MaaS Subscription Active"
+    - name: "Verify: Collect active model names"
+      ansible.builtin.set_fact:
+        _verify_active_model_names: "{{ (_verify_active_model_names | default([])) + [item.key] }}"
+      loop: "{{ models | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - install_maas_resources | default(true)
+        - install_keycloak | default(true)
+        - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
+      tags: [workload, maas]
+
+    - name: "Verify: Each configured MaaS Subscription Active"
       kubernetes.core.k8s_info:
         api_version: maas.opendatahub.io/v1alpha1
         kind: MaaSSubscription
+        name: "{{ item.key }}-subscription"
         namespace: models-as-a-service
       register: _subscriptions
       failed_when: >-
         _subscriptions.resources | length == 0 or
-        (_subscriptions.resources
-         | selectattr('status.phase', 'defined')
-         | selectattr('status.phase', 'equalto', 'Active')
-         | list | length == 0)
-      when: install_maas_resources | default(true) and install_keycloak | default(true)
+        _subscriptions.resources[0].status.phase | default('') != 'Active' or
+        (_expected_models | difference(_subscriptions.resources[0].spec.modelRefs
+         | default([]) | map(attribute='name') | list) | length > 0)
+      vars:
+        _group_models: "{{ item.value.models | default([]) }}"
+        _expected_models: >-
+          {{ _verify_active_model_names | default([]) if '*' in _group_models
+             else (_group_models | intersect(_verify_active_model_names | default([]))) }}
+      loop: "{{ keycloak_groups | default({}) | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - install_maas_resources | default(true)
+        - install_keycloak | default(true)
+        - _expected_models | length > 0
       tags: [workload, maas]
 
     - name: "Verify: Get maas-api Pod name"
@@ -323,7 +348,10 @@
         -o jsonpath='{.items[0].metadata.name}'
       register: _maas_pod
       changed_when: false
-      when: install_maas_resources | default(true) and install_keycloak | default(true)
+      when:
+        - install_maas_resources | default(true)
+        - install_keycloak | default(true)
+        - verify_maas_api_key_issuance | default(false) | bool
       tags: [workload, maas]
 
     - name: "Verify: MaaS API Key issuable"
@@ -342,6 +370,7 @@
       when:
         - install_maas_resources | default(true)
         - install_keycloak | default(true)
+        - verify_maas_api_key_issuance | default(false) | bool
         - _maas_pod.stdout | default('') | length > 0
       tags: [workload, maas]
 

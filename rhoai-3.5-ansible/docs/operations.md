@@ -579,9 +579,58 @@ oc get maassubscription -n models-as-a-service
 
 存在しない場合は `manage_maas_access.yml` を再実行してください。
 
+Subscription が存在しても `Failed` の場合は、参照先モデルを先に確認します。
+Qwen 構成では LLMInferenceService と MaaSModelRef が Ready になってから
+MaaS ポリシーと Guardrails を再適用し、最後に除外なしで検証します。
+
+```bash
+oc get llminferenceservice qwen3-06b -n llm-serving
+oc get maasmodelref qwen3-06b -n llm-serving
+oc get maassubscription -n models-as-a-service
+uv run ansible-playbook site.yml -i inventory/<env> --tags llm
+uv run ansible-playbook site.yml -i inventory/<env> --tags maas,guardrails
+uv run ansible-playbook playbooks/verify.yml -i inventory/<env>
+```
+
+通常の検証は、設定された各グループの MaaSSubscription が Active で、
+対象モデルを参照していることを確認します。
+
 #### Keycloak が起動しない
 
 Keycloak の PostgreSQL が PVC をマウントできていない場合、LVMCluster の状態を確認してください。
+
+#### Keycloak admin credential recovery
+
+PostgreSQL PVC の再作成後に `keycloak-initial-admin` Secret のパスワードで
+admin token を取得できず、HTTP 401 になることがあります。master realm が既に
+存在する場合、Secret の削除や Pod の再起動では DB 内の管理者パスワードは
+再設定されません。`inventory/*/group_vars/all/components.yml` の
+`keycloak_admin_recovery: true` で、`site.yml` の Keycloak デプロイ前に
+復旧ロールを有効にできます。既存の Keycloak が Ready で、Secret の認証が
+成功すれば読み取りのみで終了します。新規構築時は Keycloak CR がないため
+スキップします。HTTP 401 の `Invalid user credentials` を確認した場合だけ
+一時管理者による復旧を実行します。必要なら `false` で無効化できます。
+
+復旧中は Keycloak を一時停止するため、Keycloak を使うログインも停止します。
+元の管理者パスワードを既存 Secret の値に合わせます。DB パスワード、PVC、
+realm データは変更しません。成功後は一時管理者、Job、Secret を削除します。
+対象だけ実行する場合は `site.yml --tags keycloak_recovery` を利用できます。
+
+今回のクラスタでは、DB と realm データを保持したまま次の手順で復旧しました。
+
+1. Keycloak CR と PostgreSQL PVC の状態を確認し、PVC を保全する。
+2. Keycloak CR の `spec.instances` を一時的に 0 にし、全 Keycloak Pod の停止を確認する。
+3. 本番 Pod と同じ Keycloak イメージ・DB 接続設定を使う一時 Job で
+   `kc.sh bootstrap-admin user --username temp-recovery-admin --password:env KC_TEMP_ADMIN_PASSWORD --no-prompt`
+   を実行する。パスワードは一時 Secret から環境変数で渡し、引数やログに記載しない。
+4. `spec.instances` を元の値に戻し、一時管理者で認証する。管理 API から
+   `keycloak-initial-admin` Secret に記録されたユーザーのパスワードを再設定する。
+5. 元の管理者で token endpoint が HTTP 200 を返すことを確認し、一時管理者、
+   Job、Secret を削除する。
+6. 必要なロールを再実行し、最後に除外なしの `verify.yml` を実行する。
+
+一時管理者の作成は Keycloak を停止して行う必要があります。詳細は
+[Keycloak 公式の管理者復旧手順](https://www.keycloak.org/server/bootstrap-admin-recovery)を参照してください。
 
 ---
 

@@ -44,6 +44,7 @@ models:
 
 # ---- Keycloak ----
 keycloak_namespace: keycloak
+keycloak_admin_recovery: true  # Existing, Ready Keycloak only; valid credentials cause no changes.
 keycloak_realm: maas
 keycloak_users:
   - username: admin1

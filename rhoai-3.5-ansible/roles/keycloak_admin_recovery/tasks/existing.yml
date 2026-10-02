@@ -1,0 +1,132 @@
+---
+- name: Retain the checked Keycloak identity
+  ansible.builtin.set_fact:
+    _kc_cr: "{{ _kc_recovery_existing_cr }}"
+
+- name: Read OpenShift apps domain
+  ansible.builtin.command:
+    argv:
+      - oc
+      - get
+      - ingresses.config.openshift.io
+      - cluster
+      - -o
+      - jsonpath={.spec.domain}
+  register: _kc_domain
+  changed_when: false
+
+- name: Read Keycloak server Pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+    label_selectors:
+      - app=keycloak
+      - app.kubernetes.io/managed-by=keycloak-operator
+  register: _kc_pods
+
+- name: Read initial-admin Secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: keycloak-initial-admin
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  register: _kc_initial_secret
+  no_log: true
+
+- name: Read Keycloak database Secret
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: keycloak-db-credentials
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  register: _kc_db_secret
+  no_log: true
+
+- name: Read Keycloak PostgreSQL PVC
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    name: data-postgres-0
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  register: _kc_db_pvc
+
+- name: Reject unknown or incomplete Keycloak topology
+  ansible.builtin.assert:
+    that:
+      - _kc_cr.resources | length == 1
+      - _kc_cr.resources[0].metadata.deletionTimestamp is not defined
+      - _kc_cr.resources[0].spec.instances | default(0) | int > 0
+      - _kc_pods.resources | length == _kc_cr.resources[0].spec.instances | int
+      - _kc_db_secret.resources | length == 1
+      - _kc_db_pvc.resources | length == 1
+      - _kc_db_pvc.resources[0].status.phase | default('') == 'Bound'
+      - _kc_db_pvc.resources[0].metadata.deletionTimestamp is not defined
+      - _kc_initial_secret.resources | length == 1
+      - _kc_initial_secret.resources[0].data.username | default('') | length > 0
+      - _kc_initial_secret.resources[0].data.password | default('') | length > 0
+    fail_msg: >-
+      Keycloak topology or database storage differs from the supported setup.
+      No recovery mutation was attempted.
+    quiet: true
+  no_log: true
+
+- name: Derive recovery inputs from the running Keycloak Pod
+  ansible.builtin.set_fact:
+    _kc_original_instances: "{{ _kc_cr.resources[0].spec.instances | int }}"
+    _kc_image: "{{ _kc_pods.resources[0].spec.containers[0].image }}"
+    _kc_db_env: >-
+      {{ _kc_pods.resources[0].spec.containers[0].env
+         | selectattr('name', 'match', '^KC_DB($|_)') | list }}
+    _kc_original_username: "{{ _kc_initial_secret.resources[0].data.username | b64decode }}"
+    _kc_original_password: "{{ _kc_initial_secret.resources[0].data.password | b64decode }}"
+    _kc_url: "https://keycloak-{{ keycloak_namespace | default('keycloak') }}.{{ _kc_domain.stdout }}"
+  no_log: true
+
+- name: Validate image and database configuration before recovery
+  ansible.builtin.assert:
+    that:
+      - _kc_image | length > 0
+      - _kc_db_env | map(attribute='name') | list is superset(['KC_DB', 'KC_DB_USERNAME', 'KC_DB_PASSWORD', 'KC_DB_URL_HOST', 'KC_DB_URL_DATABASE'])
+      - _kc_original_username | length > 0
+      - _kc_original_password | length > 0
+    fail_msg: >-
+      The running Keycloak Pod does not expose the required image and database
+      settings. No recovery mutation was attempted.
+    quiet: true
+  no_log: true
+
+- name: Check whether the initial-admin Secret already works
+  ansible.builtin.uri:
+    url: "{{ _kc_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      client_id: admin-cli
+      username: "{{ _kc_original_username }}"
+      password: "{{ _kc_original_password }}"
+      grant_type: password
+    validate_certs: false
+    status_code: [200, 401]
+  register: _kc_initial_token
+  no_log: true
+
+- name: Report that recovery is unnecessary
+  ansible.builtin.debug:
+    msg: Keycloak initial-admin credentials work; no cluster resource was changed.
+  when: _kc_initial_token.status == 200
+
+- name: Require a confirmed credential mismatch
+  ansible.builtin.assert:
+    that:
+      - _kc_initial_token.json.error | default('') == 'invalid_grant'
+      - _kc_initial_token.json.error_description | default('') == 'Invalid user credentials'
+    fail_msg: >-
+      Recovery requires HTTP 401 with Invalid user credentials.
+      No mutation was attempted for any other authentication failure.
+    quiet: true
+  when: _kc_initial_token.status == 401
+
+- name: Repair a confirmed stale initial-admin Secret
+  ansible.builtin.include_tasks: recover.yml
+  when: _kc_initial_token.status == 401

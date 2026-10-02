@@ -1,90 +1,52 @@
 ---
-# Get Keycloak admin token and set _kc_token fact
-# If the initial-admin credentials are stale (e.g. after DB rebuild),
-# automatically regenerate them by deleting the Secret and restarting the Keycloak Pod.
-- name: Get Keycloak admin token
-  block:
-    - name: Get Keycloak admin username
-      ansible.builtin.command: >-
-        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
-        -o jsonpath='{.data.username}'
-      changed_when: false
-      register: _kc_admin_user_b64
+# Obtain a Keycloak admin token without changing persistent credentials.
+# Once the master realm exists, recreating keycloak-initial-admin does not
+# reset the admin password stored in the database.
+- name: Get Keycloak admin username
+  ansible.builtin.command: >-
+    oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+    -o jsonpath='{.data.username}'
+  changed_when: false
+  register: _kc_admin_user_b64
+  no_log: true
 
-    - name: Get Keycloak admin password
-      ansible.builtin.command: >-
-        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
-        -o jsonpath='{.data.password}'
-      changed_when: false
-      register: _kc_admin_pass_b64
+- name: Get Keycloak admin password
+  ansible.builtin.command: >-
+    oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
+    -o jsonpath='{.data.password}'
+  changed_when: false
+  register: _kc_admin_pass_b64
+  no_log: true
 
-    - name: Obtain Keycloak admin token
-      ansible.builtin.uri:
-        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
-        method: POST
-        body_format: form-urlencoded
-        body:
-          client_id: admin-cli
-          username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
-          password: "{{ _kc_admin_pass_b64.stdout | b64decode }}"
-          grant_type: password
-        validate_certs: false
-        return_content: true
-      register: _kc_token_response
-      retries: 5
-      delay: 10
-      until: _kc_token_response.status == 200
+- name: Obtain Keycloak admin token
+  ansible.builtin.uri:
+    url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
+    method: POST
+    body_format: form-urlencoded
+    body:
+      client_id: admin-cli
+      username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
+      password: "{{ _kc_admin_pass_b64.stdout | b64decode }}"
+      grant_type: password
+    validate_certs: false
+    return_content: true
+    status_code: [200, 401]
+  register: _kc_token_response
+  retries: 5
+  delay: 10
+  until: _kc_token_response is not failed and _kc_token_response.status in [200, 401]
+  no_log: true
 
-  rescue:
-    - name: "Recovery: Delete stale keycloak-initial-admin Secret"
-      ansible.builtin.command: >-
-        oc delete secret keycloak-initial-admin -n {{ keycloak_namespace }}
-      changed_when: true
-
-    - name: "Recovery: Restart Keycloak Pod to regenerate admin credentials"
-      ansible.builtin.command: >-
-        oc delete pod -n {{ keycloak_namespace }} -l app=keycloak --wait=false
-      changed_when: true
-
-    - name: "Recovery: Wait for Keycloak Pod to be Ready"
-      ansible.builtin.command: >-
-        oc rollout status statefulset/keycloak -n {{ keycloak_namespace }} --timeout=180s
-      changed_when: false
-
-    - name: "Recovery: Wait for new keycloak-initial-admin Secret"
-      ansible.builtin.command: >-
-        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
-        -o jsonpath='{.data.password}'
-      changed_when: false
-      register: _kc_new_pass_b64
-      retries: 30
-      delay: 10
-      until: _kc_new_pass_b64.rc == 0 and _kc_new_pass_b64.stdout | length > 0
-
-    - name: "Recovery: Get new admin username"
-      ansible.builtin.command: >-
-        oc get secret keycloak-initial-admin -n {{ keycloak_namespace }}
-        -o jsonpath='{.data.username}'
-      changed_when: false
-      register: _kc_admin_user_b64
-
-    - name: "Recovery: Obtain Keycloak admin token with new credentials"
-      ansible.builtin.uri:
-        url: "{{ keycloak_url }}/realms/master/protocol/openid-connect/token"
-        method: POST
-        body_format: form-urlencoded
-        body:
-          client_id: admin-cli
-          username: "{{ _kc_admin_user_b64.stdout | b64decode }}"
-          password: "{{ _kc_new_pass_b64.stdout | b64decode }}"
-          grant_type: password
-        validate_certs: false
-        return_content: true
-      register: _kc_token_response
-      retries: 5
-      delay: 10
-      until: _kc_token_response.status == 200
+- name: Fail if Keycloak initial-admin Secret does not match the database
+  ansible.builtin.fail:
+    msg: >-
+      Keycloak rejected the initial-admin Secret (HTTP 401). The Secret and
+      database credentials may diverge after PostgreSQL PVC recreation.
+      Do not delete the Secret or restart the Pod to reset the password;
+      follow docs/operations.md, "Keycloak admin credential recovery".
+  when: _kc_token_response.status == 401
 
 - name: Set Keycloak token fact
   ansible.builtin.set_fact:
     _kc_token: "{{ _kc_token_response.json.access_token }}"
+  no_log: true

@@ -1,0 +1,16 @@
+---
+- name: Check whether a Keycloak instance already exists
+  kubernetes.core.k8s_info:
+    api_version: k8s.keycloak.org/v2beta1
+    kind: Keycloak
+    name: keycloak
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  register: _kc_recovery_existing_cr
+
+- name: Check credentials only for an existing Ready Keycloak
+  ansible.builtin.include_tasks: existing.yml
+  when: >-
+    _kc_recovery_existing_cr.resources | length == 1 and
+    (_kc_recovery_existing_cr.resources[0].status.conditions | default([])
+     | selectattr('type', 'equalto', 'Ready')
+     | selectattr('status', 'equalto', 'True') | list | length > 0)
