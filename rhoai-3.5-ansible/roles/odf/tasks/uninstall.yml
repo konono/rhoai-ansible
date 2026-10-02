@@ -23,6 +23,35 @@
       delay: 10
       when: (_obc_crd.resources | default([])) | length > 0
 
+    - name: Check whether NooBaa exists
+      kubernetes.core.k8s_info:
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: noobaa
+        namespace: openshift-storage
+      register: _noobaa_before_delete
+
+    # NooBaa's admission webhook rejects DELETE unless this flag is set.
+    # https://access.redhat.com/solutions/5948631
+    # Only enable it after all ObjectBucketClaims have been removed.
+    - name: Allow NooBaa deletion
+      kubernetes.core.k8s:
+        state: patched
+        api_version: noobaa.io/v1alpha1
+        kind: NooBaa
+        name: noobaa
+        namespace: openshift-storage
+        definition:
+          apiVersion: noobaa.io/v1alpha1
+          kind: NooBaa
+          metadata:
+            name: noobaa
+            namespace: openshift-storage
+          spec:
+            cleanupPolicy:
+              allowNoobaaDeletion: true
+      when: (_noobaa_before_delete.resources | default([])) | length > 0
+
     - name: Delete NooBaa
       kubernetes.core.k8s:
         state: absent
@@ -30,7 +59,7 @@
         kind: NooBaa
         name: noobaa
         namespace: openshift-storage
-      failed_when: false
+      when: (_noobaa_before_delete.resources | default([])) | length > 0
 
     - name: Wait for NooBaa deletion
       kubernetes.core.k8s_info:
@@ -55,4 +84,4 @@
     - ansible.builtin.fail:
         msg: |
           ODF Object Storage のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags storage,odf -e uninstall_odf=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags odf -e '{"uninstall_odf": true}'

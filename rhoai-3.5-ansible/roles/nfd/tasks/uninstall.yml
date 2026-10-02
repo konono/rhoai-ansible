@@ -43,4 +43,4 @@
     - ansible.builtin.fail:
         msg: |
           Node Feature Discovery のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,nfd -e uninstall_nfd=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags nfd -e '{"uninstall_nfd": true}'

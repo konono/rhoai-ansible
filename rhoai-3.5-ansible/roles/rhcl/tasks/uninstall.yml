@@ -67,4 +67,4 @@
     - ansible.builtin.fail:
         msg: |
           RHCL (Kuadrant/Authorino) のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,rhcl -e uninstall_rhcl=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags rhcl -e '{"uninstall_rhcl": true}'

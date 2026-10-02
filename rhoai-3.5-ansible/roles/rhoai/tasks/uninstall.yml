@@ -160,16 +160,45 @@
     # ---------------------------------------------------------------------------
     # Step 4: Wait for namespace cleanup
     # ---------------------------------------------------------------------------
-    - name: Wait for redhat-ods-applications namespace deletion
+    - name: Wait for operator-managed namespaces before recovery
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+      register: _rhoai_ns_initial
+      until: >-
+        _rhoai_ns_initial is not failed and
+        (_rhoai_ns_initial.resources | default([]) |
+         selectattr('metadata.name', 'in',
+                    ['redhat-ods-applications', 'ai-tenants', 'models-as-a-service']) |
+         list | length) == 0
+      retries: 18
+      delay: 10
+      failed_when: false
+
+    - name: Recheck operator-managed namespaces after the grace period
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+      register: _rhoai_ns_after_wait
+
+    - name: Recover operator-owned finalizers after controllers have stopped
+      ansible.builtin.include_tasks: recover_stale_finalizers.yml
+      when: >-
+        (_rhoai_ns_after_wait.resources |
+         selectattr('metadata.name', 'in',
+                    ['redhat-ods-applications', 'ai-tenants', 'models-as-a-service']) |
+         list | length) > 0
+
+    - name: Confirm redhat-ods-applications namespace deletion
       kubernetes.core.k8s_info:
         api_version: v1
         kind: Namespace
         name: redhat-ods-applications
-      register: _rhoai_apps_ns
+      register: _rhoai_apps_ns_confirm
       until: >-
-        _rhoai_apps_ns is not failed and
-        (_rhoai_apps_ns.resources | default([])) | length == 0
-      retries: 60
+        _rhoai_apps_ns_confirm is not failed and
+        (_rhoai_apps_ns_confirm.resources | default([])) | length == 0
+      retries: 30
       delay: 10
 
     - name: Wait for operator-managed ai-tenants namespace deletion
@@ -181,6 +210,18 @@
       until: >-
         _ai_tenants_ns is not failed and
         (_ai_tenants_ns.resources | default([])) | length == 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for operator-managed models-as-a-service namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: models-as-a-service
+      register: _maas_ns
+      until: >-
+        _maas_ns is not failed and
+        (_maas_ns.resources | default([])) | length == 0
       retries: 30
       delay: 10
 
@@ -275,4 +316,4 @@
     - ansible.builtin.fail:
         msg: |
           OpenShift AI (RHOAI) のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags platform,rhoai -e uninstall_rhoai=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags rhoai -e '{"uninstall_rhoai": true}'

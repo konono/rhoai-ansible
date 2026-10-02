@@ -33,7 +33,7 @@
       LVM Operator のアンインストールを中止しました。
       以下の PVC が lvms-vg1 StorageClass を使用中です。
       先にこれらの PVC を削除してから再実行してください。
-      再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
+      再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags lvm -e '{"uninstall_lvm": true}'
 
       {{ _lvms_pvcs.stdout }}
   when: _lvms_pvcs.rc != 0
@@ -74,4 +74,4 @@
     - ansible.builtin.fail:
         msg: |
           LVM Operator のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags lvm -e '{"uninstall_lvm": true}'

@@ -13,4 +13,4 @@
     - ansible.builtin.fail:
         msg: |
           LeaderWorkerSet のアンインストールに失敗しました。
-          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags deps,leaderworkerset -e uninstall_leaderworkerset=true
+          再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags leaderworkerset -e '{"uninstall_leaderworkerset": true}'

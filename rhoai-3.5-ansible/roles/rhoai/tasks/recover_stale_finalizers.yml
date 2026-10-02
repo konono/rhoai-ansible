@@ -1,0 +1,90 @@
+---
+# The RHOAI self-delete flow can stop its controllers before their child CR
+# finalizers have been cleared. Only recover resources already being deleted,
+# after every relevant namespace has no remaining pods.
+
+- name: Check namespaces before finalizer recovery
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: "{{ item }}"
+  loop:
+    - redhat-ods-operator
+    - redhat-ods-applications
+    - redhat-ai-gateway-infra
+    - ai-tenants
+    - models-as-a-service
+  register: _recovery_namespaces
+
+- name: Refuse finalizer recovery outside namespace deletion
+  ansible.builtin.assert:
+    that:
+      - item.resources | length == 0 or item.resources[0].metadata.deletionTimestamp is defined
+    fail_msg: "{{ item.item }} is not being deleted; refusing finalizer recovery."
+    quiet: true
+  loop: "{{ _recovery_namespaces.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.item not in ['redhat-ods-operator', 'redhat-ai-gateway-infra']
+
+- name: Check pods before finalizer recovery
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ item.item }}"
+  loop: "{{ _recovery_namespaces.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.resources | length > 0
+  register: _recovery_pods
+
+- name: Refuse finalizer recovery while pods remain
+  ansible.builtin.assert:
+    that:
+      - _recovery_pods.results | selectattr('resources', 'defined') | map(attribute='resources') | map('length') | sum == 0
+    fail_msg: RHOAI namespaces are still terminating and pods remain; inspect their controllers before removing finalizers.
+    quiet: true
+
+- name: Inspect operator-owned CRs for stalled finalizers
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    namespace: "{{ item.namespace }}"
+  loop:
+    - {api_version: serving.kserve.io/v1alpha2, kind: LLMInferenceServiceConfig, namespace: redhat-ods-applications, finalizer: serving.kserve.io/llmisvcconfig-finalizer}
+    - {api_version: maas.opendatahub.io/v1alpha1, kind: AITenant, namespace: ai-tenants, finalizer: maas.opendatahub.io/aitenant-cleanup}
+    - {api_version: maas.opendatahub.io/v1alpha1, kind: MaaSAuthPolicy, namespace: models-as-a-service, finalizer: maas.opendatahub.io/authpolicy-cleanup}
+    - {api_version: maas.opendatahub.io/v1alpha1, kind: MaaSSubscription, namespace: models-as-a-service, finalizer: maas.opendatahub.io/subscription-cleanup}
+    - {api_version: maas.opendatahub.io/v1alpha1, kind: MaasTenantConfig, namespace: models-as-a-service, finalizer: maas.opendatahub.io/tenant-cleanup}
+  register: _stale_cr_query
+  failed_when: false
+
+- name: Refuse recovery for CRs without deletion request or with unknown finalizers
+  ansible.builtin.assert:
+    that:
+      - item.1.metadata.deletionTimestamp is defined
+      - (item.1.metadata.finalizers | default([]) | difference([item.0.item.finalizer])) | length == 0
+    fail_msg: "{{ item.1.kind }}/{{ item.1.metadata.name }} is not eligible for finalizer recovery."
+    quiet: true
+  loop: "{{ _stale_cr_query.results | subelements('resources', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.kind }}/{{ item.1.metadata.name }}"
+
+- name: Clear stalled finalizers on already-deleting operator CRs
+  kubernetes.core.k8s:
+    state: patched
+    definition:
+      apiVersion: "{{ item.1.apiVersion }}"
+      kind: "{{ item.1.kind }}"
+      metadata:
+        name: "{{ item.1.metadata.name }}"
+        namespace: "{{ item.1.metadata.namespace }}"
+        finalizers: []
+  register: _stale_finalizer_patch
+  until: _stale_finalizer_patch is not failed
+  retries: 5
+  delay: 5
+  loop: "{{ _stale_cr_query.results | subelements('resources', skip_missing=True) }}"
+  loop_control:
+    label: "{{ item.1.kind }}/{{ item.1.metadata.name }}"
+  when: (item.1.metadata.finalizers | default([])) | length > 0
