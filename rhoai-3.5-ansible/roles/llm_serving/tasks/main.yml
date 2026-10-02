@@ -62,6 +62,7 @@
           type: Opaque
           data:
             HF_TOKEN: "{{ hf_token | b64encode }}"
+      no_log: true
     
     - name: Check if model cache PVC exists
       kubernetes.core.k8s_info:

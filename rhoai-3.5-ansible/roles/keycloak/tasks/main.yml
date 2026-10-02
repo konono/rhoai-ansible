@@ -14,6 +14,7 @@
         keycloak_db_password: >-
           {{ keycloak_db_password if (keycloak_db_password | default('') | length > 0)
              else lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}
+      no_log: true
     
     - name: Set OAuth callback URL
       ansible.builtin.set_fact:
@@ -32,16 +33,19 @@
       ansible.builtin.set_fact:
         oidc_client_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
       when: oidc_client_secret is not defined or oidc_client_secret | length == 0
+      no_log: true
     
     - name: Generate maas_oidc_client_secret if not set
       ansible.builtin.set_fact:
         maas_oidc_client_secret: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
       when: maas_oidc_client_secret is not defined or maas_oidc_client_secret | length == 0
+      no_log: true
     
     - name: Generate group_sync_password if not set
       ansible.builtin.set_fact:
         group_sync_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
       when: group_sync_password is not defined or group_sync_password | length == 0
+      no_log: true
     
     - name: Save OIDC secrets to generated-passwords file
       ansible.builtin.lineinfile:
@@ -57,6 +61,7 @@
         - { key: group_sync_password, value: "{{ group_sync_password }}" }
       loop_control:
         label: "{{ item.key }}"
+      no_log: true
     
     # --- Namespace ---
     - name: Create keycloak namespace

@@ -579,6 +579,22 @@ oc get maassubscription -n models-as-a-service
 
 存在しない場合は `manage_maas_access.yml` を再実行してください。
 
+Subscription が存在しても `Failed` の場合は、参照先モデルを先に確認します。
+Qwen 構成では LLMInferenceService と MaaSModelRef が Ready になってから
+MaaS ポリシーと Guardrails を再適用し、最後に除外なしで検証します。
+
+```bash
+oc get llminferenceservice qwen3-06b -n llm-serving
+oc get maasmodelref qwen3-06b -n llm-serving
+oc get maassubscription -n models-as-a-service
+uv run ansible-playbook site.yml -i inventory/<env> --tags llm
+uv run ansible-playbook site.yml -i inventory/<env> --tags maas,guardrails
+uv run ansible-playbook playbooks/verify.yml -i inventory/<env>
+```
+
+通常の検証は、設定された各グループの MaaSSubscription が Active で、
+対象モデルを参照していることを確認します。
+
 #### Keycloak が起動しない
 
 Keycloak の PostgreSQL が PVC をマウントできていない場合、LVMCluster の状態を確認してください。

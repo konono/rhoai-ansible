@@ -28,21 +28,25 @@
   ansible.builtin.include_vars:
     file: "{{ ansible_root }}/.generated-passwords.yml"
   ignore_errors: true
+  no_log: true
 
 - name: Generate maas_db_password if empty
   ansible.builtin.set_fact:
     maas_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
   when: maas_db_password | default('') | length == 0
+  no_log: true
 
 - name: Generate ogx_db_password if empty
   ansible.builtin.set_fact:
     ogx_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
   when: ogx_db_password | default('') | length == 0
+  no_log: true
 
 - name: Generate keycloak_db_password if empty
   ansible.builtin.set_fact:
     keycloak_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
   when: keycloak_db_password | default('') | length == 0
+  no_log: true
 
 - name: Check if passwords file needs update
   ansible.builtin.set_fact:
@@ -54,6 +58,7 @@
     _prev_maas_db_password: "{{ lookup('file', ansible_root ~ '/.generated-passwords.yml', errors='ignore') | regex_search('maas_db_password:\\s*(\\S+)', '\\1') | default([''], true) | first }}"
     _prev_ogx_db_password: "{{ lookup('file', ansible_root ~ '/.generated-passwords.yml', errors='ignore') | regex_search('ogx_db_password:\\s*(\\S+)', '\\1') | default([''], true) | first }}"
     _prev_keycloak_db_password: "{{ lookup('file', ansible_root ~ '/.generated-passwords.yml', errors='ignore') | regex_search('keycloak_db_password:\\s*(\\S+)', '\\1') | default([''], true) | first }}"
+  no_log: true
 
 - name: Save generated passwords to local file
   ansible.builtin.copy:
@@ -67,6 +72,7 @@
     mode: "0600"
   delegate_to: localhost
   when: _passwords_changed | default(true) | bool
+  no_log: true
 
 - name: Auto-enable install_lvm when storage_class uses lvms
   ansible.builtin.set_fact:

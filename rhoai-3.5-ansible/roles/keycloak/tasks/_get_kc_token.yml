@@ -84,7 +84,9 @@
       retries: 5
       delay: 10
       until: _kc_token_response.status == 200
+  no_log: true
 
 - name: Set Keycloak token fact
   ansible.builtin.set_fact:
     _kc_token: "{{ _kc_token_response.json.access_token }}"
+  no_log: true
