@@ -35,7 +35,9 @@
     kind: Namespace
     name: "{{ operator_namespace }}"
   register: _ns
-  until: _ns.resources | default([]) | length == 0
+  until: >-
+    _ns is not failed and
+    (_ns.resources | default([])) | length == 0
   retries: 30
   delay: 10
   failed_when: false

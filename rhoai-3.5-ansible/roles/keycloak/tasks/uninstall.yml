@@ -43,7 +43,9 @@
         name: keycloak
         namespace: "{{ keycloak_namespace | default('keycloak') }}"
       register: _kc
-      until: _kc.resources | default([]) | length == 0
+      until: >-
+        _kc is not failed and
+        (_kc.resources | default([])) | length == 0
       retries: 20
       delay: 10
       failed_when: false

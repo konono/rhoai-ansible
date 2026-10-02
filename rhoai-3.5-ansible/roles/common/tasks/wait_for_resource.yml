@@ -7,8 +7,9 @@
     namespace: "{{ res_namespace | default(omit) }}"
   register: _res
   until: >-
-    _res.resources | length > 0 and
-    (_res.resources[0].status.conditions | default([])
+    _res is not failed and
+    (_res.resources | default([])) | length > 0 and
+    ((_res.resources[0].status | default({})).conditions | default([])
      | selectattr('type', 'equalto', res_condition_type)
      | selectattr('status', 'equalto', res_condition_status | default('True'))
      | list | length > 0)

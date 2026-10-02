@@ -1,178 +1,180 @@
+[日本語](README_ja.md)
+
 # RHOAI 3.5 Ansible Installer
 
-## 1. 概要
+## 1. Overview
 
-OpenShift AI (RHOAI) 3.5 を OpenShift 環境にデプロイする Ansible Playbook です。Single Node OpenShift (SNO) およびマルチノードクラスターの両方に対応しています。
+An Ansible Playbook for deploying OpenShift AI (RHOAI) 3.5 to an OpenShift environment. It supports both Single Node OpenShift (SNO) and multi-node clusters.
 
-以下のコンポーネントを段階的にインストールします：
+The following components are installed in stages:
 
-- **Infrastructure**: LVM Operator (ローカルストレージ), MetalLB (LoadBalancer)
+- **Infrastructure**: LVM Operator (local storage), MetalLB (LoadBalancer)
 - **Dependency Operators**: cert-manager, ServiceMesh, NFD, GPU Operator, RHCL (Authorino), Kueue, JobSet, LeaderWorkerSet
-- **Storage**: ODF (NooBaa オブジェクトストレージ)
+- **Storage**: ODF (NooBaa object storage)
 - **Platform**: OpenShift AI (RHOAI), Keycloak (IdP)
-- **Integration**: Keycloak → OpenShift OAuth, Keycloak → MaaS ポリシー, AITenant OIDC
-- **Workloads**: LLM Serving (vLLM), MaaS リソース, MLflow, OGX, NeMo Guardrails, Observability
+- **Integration**: Keycloak → OpenShift OAuth, Keycloak → MaaS policies, AITenant OIDC
+- **Workloads**: LLM Serving (vLLM), MaaS resources, MLflow, OGX, NeMo Guardrails, Observability
 
 ---
 
-## 2. 前提条件
+## 2. Prerequisites
 
-### ハードウェア要件
+### Hardware Requirements
 
-| リソース | 最小要件 | 備考 |
+| Resource | Minimum | Notes |
 |---|---|---|
-| GPU | NVIDIA GPU × 1 | GPU Operator が管理。vLLM 推論に必要 |
-| ストレージ | 空きブロックデバイス × 1 以上 | LVM Operator が VolumeGroup として使用。200GB 以上推奨 |
-| メモリ | 64GB 以上 | SNO では全コンポーネントが同一ノードで動作。マルチノードでは分散可能 |
-| CPU | 16 vCPU 以上 | |
+| GPU | NVIDIA GPU × 1 | Managed by GPU Operator. Required for vLLM inference |
+| Storage | 1 or more free block devices | Used by LVM Operator as VolumeGroup. 200GB+ recommended |
+| Memory | 64GB or more | On SNO all components run on a single node. Can be distributed on multi-node |
+| CPU | 16 vCPU or more | |
 
-### ソフトウェア要件
+### Software Requirements
 
-| ソフトウェア | バージョン | 用途 |
+| Software | Version | Purpose |
 |---|---|---|
-| OpenShift | 4.22 | ベースクラスター |
-| Python | 3.12.x | Ansible 実行環境。wheels が cp312 向けにビルドされているため **3.12 系のみ対応** |
-| `oc` | 4.22+ | OpenShift CLI（PATH に存在すること） |
-| pip | 最新 | Python パッケージ管理（uv は自動インストールされるため事前準備不要） |
+| OpenShift | 4.22 | Base cluster |
+| Python | 3.12.x | Ansible execution environment. Wheels are built for cp312, so **only 3.12.x is supported** |
+| `oc` | 4.22+ | OpenShift CLI (must be in PATH) |
+| pip | latest | Python package management (uv is auto-installed, no prior setup needed) |
 
-> **Python バージョンに関する注意**: ホストに Python 3.12 がない場合でも、`download-deps.sh` でスタンドアロン Python 3.12 をダウンロードし、`setup-env.sh` が自動でインストールします。ホストの Python には一切影響しません。
+> **Note on Python version**: Even if the host does not have Python 3.12, `download-deps.sh` downloads a standalone Python 3.12 build, and `setup-env.sh` installs it automatically. It does not affect the host's Python installation.
 
-### Python パッケージ
+### Python Packages
 
-| パッケージ | バージョン | 用途 |
+| Package | Version | Purpose |
 |---|---|---|
-| ansible-core | >= 2.17, < 3.0 | Ansible 本体 |
-| ansible | >= 10.0 | Ansible コレクション |
-| kubernetes | >= 29.0 | `kubernetes.core` モジュール用 |
-| jmespath | >= 1.0 | `json_query` フィルター用 |
+| ansible-core | >= 2.17, < 3.0 | Ansible core |
+| ansible | >= 10.0 | Ansible collections |
+| kubernetes | >= 29.0 | For `kubernetes.core` modules |
+| jmespath | >= 1.0 | For `json_query` filter |
 
-> これらは `pyproject.toml` に定義済みです。手動で pip install する必要はありません。
+> These are defined in `pyproject.toml`. No manual pip install is required.
 
-### Ansible Galaxy コレクション
+### Ansible Galaxy Collections
 
-| コレクション | バージョン | 用途 |
+| Collection | Version | Purpose |
 |---|---|---|
-| kubernetes.core | >= 5.0.0 | K8s リソース管理 |
-| community.general | >= 9.0.0 | 汎用フィルター・モジュール |
+| kubernetes.core | >= 5.0.0 | K8s resource management |
+| community.general | >= 9.0.0 | General-purpose filters and modules |
 
-### クラスター要件
+### Cluster Requirements
 
-- `cluster-admin` 権限でログイン済み（`oc login`）
-- OperatorHub (redhat-operators) にアクセス可能（Disconnected 環境では事前にミラーリング）
-- `*.apps.<cluster_domain>` の DNS が解決可能
+- Logged in with `cluster-admin` privileges (`oc login`)
+- Access to OperatorHub (redhat-operators) (pre-mirror for disconnected environments)
+- DNS resolution for `*.apps.<cluster_domain>`
 
 ---
 
-## 3. セットアップ
+## 3. Setup
 
-### クイックスタート（全環境共通）
+### Quick Start (All Environments)
 
 ```bash
-# 1. オンライン環境で資材をダウンロード（初回のみ）
+# 1. Download dependencies in an online environment (first time only)
 cd ansible
 bash scripts/download-deps.sh
 
-# 2. 環境セットアップ（オンラインでも Disconnected でも同じコマンド）
+# 2. Environment setup (same command for both online and disconnected)
 bash scripts/setup-env.sh
 
-# 3. Playbook 実行
+# 3. Run playbook
 uv run ansible-playbook site.yml -i inventory/myenv
 ```
 
-以上です。以降は詳細な説明です。
+That's it. The following sections provide detailed explanations.
 
-### Playbook の実行方法
+### Running Playbooks
 
-本プロジェクトでは **`uv run` を標準の実行方法とします**。`source .venv/bin/activate` は不要です。
+This project uses **`uv run` as the standard execution method**. `source .venv/bin/activate` is not needed.
 
 ```bash
-# すべての ansible コマンドに uv run を付ける
+# Prefix all ansible commands with uv run
 uv run ansible-playbook site.yml -i inventory/myenv
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
 uv run ansible-galaxy collection list
 uv run ansible --version
 ```
 
-> **なぜ `uv run` か**: `uv run` は `.venv` のアクティベートなしに仮想環境内のコマンドを実行します。activate 忘れによる「ホストの Python で実行してしまった」事故を防ぎます。`pyproject.toml` の `[tool.uv] find-links` 設定により、オフラインでもローカル wheels が自動参照されます。
+> **Why `uv run`**: `uv run` executes commands within the virtual environment without activating `.venv`. This prevents the "accidentally ran with host Python" issue caused by forgetting to activate. The `[tool.uv] find-links` setting in `pyproject.toml` ensures local wheels are referenced automatically even offline.
 
-### Step 1: 資材ダウンロード（オンライン環境で実行）
+### Step 1: Download Dependencies (Run in Online Environment)
 
 ```bash
 cd ansible
 bash scripts/download-deps.sh
 ```
 
-以下がダウンロードされます：
+The following are downloaded:
 
-| ダウンロード先 | 内容 | サイズ目安 |
+| Destination | Contents | Approx. Size |
 |---|---|---|
-| `vendor/uv/` | uv バイナリ（4 プラットフォーム分） | ~70MB |
-| `vendor/python/` | Python 3.12 スタンドアロンビルド（4 プラットフォーム分） | ~200MB |
-| `vendor/wheels/` | Python wheels（macOS ARM64/x86_64, Linux aarch64/x86_64） | ~160MB |
+| `vendor/uv/` | uv binary (4 platforms) | ~70MB |
+| `vendor/python/` | Python 3.12 standalone build (4 platforms) | ~200MB |
+| `vendor/wheels/` | Python wheels (macOS ARM64/x86_64, Linux aarch64/x86_64) | ~160MB |
 | `vendor/collections/` | Ansible Galaxy collections | ~3MB |
 
-特定のコンポーネントだけ再ダウンロードすることもできます：
+You can also re-download specific components:
 
 ```bash
-bash scripts/download-deps.sh python       # Python だけ
-bash scripts/download-deps.sh wheels       # wheels だけ
-bash scripts/download-deps.sh uv python    # 複数指定
-bash scripts/download-deps.sh --help       # ヘルプ
+bash scripts/download-deps.sh python       # Python only
+bash scripts/download-deps.sh wheels       # wheels only
+bash scripts/download-deps.sh uv python    # multiple targets
+bash scripts/download-deps.sh --help       # help
 ```
 
-> **GitHub API レートリミット**: Python スタンドアロンビルドのダウンロードは GitHub API を使用します。`gh` CLI が利用可能な場合は認証済み API を使うためレートリミットの問題は起きません。`gh auth login` を事前に実行しておくことを推奨します。
+> **GitHub API Rate Limiting**: Downloading Python standalone builds uses the GitHub API. If `gh` CLI is available, it uses authenticated API calls to avoid rate limiting. Running `gh auth login` beforehand is recommended.
 
-### Step 2: Disconnected 環境への持ち込み
+### Step 2: Transfer to Disconnected Environment
 
-`ansible/` ディレクトリごとコピーするのが最も確実です。最低限必要なファイルは以下の通りです：
+Copying the entire `ansible/` directory is the most reliable method. The minimum required files are:
 
 ```
 ansible/
-├── vendor/              ← ダウンロードした資材一式（必須）
-│   ├── uv/              ← uv バイナリ
-│   ├── python/          ← Python 3.12 スタンドアロンビルド
+├── vendor/              ← Downloaded dependencies (required)
+│   ├── uv/              ← uv binary
+│   ├── python/          ← Python 3.12 standalone build
 │   ├── wheels/          ← Python wheels
 │   └── collections/     ← Ansible Galaxy collections
-├── pyproject.toml       ← 依存定義 + uv の find-links 設定（必須）
-├── scripts/             ← セットアップスクリプト（必須）
-├── ansible.cfg          ← Ansible 設定（必須）
-├── requirements.yml     ← Galaxy collections 定義（必須）
-├── site.yml             ← メイン Playbook
-├── roles/               ← 各 Role
+├── pyproject.toml       ← Dependency definitions + uv find-links config (required)
+├── scripts/             ← Setup scripts (required)
+├── ansible.cfg          ← Ansible configuration (required)
+├── requirements.yml     ← Galaxy collections definition (required)
+├── site.yml             ← Main playbook
+├── roles/               ← Roles
 ├── inventory/           ← Inventory
 └── ...
 ```
 
-### Step 3: 環境セットアップ（Disconnected 環境で実行）
+### Step 3: Environment Setup (Run in Disconnected Environment)
 
 ```bash
 cd ansible
 bash scripts/setup-env.sh
 ```
 
-`setup-env.sh` は以下を自動で行います：
+`setup-env.sh` automatically performs the following:
 
-1. **uv の配置** — `vendor/uv/` からプラットフォームに合った uv バイナリを `.local/bin/` に展開
-2. **Python 3.12 の配置** — `vendor/python/` からスタンドアロンビルドを `.local/python/` に展開（ホストに Python 3.12 がない場合のみ）
-3. **仮想環境の作成** — `.venv/` を作成し、`vendor/wheels/` から依存パッケージをオフラインインストール
-4. **Galaxy collections のインストール** — `vendor/collections/` から `collections/` にインストール
+1. **uv installation** — Extracts the platform-appropriate uv binary from `vendor/uv/` to `.local/bin/`
+2. **Python 3.12 installation** — Extracts the standalone build from `vendor/python/` to `.local/python/` (only if host lacks Python 3.12)
+3. **Virtual environment creation** — Creates `.venv/` and offline-installs dependencies from `vendor/wheels/`
+4. **Galaxy collections installation** — Installs from `vendor/collections/` to `collections/`
 
-> **ホストへの影響なし**: すべてのファイルは `ansible/` ディレクトリ内に閉じます。ホストの Python、pip、グローバルパッケージには一切影響しません。
+> **No host impact**: All files are contained within the `ansible/` directory. No impact on host Python, pip, or global packages.
 >
-> | 生成先 | 内容 |
+> | Output | Contents |
 > |---|---|
-> | `.venv/` | Python 仮想環境 |
-> | `.local/bin/` | uv バイナリ（ホストに uv がない場合のみ） |
-> | `.local/python/` | Python 3.12（ホストに 3.12 がない場合のみ） |
+> | `.venv/` | Python virtual environment |
+> | `.local/bin/` | uv binary (only if host lacks uv) |
+> | `.local/python/` | Python 3.12 (only if host lacks 3.12) |
 > | `collections/` | Ansible Galaxy collections |
 
-### セットアップの確認
+### Verifying Setup
 
 ```bash
 uv run ansible-playbook --version
 ```
 
-以下のように Python 3.12.x、ansible-core 2.21.x が表示されれば成功です：
+Success looks like Python 3.12.x and ansible-core 2.21.x:
 
 ```
 ansible-playbook [core 2.21.4]
@@ -180,155 +182,155 @@ ansible-playbook [core 2.21.4]
   python version = 3.12.14 (...)
 ```
 
-### トラブルシューティング
+### Troubleshooting
 
-| 症状 | 原因 | 対処 |
+| Symptom | Cause | Solution |
 |---|---|---|
-| `uv: command not found` | uv が未インストール | `bash scripts/setup-env.sh` を再実行（vendor/uv/ から自動インストールされる） |
-| `cp314` の wheel がないエラー | ホストの Python 3.14 が使われている | `vendor/python/` にスタンドアロンビルドがあるか確認。なければ `bash scripts/download-deps.sh python` で再ダウンロード |
-| `uv sync` で解決不能エラー | pyproject.toml の `requires-python` とホストの Python バージョン不一致 | `requires-python = ">=3.12,<3.13"` であることを確認 |
-| Galaxy collection が見つからない | `vendor/collections/` が空 | `bash scripts/download-deps.sh collections` で再ダウンロード |
+| `uv: command not found` | uv not installed | Re-run `bash scripts/setup-env.sh` (auto-installs from vendor/uv/) |
+| `cp314` wheel not found error | Host Python 3.14 is being used | Check if standalone build exists in `vendor/python/`. If not, re-download with `bash scripts/download-deps.sh python` |
+| `uv sync` resolution error | `requires-python` in pyproject.toml doesn't match host Python version | Verify `requires-python = ">=3.12,<3.13"` |
+| Galaxy collection not found | `vendor/collections/` is empty | Re-download with `bash scripts/download-deps.sh collections` |
 
 ---
 
-## 4. Inventory 準備
+## 4. Inventory Preparation
 
-### Inventory の作成
+### Creating an Inventory
 
 ```bash
 cp -r inventory/sample inventory/myenv
 ```
 
-### 編集が必要なファイル
+### Files to Edit
 
-| ファイル | 内容 | 影響範囲 |
+| File | Contents | Impact |
 |---|---|---|
-| `group_vars/all/cluster.yml` | クラスター共通設定（kubeconfig, StorageClass, Proxy, Operator チャネル, DB パスワード） | 複数の Role から参照される。変更は広範囲に影響 |
-| `group_vars/all/components.yml` | ソリューション固有設定（LVM デバイス, モデル名, Keycloak ユーザー, 有効/無効フラグ） | 各 Role 内でのみ使用 |
-| `group_vars/all/vault.yml` | HuggingFace トークン等のシークレット | LLM ダウンロードに必要 |
-| `hosts.yml` | Ansible ホスト定義 | 通常変更不要（localhost 固定） |
+| `group_vars/all/cluster.yml` | Cluster-wide settings (kubeconfig, StorageClass, Proxy, Operator channels, DB passwords) | Referenced by multiple roles. Changes have wide impact |
+| `group_vars/all/components.yml` | Solution-specific settings (LVM devices, model names, Keycloak users, enable/disable flags) | Used only within individual roles |
+| `group_vars/all/vault.yml` | Secrets such as HuggingFace tokens | Required for LLM downloads |
+| `hosts.yml` | Ansible host definition | Usually no changes needed (fixed to localhost) |
 
-> **注意**: `ansible.cfg` のデフォルト inventory は `inventory/sample` です。必ず `-i inventory/myenv` を指定してください。指定を忘れると sample の設定でデプロイされます。
+> **Note**: The default inventory in `ansible.cfg` is `inventory/sample`. Always specify `-i inventory/myenv`. Forgetting this will deploy with sample settings.
 
-### 最低限必要な編集
+### Minimum Required Edits
 
-1. **vault.yml** — HuggingFace トークンの設定（LLM ダウンロードに必須）:
+1. **vault.yml** — Set the HuggingFace token (required for LLM downloads):
    ```bash
    vi inventory/myenv/group_vars/all/vault.yml
    ```
    ```yaml
    hf_token: "hf_xxxxxxxxxxxxxxxxxxxxx"
    ```
-   > HuggingFace の [Access Tokens](https://huggingface.co/settings/tokens) ページで「Read」権限のトークンを作成してください。
+   > Create a "Read" permission token at the HuggingFace [Access Tokens](https://huggingface.co/settings/tokens) page.
 
-2. **cluster.yml** — kubeconfig パスの設定（環境による）:
+2. **cluster.yml** — Set the kubeconfig path (environment-dependent):
    ```bash
    vi inventory/myenv/group_vars/all/cluster.yml
    ```
-   `KUBECONFIG` 環境変数が設定済みなら編集不要です。
+   No edit needed if the `KUBECONFIG` environment variable is already set.
 
-3. **components.yml** — LVM デバイスパス・モデル設定の調整:
+3. **components.yml** — Adjust LVM device paths and model settings:
    ```bash
    vi inventory/myenv/group_vars/all/components.yml
    ```
-   `lvm_device_paths` を実環境のデバイスに合わせてください。
+   Set `lvm_device_paths` to match your environment's actual devices.
 
 ---
 
-## 5. パラメーターリファレンス
+## 5. Parameter Reference
 
-### 5.1 cluster.yml — クラスター共通設定
+### 5.1 cluster.yml — Cluster-Wide Settings
 
-これらのパラメーターは複数の Role から参照されます。変更は広範囲に影響します。
+These parameters are referenced by multiple roles. Changes have wide impact.
 
-#### パス解決
+#### Path Resolution
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `ansible_root` | Ansible プロジェクトルート（`ansible/`）の絶対パス | `playbook_dir` から自動計算 | **変更不要** — `site.yml` と `playbooks/*.yml` のどちらから実行しても正しいパスに解決される |
+| `ansible_root` | Absolute path to the Ansible project root (`ansible/`) | Auto-calculated from `playbook_dir` | **No change needed** — Resolves correctly whether run from `site.yml` or `playbooks/*.yml` |
 
-> `ansible_root` は role やテンプレートからファイルを参照する際の基準パスです。`playbook_dir` はエントリポイントにより変わるため、直接使わず `ansible_root` を使用してください。
+> `ansible_root` is the base path for referencing files from roles and templates. Since `playbook_dir` varies by entry point, use `ansible_root` instead of `playbook_dir` directly.
 
 #### Kubeconfig
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `k8s_kubeconfig` | kubeconfig ファイルのパス | 未設定（`KUBECONFIG` 環境変数 → `~/.kube/config` の順でフォールバック） | **環境による** — `oc login` 後に `KUBECONFIG` 環境変数が設定されていれば不要。明示的に指定したい場合のみ設定 |
+| `k8s_kubeconfig` | Path to kubeconfig file | Not set (falls back to `KUBECONFIG` env var → `~/.kube/config`) | **Environment-dependent** — Not needed if `KUBECONFIG` is set after `oc login`. Set only if you want to specify explicitly |
 
-#### ストレージ
+#### Storage
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `storage_class` | 全 PVC で使用する StorageClass 名 | `lvms-vg1` | **必要に応じて** — LVM を使わない場合（例: EBS 直接使用）は `gp3-csi` 等に変更。`lvms-*` を指定すると `install_lvm` が自動的に有効化される |
+| `storage_class` | StorageClass name used for all PVCs | `lvms-vg1` | **As needed** — Change to `gp3-csi` etc. if not using LVM (e.g., direct EBS). Specifying `lvms-*` automatically enables `install_lvm` |
 
 #### Proxy
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `cluster_proxy.http_proxy` | HTTP プロキシ URL | `""` (空 = スキップ) | **Proxy 環境のみ** |
-| `cluster_proxy.https_proxy` | HTTPS プロキシ URL | `""` | **Proxy 環境のみ** |
-| `cluster_proxy.no_proxy` | プロキシ除外リスト | `"localhost,127.0.0.1,.cluster.local,.svc"` | **Proxy 環境のみ** — `.apps.<cluster_domain>` を含めないよう注意。含めると MaaS Gateway の通信に影響する |
+| `cluster_proxy.http_proxy` | HTTP proxy URL | `""` (empty = skip) | **Proxy environments only** |
+| `cluster_proxy.https_proxy` | HTTPS proxy URL | `""` | **Proxy environments only** |
+| `cluster_proxy.no_proxy` | Proxy exclusion list | `"localhost,127.0.0.1,.cluster.local,.svc"` | **Proxy environments only** — Be careful not to include `.apps.<cluster_domain>` as it affects MaaS Gateway communication |
 
-> **Proxy の注意**: 設定すると `rhoai` ロールが `kube-auth-proxy`, `rhods-dashboard`, `maas-ui` に環境変数として注入します。空の場合はスキップされます。
+> **Proxy note**: When set, the `rhoai` role injects these as environment variables into `kube-auth-proxy`, `rhods-dashboard`, and `maas-ui`. Skipped when empty.
 
-#### Operator チャネル
+#### Operator Channels
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `operator_channels.lvm` | LVM Operator のチャネル | `stable-4.22` | OpenShift バージョンに合わせる |
-| `operator_channels.metallb` | MetalLB のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.cert_manager` | cert-manager のチャネル | `stable-v1` | 通常変更不要 |
-| `operator_channels.servicemesh` | ServiceMesh のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.nfd` | NFD のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.gpu` | GPU Operator のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.rhcl` | RHCL (Kuadrant/Authorino) のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.kueue` | Kueue のチャネル | `stable-v1.4` | 通常変更不要 |
-| `operator_channels.jobset` | JobSet のチャネル | `stable-v1.0` | 通常変更不要 |
-| `operator_channels.leaderworkerset` | LeaderWorkerSet のチャネル | `stable-v1.0` | 通常変更不要 |
-| `operator_channels.coo` | Cluster Observability Operator のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.opentelemetry` | OpenTelemetry のチャネル | `stable` | 通常変更不要 |
-| `operator_channels.odf` | ODF のチャネル | `stable-4.22` | OpenShift バージョンに合わせる |
-| `operator_channels.rhoai` | RHOAI のチャネル | `stable-3.5` | RHOAI バージョンに合わせる |
-| `operator_channels.keycloak` | Keycloak (RHBK) のチャネル | `stable-v26` | 通常変更不要 |
-| `operator_channels.group_sync` | Group Sync Operator のチャネル | `alpha` | 通常変更不要 |
+| `operator_channels.lvm` | LVM Operator channel | `stable-4.22` | Match to OpenShift version |
+| `operator_channels.metallb` | MetalLB channel | `stable` | Usually no change needed |
+| `operator_channels.cert_manager` | cert-manager channel | `stable-v1` | Usually no change needed |
+| `operator_channels.servicemesh` | ServiceMesh channel | `stable` | Usually no change needed |
+| `operator_channels.nfd` | NFD channel | `stable` | Usually no change needed |
+| `operator_channels.gpu` | GPU Operator channel | `stable` | Usually no change needed |
+| `operator_channels.rhcl` | RHCL (Kuadrant/Authorino) channel | `stable` | Usually no change needed |
+| `operator_channels.kueue` | Kueue channel | `stable-v1.4` | Usually no change needed |
+| `operator_channels.jobset` | JobSet channel | `stable-v1.0` | Usually no change needed |
+| `operator_channels.leaderworkerset` | LeaderWorkerSet channel | `stable-v1.0` | Usually no change needed |
+| `operator_channels.coo` | Cluster Observability Operator channel | `stable` | Usually no change needed |
+| `operator_channels.opentelemetry` | OpenTelemetry channel | `stable` | Usually no change needed |
+| `operator_channels.odf` | ODF channel | `stable-4.22` | Match to OpenShift version |
+| `operator_channels.rhoai` | RHOAI channel | `stable-3.5` | Match to RHOAI version |
+| `operator_channels.keycloak` | Keycloak (RHBK) channel | `stable-v26` | Usually no change needed |
+| `operator_channels.group_sync` | Group Sync Operator channel | `alpha` | Usually no change needed |
 
-> **Operator チャネルの注意**: OpenShift のメジャー/マイナーバージョンを変更した場合、`lvm` と `odf` のチャネルも合わせて更新してください。
+> **Operator channel note**: When changing the OpenShift major/minor version, update the `lvm` and `odf` channels accordingly.
 
-#### DB パスワード
+#### DB Passwords
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `maas_db_password` | MaaS PostgreSQL のパスワード | `""` (空 = 自動生成) | **通常不要** — 空にしておけば初回デプロイ時に自動生成され `.generated-passwords.yml` に保存される |
-| `ogx_db_password` | OGX PostgreSQL のパスワード | `""` | 同上 |
-| `keycloak_db_password` | Keycloak PostgreSQL のパスワード | `""` | 同上 |
+| `maas_db_password` | MaaS PostgreSQL password | `""` (empty = auto-generated) | **Usually not needed** — Left empty, a password is auto-generated on first deploy and saved to `.generated-passwords.yml` |
+| `ogx_db_password` | OGX PostgreSQL password | `""` | Same as above |
+| `keycloak_db_password` | Keycloak PostgreSQL password | `""` | Same as above |
 
-> **パスワードの自動生成**: 初回デプロイ時に `preflight` ロールが 20 文字のランダムパスワードを生成し、`ansible/.generated-passwords.yml` に保存します。2回目以降はこのファイルから読み込まれるため、再生成されません。
+> **Auto-generated passwords**: On first deploy, the `preflight` role generates 20-character random passwords and saves them to `ansible/.generated-passwords.yml`. On subsequent runs, passwords are loaded from this file and not regenerated.
 
-### 5.2 components.yml — ソリューション固有設定
+### 5.2 components.yml — Solution-Specific Settings
 
-これらのパラメーターは各 Role 内でのみ使用されます。
+These parameters are used only within their respective roles.
 
-#### LVM 設定
+#### LVM Settings
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `lvm_device_paths` | LVMS VolumeGroup に使用するブロックデバイスのパス（リスト） | `["/dev/disk/by-path/pci-0000:34:00.0-nvme-1"]` | **必須** — 環境ごとにデバイスが異なる |
+| `lvm_device_paths` | Block device paths for LVMS VolumeGroup (list) | `["/dev/disk/by-path/pci-0000:34:00.0-nvme-1"]` | **Required** — Devices vary by environment |
 
-デバイスパスには 3 つの形式が使用可能です：
+Three path formats are available:
 
-| 形式 | 例 | 安定性 | 推奨 |
+| Format | Example | Stability | Recommended |
 |---|---|---|---|
-| デバイス名 | `/dev/nvme1n1` | 低（再起動で番号が変わる場合あり） | △ |
-| PCI パス | `/dev/disk/by-path/pci-0000:34:00.0-nvme-1` | 高（PCI スロット固定） | **◎ 推奨** |
-| デバイス ID | `/dev/disk/by-id/nvme-Amazon_EC2_...` | 高（インスタンス固有） | ○ |
+| Device name | `/dev/nvme1n1` | Low (numbers may change on reboot) | △ |
+| PCI path | `/dev/disk/by-path/pci-0000:34:00.0-nvme-1` | High (PCI slot is fixed) | **◎ Recommended** |
+| Device ID | `/dev/disk/by-id/nvme-Amazon_EC2_...` | High (instance-specific) | ○ |
 
-**デバイス確認コマンド**:
+**Device identification commands**:
 
 ```bash
-# デバイス一覧（サイズ・モデルで用途を判別）
+# Device list (identify purpose by size and model)
 oc debug node/<node-name> -- chroot /host lsblk -d -o NAME,SIZE,TYPE,MODEL
 
-# デバイス名と PCI パスの対応表
+# Device name to PCI path mapping
 oc debug node/<node-name> -- chroot /host bash -c \
   'for d in $(lsblk -dn -o NAME | grep nvme); do \
     BP=$(find /dev/disk/by-path -lname "*/$d" -printf "%f" 2>/dev/null); \
@@ -339,7 +341,7 @@ oc debug node/<node-name> -- chroot /host bash -c \
   done'
 ```
 
-出力例:
+Example output:
 
 ```
 /dev/nvme0n1  300G    Amazon Elastic Block Store               pci-0000:00:04.0-nvme-1
@@ -347,123 +349,123 @@ oc debug node/<node-name> -- chroot /host bash -c \
 /dev/nvme2n1  200G    Amazon Elastic Block Store               pci-0000:23:00.0-nvme-1
 ```
 
-> **EC2 Instance Storage の注意**: インスタンス再起動でデバイス番号が変わります（例: nvme14n1 → nvme1n1）。**必ず PCI パス形式を使用してください。** LVMS は symlink を解決してからデバイスを使用するため、by-path パスが正しく動作します。
+> **EC2 Instance Storage note**: Device numbers may change on instance reboot (e.g., nvme14n1 → nvme1n1). **Always use the PCI path format.** LVMS resolves symlinks before using devices, so by-path paths work correctly.
 
-#### MetalLB 設定
+#### MetalLB Settings
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `metallb_ip_range` | MetalLB で使用する IP アドレス範囲 | `""` (空 = ノード IP から自動計算) | **通常不要** — 空ならノードの InternalIP と同じアドレスを使用。カスタム範囲が必要な場合のみ設定（例: `"192.168.1.100-192.168.1.110"`） |
+| `metallb_ip_range` | IP address range for MetalLB | `""` (empty = auto-calculated from node IP) | **Usually not needed** — When empty, uses the same address as the node's InternalIP. Set only if a custom range is needed (e.g., `"192.168.1.100-192.168.1.110"`) |
 
-#### LLM モデル設定
+#### LLM Model Settings
 
-モデル管理は `models` 変数で一元化されています。デフォルト値は `roles/llm_serving/defaults/main.yml` の `model_defaults` で定義され、モデルごとに上書きしたいフィールドだけ `models` に記述します。
+Model management is centralized in the `models` variable. Default values are defined in `roles/llm_serving/defaults/main.yml` under `model_defaults`. Only fields you want to override need to be specified in `models`.
 
 ```yaml
 models:
   qwen3-06b:
-    hf_repo: Qwen/Qwen3-0.6B       # (必須) HuggingFace リポジトリ名
-    state: present                   # present=デプロイ, absent=削除
-    # 以下はデフォルト値があるため省略可能
+    hf_repo: Qwen/Qwen3-0.6B       # (required) HuggingFace repository name
+    state: present                   # present=deploy, absent=remove
+    # The following have defaults and can be omitted
     # vllm_image: vllm/vllm-openai:v0.28.0
     # tool_call_parser: qwen3_coder
     # reasoning_parser: ""
     # chat_template_configmap: qwen3-chat-template
     # gpu_count: 1
     # vllm_extra_args: ["--max-model-len=4096", "--enable-auto-tool-choice"]
-    # purge: false                   # true なら PVC 上のモデルデータも削除
+    # purge: false                   # true to also delete model data on PVC
 ```
 
-| フィールド | 説明 | デフォルト |
+| Field | Description | Default |
 |---|---|---|
-| `hf_repo` | HuggingFace リポジトリ名（必須） | — |
-| `state` | `present` でデプロイ、`absent` で削除 | `present` |
-| `namespace` | デプロイ先 namespace | `llm-serving` |
-| `vllm_image` | vLLM コンテナイメージ | `vllm/vllm-openai:v0.28.0` |
+| `hf_repo` | HuggingFace repository name (required) | — |
+| `state` | `present` to deploy, `absent` to remove | `present` |
+| `namespace` | Target namespace for deployment | `llm-serving` |
+| `vllm_image` | vLLM container image | `vllm/vllm-openai:v0.28.0` |
 | `tool_call_parser` | `--tool-call-parser` | `qwen3_coder` |
-| `reasoning_parser` | `--reasoning-parser`（空なら省略） | `""` |
-| `chat_template_configmap` | チャットテンプレート ConfigMap 名 | `qwen3-chat-template` |
-| `gpu_count` | 要求 GPU 数 | `1` |
-| `vllm_extra_args` | vLLM 追加引数（リスト） | `["--max-model-len=4096", "--enable-auto-tool-choice"]` |
-| `purge` | `state: absent` 時に PVC キャッシュも削除するか | `false` |
+| `reasoning_parser` | `--reasoning-parser` (omitted if empty) | `""` |
+| `chat_template_configmap` | Chat template ConfigMap name | `qwen3-chat-template` |
+| `gpu_count` | Number of GPUs requested | `1` |
+| `vllm_extra_args` | Additional vLLM arguments (list) | `["--max-model-len=4096", "--enable-auto-tool-choice"]` |
+| `purge` | Whether to delete PVC cache when `state: absent` | `false` |
 
-> **dict キーがモデル名になります。** K8s リソース名に使われるため RFC 1123 準拠（小文字英数字・ハイフン・ドットのみ）が必要です。
+> **The dict key becomes the model name.** It is used as K8s resource names, so it must be RFC 1123 compliant (lowercase alphanumeric, hyphens, and dots only).
 
-#### state による動作
+#### Behavior by State
 
-| state | 動作 |
+| State | Behavior |
 |---|---|
-| `present` | モデルをダウンロード（キャッシュ済みならスキップ）→ LLMInferenceService + MaaSModelRef 作成 → AuthPolicy/Subscription に含める |
-| `absent` | LLMInferenceService + MaaSModelRef 削除（GPU 解放）→ AuthPolicy/Subscription から除外。PVC キャッシュは残る |
-| `absent` + `purge: true` | 上記に加え、PVC 上のモデルデータも削除 |
+| `present` | Download model (skip if cached) → Create LLMInferenceService + MaaSModelRef → Include in AuthPolicy/Subscription |
+| `absent` | Delete LLMInferenceService + MaaSModelRef (release GPU) → Exclude from AuthPolicy/Subscription. PVC cache is retained |
+| `absent` + `purge: true` | In addition to above, also delete model data on PVC |
 
-> **処理順序**: site.yml 実行時、`absent` モデルが先に処理されます（GPU 解放のため）。その後 `present` モデルがデプロイされます。
+> **Processing order**: When running site.yml, `absent` models are processed first (to release GPUs). Then `present` models are deployed.
 >
-> **GPU キャパシティチェック**: `present` モデルの合計 `gpu_count` がクラスタの GPU 数を超える場合、デプロイ前にエラーで停止します。
+> **GPU capacity check**: If the total `gpu_count` of `present` models exceeds the cluster's GPU count, deployment stops with an error before proceeding.
 
-#### Keycloak 設定
+#### Keycloak Settings
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
+| Variable | Description | Default | Customer Change |
 |---|---|---|---|
-| `keycloak_namespace` | Keycloak をデプロイする namespace | `keycloak` | 通常変更不要 |
-| `keycloak_realm` | Keycloak realm 名 | `maas` | 通常変更不要 |
-| `keycloak_users` | 作成するユーザーのリスト | admin1 + testuser1 | **必要に応じて** — ユーザー名、メール、グループ割り当てを環境に合わせる |
-| `keycloak_groups` | MaaS アクセス制御グループの定義 | maas-admins + maas-qwen3-06b-users | **モデル変更時に必須** — グループ名は `maas-<モデル名>-users` 形式 |
+| `keycloak_namespace` | Namespace for Keycloak deployment | `keycloak` | Usually no change needed |
+| `keycloak_realm` | Keycloak realm name | `maas` | Usually no change needed |
+| `keycloak_users` | List of users to create | admin1 + testuser1 | **As needed** — Adjust usernames, emails, and group assignments for your environment |
+| `keycloak_groups` | MaaS access control group definitions | maas-admins + maas-qwen3-06b-users | **Required when changing models** — Group names follow `maas-<model-name>-users` format |
 
-> **命名規則**: グループ名は K8s リソース名に使用されるため RFC 1123 準拠が必要です。`keycloak_groups` の dict キー、`keycloak_users[].groups` の値、`keycloak_groups[].models` の値が整合する必要があります。
+> **Naming convention**: Group names are used as K8s resource names and must be RFC 1123 compliant. The `keycloak_groups` dict keys, `keycloak_users[].groups` values, and `keycloak_groups[].models` values must be consistent.
 
-> **アクセス制御**: `keycloak_groups` の各グループから MaaSAuthPolicy（アクセス許可）と MaaSSubscription（クォータ）が自動生成されます。`keycloak_groups[].models` は `models` 変数の dict キーを参照します。`state: present` のモデルのみポリシーに含まれます。`priority` はリクエスト競合時の優先度（大きいほど優先）、`quota_tokens_24h` は 24 時間あたりのトークン上限です。詳細は [docs/operations.md](docs/operations.md#アクセス制御とクォータ) を参照。
+> **Access control**: MaaSAuthPolicy (access permission) and MaaSSubscription (quota) are auto-generated from each group in `keycloak_groups`. `keycloak_groups[].models` references the dict keys in the `models` variable. Only `state: present` models are included in policies. `priority` is the request contention priority (higher = more priority), and `quota_tokens_24h` is the 24-hour token limit. See [docs/operations.md](docs/operations.md#access-control-and-quotas) for details.
 
-#### Role 有効/無効フラグ
+#### Role Enable/Disable Flags
 
-| 変数 | 対象 Role | デフォルト | 顧客変更 |
+| Variable | Target Role | Default | Customer Change |
 |---|---|---|---|
-| `install_lvm` | LVM Operator | `true` | `storage_class` が `lvms-*` 以外なら `false` に |
-| `install_metallb` | MetalLB | `true` | ベアメタルや LoadBalancer が不要な場合 `false` |
-| `install_cert_manager` | cert-manager | `true` | 通常変更不要（rhoai の依存） |
-| `install_servicemesh` | ServiceMesh | `true` | 通常変更不要（rhoai の依存） |
-| `install_nfd` | Node Feature Discovery | `true` | 通常変更不要（rhoai/gpu の依存） |
-| `install_gpu_operator` | GPU Operator | `true` | GPU なし環境では `false` |
-| `install_rhcl` | RHCL (Kuadrant/Authorino) | `true` | 通常変更不要（rhoai の依存） |
-| `install_kueue` | Kueue | `true` | 通常変更不要（rhoai の依存） |
-| `install_jobset` | JobSet | `true` | 通常変更不要（rhoai の依存） |
-| `install_leaderworkerset` | LeaderWorkerSet | `true` | 通常変更不要（rhoai の依存） |
-| `install_odf` | ODF (NooBaa) | `true` | MLflow / OGX を使わない場合 `false` |
-| `install_rhoai` | OpenShift AI | `true` | 通常変更不要（中核コンポーネント） |
-| `install_keycloak` | Keycloak | `true` | 認証不要なら `false`（ただし MaaS ポリシーも無効になる） |
-| `install_llm_serving` | LLM Serving | `true` | LLM 推論が不要なら `false` |
-| `install_maas_resources` | MaaS リソース | `true` | 通常変更不要（llm_serving の依存） |
-| `install_mlflow` | MLflow | `true` | 実験管理が不要なら `false` |
-| `install_ogx` | OGX Server | `true` | OGX が不要なら `false` |
-| `install_guardrails` | NeMo Guardrails | `true` | Guardrails が不要なら `false` |
-| `install_observability` | Observability | `true` | 監視が不要なら `false` |
+| `install_lvm` | LVM Operator | `true` | Set to `false` if `storage_class` is not `lvms-*` |
+| `install_metallb` | MetalLB | `true` | Set to `false` for bare metal or when LoadBalancer is not needed |
+| `install_cert_manager` | cert-manager | `true` | Usually no change needed (RHOAI dependency) |
+| `install_servicemesh` | ServiceMesh | `true` | Usually no change needed (RHOAI dependency) |
+| `install_nfd` | Node Feature Discovery | `true` | Usually no change needed (RHOAI/GPU dependency) |
+| `install_gpu_operator` | GPU Operator | `true` | Set to `false` for environments without GPU |
+| `install_rhcl` | RHCL (Kuadrant/Authorino) | `true` | Usually no change needed (RHOAI dependency) |
+| `install_kueue` | Kueue | `true` | Usually no change needed (RHOAI dependency) |
+| `install_jobset` | JobSet | `true` | Usually no change needed (RHOAI dependency) |
+| `install_leaderworkerset` | LeaderWorkerSet | `true` | Usually no change needed (RHOAI dependency) |
+| `install_odf` | ODF (NooBaa) | `true` | Set to `false` if not using MLflow / OGX |
+| `install_rhoai` | OpenShift AI | `true` | Usually no change needed (core component) |
+| `install_keycloak` | Keycloak | `true` | Set to `false` if auth is not needed (note: MaaS policies will also be disabled) |
+| `install_llm_serving` | LLM Serving | `true` | Set to `false` if LLM inference is not needed |
+| `install_maas_resources` | MaaS resources | `true` | Usually no change needed (llm_serving dependency) |
+| `install_mlflow` | MLflow | `true` | Set to `false` if experiment tracking is not needed |
+| `install_ogx` | OGX Server | `true` | Set to `false` if OGX is not needed |
+| `install_guardrails` | NeMo Guardrails | `true` | Set to `false` if Guardrails is not needed |
+| `install_observability` | Observability | `true` | Set to `false` if monitoring is not needed |
 
-> **依存関係の自動解決**: 親 Role を有効にすると、依存 Role が自動的に有効化されます。例えば `install_rhoai: true` にすると `cert_manager`, `servicemesh`, `rhcl`, `kueue`, `jobset`, `leaderworkerset`, `nfd`, `gpu_operator` が自動的に有効になります。また `storage_class: lvms-*` の場合、`install_lvm` が自動的に有効化されます。
+> **Automatic dependency resolution**: Enabling a parent role automatically enables its dependencies. For example, setting `install_rhoai: true` automatically enables `cert_manager`, `servicemesh`, `rhcl`, `kueue`, `jobset`, `leaderworkerset`, `nfd`, and `gpu_operator`. Additionally, `install_lvm` is automatically enabled when `storage_class: lvms-*`.
 
-#### Integration 有効/無効フラグ
+#### Integration Enable/Disable Flags
 
-| 変数 | 対象 | デフォルト | 顧客変更 |
+| Variable | Target | Default | Customer Change |
 |---|---|---|---|
-| `integrate_keycloak_oauth` | Keycloak → OpenShift OAuth IdP 登録 | `true` | Keycloak を OpenShift のログインに使わない場合 `false` |
-| `integrate_keycloak_maas` | Keycloak → MaaS AuthPolicy/Subscription 生成 | `true` | 通常変更不要 |
-| `integrate_rhoai_oidc` | AITenant への OIDC 設定 | `true` | 通常変更不要 |
+| `integrate_keycloak_oauth` | Keycloak → OpenShift OAuth IdP registration | `true` | Set to `false` if not using Keycloak for OpenShift login |
+| `integrate_keycloak_maas` | Keycloak → MaaS AuthPolicy/Subscription generation | `true` | Usually no change needed |
+| `integrate_rhoai_oidc` | AITenant OIDC configuration | `true` | Usually no change needed |
 
-### 5.3 vault.yml — シークレット
+### 5.3 vault.yml — Secrets
 
-| 変数 | 説明 | 顧客変更 |
+| Variable | Description | Customer Change |
 |---|---|---|
-| `hf_token` | HuggingFace アクセストークン | **必須** — https://huggingface.co/settings/tokens から取得。モデルダウンロードに必要 |
+| `hf_token` | HuggingFace access token | **Required** — Obtain from https://huggingface.co/settings/tokens. Needed for model downloads |
 
 ---
 
-## 6. デプロイフロー
+## 6. Deployment Flow
 
-### 6.1 Role 一覧と実行順序
+### 6.1 Role List and Execution Order
 
-| # | Phase | Role 名 | タグ | フラグ | デプロイ内容 | 依存 Role |
+| # | Phase | Role Name | Tags | Flag | Deployed Resources | Dependencies |
 |---|---|---|---|---|---|---|
-| 1 | Preflight | `preflight` | `always` | — | oc ログイン確認, パスワード生成, 変数検証, 依存解決 | — |
-| 2 | Infrastructure | `lvm` | `infra, lvm` | `install_lvm` | LVM Operator, LVMCluster, default StorageClass 設定 | — |
+| 1 | Preflight | `preflight` | `always` | — | oc login check, password generation, variable validation, dependency resolution | — |
+| 2 | Infrastructure | `lvm` | `infra, lvm` | `install_lvm` | LVM Operator, LVMCluster, default StorageClass setup | — |
 | 3 | Infrastructure | `metallb` | `infra, metallb` | `install_metallb` | MetalLB Operator, IPAddressPool, L2Advertisement | — |
 | 4 | Dependencies | `cert_manager` | `deps, cert_manager` | `install_cert_manager` | cert-manager Operator | — |
 | 5 | Dependencies | `servicemesh` | `deps, servicemesh` | `install_servicemesh` | ServiceMesh Operator | — |
@@ -476,60 +478,60 @@ models:
 | 12 | Storage | `odf` | `storage, odf` | `install_odf` | ODF Operator, NooBaa CR | — |
 | 13 | Platform | `rhoai` | `platform, rhoai` | `install_rhoai` | RHOAI Operator, DataScienceCluster, MaaS PostgreSQL, MaaS Gateway, HardwareProfile, Authorino TLS, NetworkPolicy | cert_manager, servicemesh, rhcl, kueue, jobset, leaderworkerset, nfd, gpu_operator |
 | 14 | Platform | `keycloak` | `platform, keycloak` | `install_keycloak` | RHBK Operator, PostgreSQL, Keycloak CR, Realm Import, Group Sync Operator | lvm |
-| 15 | Integration | `integration_keycloak_oauth` | `integration, keycloak_oauth` | `integrate_keycloak_oauth` | OpenShift OAuth IdP 登録, keycloak-ca ConfigMap, OIDC client secret | keycloak |
-| 16 | Integration | `integration_keycloak_maas` | `integration, keycloak_maas` | `integrate_keycloak_maas` | Keycloak ユーザー/グループ同期, MaaS AuthPolicy, MaaS Subscription | keycloak |
-| 17 | Integration | `integration_rhoai_oidc` | `integration, rhoai_oidc` | `integrate_rhoai_oidc` | AITenant OIDC パッチ, maas-oidc-client-secret | keycloak, rhoai |
-| 18 | Workload | `llm_serving` | `workload, llm` | `install_llm_serving` | llm-serving Namespace, hf-token Secret, PVC, ClusterStorageContainer, ChatTemplate ConfigMap, Download Job, LLMInferenceService (Ready 待ち最大20分) | rhoai |
+| 15 | Integration | `integration_keycloak_oauth` | `integration, keycloak_oauth` | `integrate_keycloak_oauth` | OpenShift OAuth IdP registration, keycloak-ca ConfigMap, OIDC client secret | keycloak |
+| 16 | Integration | `integration_keycloak_maas` | `integration, keycloak_maas` | `integrate_keycloak_maas` | Keycloak user/group sync, MaaS AuthPolicy, MaaS Subscription | keycloak |
+| 17 | Integration | `integration_rhoai_oidc` | `integration, rhoai_oidc` | `integrate_rhoai_oidc` | AITenant OIDC patch, maas-oidc-client-secret | keycloak, rhoai |
+| 18 | Workload | `llm_serving` | `workload, llm` | `install_llm_serving` | llm-serving Namespace, hf-token Secret, PVC, ClusterStorageContainer, ChatTemplate ConfigMap, Download Job, LLMInferenceService (Ready wait up to 20 min) | rhoai |
 | 19 | Workload | `maas_resources` | `workload, maas` | `install_maas_resources` | Dashboard RBAC | rhoai |
 | 20 | Workload | `mlflow` | `workload, mlflow` | `install_mlflow` | mlflow-workspace Namespace, OBC, MLflow CR | rhoai, odf |
 | 21 | Workload | `ogx` | `workload, ogx` | `install_ogx` | OGX PostgreSQL, OGXServer CR, vLLM connection Secret | rhoai, odf |
 | 22 | Workload | `guardrails` | `workload, guardrails` | `install_guardrails` | NeMo Guardrails ConfigMap, NemoGuardrails CR | llm_serving |
 | 23 | Workload | `observability` | `workload, observability` | `install_observability` | COO Operator, OpenTelemetry Operator, Perses, PrometheusRule, PodMonitor, ScrapeConfig, Dashboard | rhoai |
-| 24 | Post-deploy | — | `post_deploy, opencode` | — | OpenCode 設定 (API Key 発行 + opencode.json 生成) | — |
+| 24 | Post-deploy | — | `post_deploy, opencode` | — | OpenCode configuration (API Key issuance + opencode.json generation) | — |
 
-### 6.2 各 Role のスコープ
+### 6.2 Role Scope Details
 
 #### `preflight` (always)
 
-| 処理 | 詳細 |
+| Process | Details |
 |---|---|
-| oc ログイン確認 | `oc whoami` で接続確認 |
-| cluster_domain 取得 | `ingresses.config.openshift.io/cluster` から `.spec.domain` を取得 |
-| パスワード生成 | `maas_db_password`, `ogx_db_password`, `keycloak_db_password` が空なら自動生成 |
-| パスワード永続化 | `.generated-passwords.yml` に保存（再実行時に読み込み） |
-| LVM 自動有効化 | `storage_class` が `lvms-*` なら `install_lvm` を自動 true |
-| models バリデーション | `models` 変数が定義されていること、各キーが RFC 1123 準拠であること、各モデルに `hf_repo` が定義されていることを検証 |
-| RFC 1123 バリデーション | `models` のキーと `keycloak_groups` のキーが K8s 名として有効か検証 |
-| 必須変数検証 | `storage_class`, `lvm_device_paths`。LLM Serving 有効時のみ: `hf_token`, `llm_storage_initializer_image` |
-| 依存関係解決 | 親 Role が有効なら依存 Role を自動有効化 |
+| oc login check | Verify connection with `oc whoami` |
+| cluster_domain retrieval | Get `.spec.domain` from `ingresses.config.openshift.io/cluster` |
+| Password generation | Auto-generate if `maas_db_password`, `ogx_db_password`, `keycloak_db_password` are empty |
+| Password persistence | Save to `.generated-passwords.yml` (loaded on re-runs) |
+| LVM auto-enable | Auto-set `install_lvm` to true if `storage_class` is `lvms-*` |
+| models validation | Verify `models` variable is defined, each key is RFC 1123 compliant, and each model has `hf_repo` defined |
+| RFC 1123 validation | Verify `models` keys and `keycloak_groups` keys are valid K8s names |
+| Required variable validation | `storage_class`, `lvm_device_paths`. LLM Serving only: `hf_token`, `llm_storage_initializer_image` |
+| Dependency resolution | Auto-enable dependency roles when parent role is enabled |
 
 #### `lvm`
 
-| 作成リソース | namespace |
+| Created Resource | Namespace |
 |---|---|
 | Namespace `openshift-storage` | — |
 | Subscription `lvms-operator` | openshift-lvm-storage |
 | LVMCluster `lvmcluster` | openshift-lvm-storage |
-| StorageClass `lvms-vg1` をデフォルトに設定 | — |
+| Set StorageClass `lvms-vg1` as default | — |
 
 **Wait**: LVMCluster `status.state == Ready`
-**使用変数**: `lvm_device_paths`, `operator_channels.lvm`
+**Variables used**: `lvm_device_paths`, `operator_channels.lvm`
 
 #### `metallb`
 
-| 作成リソース | namespace |
+| Created Resource | Namespace |
 |---|---|
 | Subscription `metallb-operator` | metallb-system |
 | MetalLB CR | metallb-system |
 | IPAddressPool `default-pool` | metallb-system |
 | L2Advertisement `default-l2` | metallb-system |
 
-**Wait**: MetalLB speaker Pod が Running
-**使用変数**: `metallb_ip_range`, `operator_channels.metallb`
+**Wait**: MetalLB speaker Pod is Running
+**Variables used**: `metallb_ip_range`, `operator_channels.metallb`
 
 #### `rhoai`
 
-| 作成リソース | namespace |
+| Created Resource | Namespace |
 |---|---|
 | Subscription `rhods-operator` | redhat-ods-operator |
 | PVC `maas-postgres-data` | redhat-ods-applications |
@@ -542,12 +544,12 @@ models:
 | NetworkPolicy `maas-authorino-allow-rhcl` | redhat-ai-gateway-infra |
 | Gateway ConfigMap `maas-gateway-options` | openshift-ingress |
 
-**Wait**: Gateway `Programmed`, AITenant 存在, rhods-dashboard Deployment Ready
-**使用変数**: `storage_class`, `maas_db_password`, `operator_channels.rhoai`, `cluster_proxy.*`
+**Wait**: Gateway `Programmed`, AITenant exists, rhods-dashboard Deployment Ready
+**Variables used**: `storage_class`, `maas_db_password`, `operator_channels.rhoai`, `cluster_proxy.*`
 
 #### `keycloak`
 
-| 作成リソース | namespace |
+| Created Resource | Namespace |
 |---|---|
 | Namespace `keycloak` | — |
 | Subscription `rhbk-operator` | keycloak |
@@ -558,12 +560,12 @@ models:
 | Subscription `group-sync-operator` | group-sync-operator |
 | GroupSync CR | group-sync-operator |
 
-**Wait**: Keycloak Ready, realm import 完了
-**使用変数**: `keycloak_namespace`, `keycloak_realm`, `keycloak_db_password`, `keycloak_users`, `keycloak_groups`, `operator_channels.keycloak`, `operator_channels.group_sync`
+**Wait**: Keycloak Ready, realm import complete
+**Variables used**: `keycloak_namespace`, `keycloak_realm`, `keycloak_db_password`, `keycloak_users`, `keycloak_groups`, `operator_channels.keycloak`, `operator_channels.group_sync`
 
 #### `llm_serving`
 
-| 作成リソース | namespace |
+| Created Resource | Namespace |
 |---|---|
 | Namespace `llm-serving` | — |
 | Secret `hf-token` | llm-serving |
@@ -574,118 +576,118 @@ models:
 | LLMInferenceService `<model_name>` (per model) | llm-serving |
 | MaaSModelRef `<model_name>` (per model) | llm-serving |
 
-**処理順序**: `state: absent` のモデルを先に削除（GPU 解放）→ `state: present` のモデルをデプロイ
-**Wait**: Download Job 完了, LLMInferenceService Ready (最大 20 分、モデルごと)
-**使用変数**: `models`, `model_defaults`, `llm_storage_initializer_image`, `hf_token`, `storage_class`
+**Processing order**: Delete `state: absent` models first (release GPU) → Deploy `state: present` models
+**Wait**: Download Job complete, LLMInferenceService Ready (up to 20 min per model)
+**Variables used**: `models`, `model_defaults`, `llm_storage_initializer_image`, `hf_token`, `storage_class`
 
 ---
 
-## 7. デプロイ実行
+## 7. Running the Deployment
 
 ```bash
-# フルデプロイ
+# Full deployment
 uv run ansible-playbook site.yml -i inventory/myenv
 
-# フルデプロイの最後に、除外なしの verify.yml が自動実行されます。
-# exit 0 が全構成の検証完了を意味します。タグ指定の部分実行後は、
-# 必要なロールを復旧してから次を別途実行してください。
+# After a full deployment, verify.yml runs automatically with no exclusions.
+# exit 0 means all components passed verification. After a partial run with tags,
+# restore the required roles first and then run verification separately:
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
 
-# API Key 発行まで試す検証は Key を作成するため、明示的に指定した時だけ実行します。
+# API key issuance verification creates a key, so it runs only when explicitly enabled:
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv -e verify_maas_api_key_issuance=true
 
-# 特定フェーズのみ実行
+# Specific phase only
 uv run ansible-playbook site.yml -i inventory/myenv --tags platform
 uv run ansible-playbook site.yml -i inventory/myenv --tags workload
 
-# コンポーネントスキップ
+# Skip components
 uv run ansible-playbook site.yml -i inventory/myenv -e install_ogx=false -e install_guardrails=false
 
-# 使用可能なタグ一覧
+# Available tags
 # always, infra, lvm, metallb, deps, cert_manager, servicemesh, nfd, gpu,
 # rhcl, kueue, jobset, leaderworkerset, storage, odf, platform, rhoai,
 # keycloak, integration, keycloak_oauth, keycloak_maas, rhoai_oidc,
 # workload, llm, maas, mlflow, ogx, guardrails, observability, post_deploy, opencode
 ```
 
-### Operator インストールの共通パターン
+### Common Operator Installation Pattern
 
-全 Operator は `roles/common/tasks/install_operator.yml` を使用して以下の手順でインストールされます：
+All Operators are installed using `roles/common/tasks/install_operator.yml` with the following steps:
 
-1. Namespace 作成
-2. OperatorGroup 作成（存在しない場合のみ）
-3. Subscription 作成
-4. InstalledCSV の出現を待機（最大 10 分）
-5. CSV の `Succeeded` を待機（最大 10 分）
+1. Create Namespace
+2. Create OperatorGroup (only if not exists)
+3. Create Subscription
+4. Wait for InstalledCSV to appear (up to 10 min)
+5. Wait for CSV `Succeeded` (up to 10 min)
 
 ---
 
-## 8. 検証
+## 8. Verification
 
 ```bash
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
 ```
 
-### チェック項目
+### Check Items
 
-| カテゴリ | チェック内容 |
+| Category | Check |
 |---|---|
 | Infrastructure | LVM Operator CSV Succeeded, LVMCluster Ready, LVMCluster VolumeGroupsReady, MetalLB speaker Running |
-| Dependencies | 8 Operator (cert-manager, ServiceMesh, NFD, GPU, RHCL, Kueue, JobSet, LeaderWorkerSet) の CSV Succeeded |
+| Dependencies | 8 Operators (cert-manager, ServiceMesh, NFD, GPU, RHCL, Kueue, JobSet, LeaderWorkerSet) CSV Succeeded |
 | Storage | NooBaa Ready |
 | Platform | RHOAI Operator CSV, DataScienceCluster Ready, MaaS Gateway Programmed, RHOAI Dashboard Ready, Keycloak Ready |
-| Integration | Keycloak ユーザー/グループ割り当て, OAuth IdP 登録, AITenant 存在 |
-| Workloads | LLMInferenceService Ready, MaaS API healthy, MaaSModelRef 存在, MaaS Subscription Active, **API Key 発行テスト**, MLflow Available, OGX Ready, Guardrails Ready |
-| Health | Route HostAlreadyClaimed 検出, 管理対象 namespace の異常 Pod 検出 |
-| Namespaces | 全管理対象 namespace の存在確認 |
+| Integration | Keycloak user/group assignment, OAuth IdP registration, AITenant exists |
+| Workloads | LLMInferenceService Ready, MaaS API healthy, MaaSModelRef exists, MaaS Subscription Active, **API Key issuance test**, MLflow Available, OGX Ready, Guardrails Ready |
+| Health | Route HostAlreadyClaimed detection, abnormal Pod detection in managed namespaces |
+| Namespaces | Existence check for all managed namespaces |
 
-verify 完了時に環境サマリーが表示されます（Console URL, Dashboard URL, Keycloak 管理者情報, MaaS エンドポイント, ユーザーパスワード等）。
+An environment summary is displayed on verify completion (Console URL, Dashboard URL, Keycloak admin info, MaaS endpoint, user passwords, etc.).
 
-### デプロイ後のアクセス情報
+### Post-Deployment Access Information
 
-#### サービス URL
+#### Service URLs
 
-デプロイ後、各サービスには `https://<service>.<cluster_domain>` でアクセスできます。
+After deployment, each service is accessible at `https://<service>.<cluster_domain>`.
 
-| サービス | URL 形式 | 用途 |
+| Service | URL Format | Purpose |
 |---|---|---|
-| OpenShift Console | `https://console-openshift-console.apps.<cluster_domain>` | クラスター管理 |
-| RHOAI Dashboard | `https://rhods-dashboard-redhat-ods-applications.apps.<cluster_domain>` | AI プラットフォーム管理 |
-| Keycloak 管理コンソール | `https://keycloak-keycloak.apps.<cluster_domain>` | IdP 管理 |
-| MaaS Gateway | `https://maas.apps.<cluster_domain>` | LLM 推論 API |
-| MLflow | `https://rh-ai.apps.<cluster_domain>/mlflow` | 実験管理 |
+| OpenShift Console | `https://console-openshift-console.apps.<cluster_domain>` | Cluster management |
+| RHOAI Dashboard | `https://rhods-dashboard-redhat-ods-applications.apps.<cluster_domain>` | AI platform management |
+| Keycloak Admin Console | `https://keycloak-keycloak.apps.<cluster_domain>` | IdP management |
+| MaaS Gateway | `https://maas.apps.<cluster_domain>` | LLM inference API |
+| MLflow | `https://rh-ai.apps.<cluster_domain>/mlflow` | Experiment tracking |
 
-URL を確認するコマンド:
+Commands to check URLs:
 
 ```bash
-# 全 Route の一覧
+# List all Routes
 oc get route --all-namespaces -o custom-columns='SERVICE:.metadata.name,URL:.spec.host'
 
-# 個別確認
+# Individual checks
 oc get route console -n openshift-console -o jsonpath='https://{.spec.host}'
 oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='https://{.spec.host}'
 oc get route keycloak -n keycloak -o jsonpath='https://{.spec.host}'
 oc get route maas-gateway -n openshift-ingress -o jsonpath='https://{.spec.host}'
 ```
 
-#### アカウント情報
+#### Account Information
 
-| アカウント | 場所 | 説明 |
+| Account | Location | Description |
 |---|---|---|
-| OpenShift cluster-admin | `oc login` 時に指定 | クラスター管理者。`oc whoami` で確認 |
-| Keycloak 管理者 | Secret `keycloak-initial-admin` (namespace: keycloak) | Keycloak 管理コンソールのログイン |
-| MaaS ユーザー (admin1, testuser1 等) | `.credentials/<username>.password` | MaaS Dashboard / API Key 発行用 |
-| MaaS API Key | `.vllm-token` | LLM 推論リクエストの Bearer トークン |
+| OpenShift cluster-admin | Specified during `oc login` | Cluster administrator. Check with `oc whoami` |
+| Keycloak admin | Secret `keycloak-initial-admin` (namespace: keycloak) | Login for Keycloak admin console |
+| MaaS users (admin1, testuser1, etc.) | `.credentials/<username>.password` | For MaaS Dashboard / API Key issuance |
+| MaaS API Key | `.vllm-token` | Bearer token for LLM inference requests |
 
-認証情報を確認するコマンド:
+Commands to check credentials:
 
 ```bash
-# Keycloak 管理者
+# Keycloak admin
 oc get secret keycloak-initial-admin -n keycloak \
   -o jsonpath='username: {.data.username} / password: {.data.password}' | \
   xargs -I{} sh -c 'echo {} | sed "s/username: //" | cut -d/ -f1 | base64 -d; echo -n " / "; echo {} | sed "s/.*password: //" | base64 -d; echo'
 
-# MaaS ユーザーパスワード
+# MaaS user passwords
 cat .credentials/admin1.password
 cat .credentials/testuser1.password
 
@@ -693,145 +695,145 @@ cat .credentials/testuser1.password
 cat .vllm-token
 ```
 
-#### 認証情報のファイル配置
+#### Credential File Layout
 
 ```
 rhoai-3.5-ansible/
-├── .credentials/              ← Keycloak ユーザーのパスワード (gitignore 対象)
+├── .credentials/              ← Keycloak user passwords (gitignored)
 │   ├── admin1.password
 │   └── testuser1.password
-├── .vllm-token                ← MaaS API Key (gitignore 対象)
-├── .generated-passwords.yml   ← DB パスワード (gitignore 対象)
+├── .vllm-token                ← MaaS API Key (gitignored)
+├── .generated-passwords.yml   ← DB passwords (gitignored)
 ```
 
-> **注意**: これらのファイルは `.gitignore` 対象です。cleanup → 再デプロイすると API Key は無効になりますが、`.credentials/` のパスワードファイルが残っていれば同じパスワードで再作成されます。
+> **Note**: These files are gitignored. If you cleanup and redeploy, the API Key becomes invalid, but if `.credentials/` password files remain, users are recreated with the same passwords.
 
 ---
 
-## 9. 顧客環境で必ず変更すべき設定
+## 9. Settings That Must Be Changed for Customer Environments
 
-以下は環境ごとに**必ず確認・変更が必要**なパラメーターです。
+The following parameters **must be reviewed and changed** for each environment.
 
-### 必須変更
+### Required Changes
 
-| パラメーター | ファイル | 説明 |
+| Parameter | File | Description |
 |---|---|---|
-| `lvm_device_paths` | components.yml | LVM に使用するデバイスパス。上記のデバイス確認コマンドで特定 |
-| `hf_token` | vault.yml | HuggingFace トークン。モデルダウンロードに必要 |
+| `lvm_device_paths` | components.yml | Device paths for LVM. Identify using the device check commands above |
+| `hf_token` | vault.yml | HuggingFace token. Required for model downloads |
 
-### 環境に応じて変更
+### Change as Needed
 
-| パラメーター | ファイル | 条件 |
+| Parameter | File | Condition |
 |---|---|---|
-| `k8s_kubeconfig` | cluster.yml | `KUBECONFIG` 環境変数が未設定の場合 |
-| `storage_class` | cluster.yml | LVM 以外のストレージを使う場合（例: `gp3-csi`） |
-| `metallb_ip_range` | components.yml | 自動計算が不適切な場合 |
-| `cluster_proxy.*` | cluster.yml | Proxy 環境の場合 |
-| `operator_channels.lvm` | cluster.yml | OpenShift バージョンが 4.22 以外の場合 |
-| `operator_channels.odf` | cluster.yml | 同上 |
-| `install_gpu_operator` | components.yml | GPU なし環境の場合 (`false` に) |
-| `keycloak_users` | components.yml | 実環境のユーザーに変更 |
-| `models` | components.yml | 異なるモデルを使う場合（hf_repo, state 等を定義） |
+| `k8s_kubeconfig` | cluster.yml | If `KUBECONFIG` environment variable is not set |
+| `storage_class` | cluster.yml | If using storage other than LVM (e.g., `gp3-csi`) |
+| `metallb_ip_range` | components.yml | If auto-calculation is unsuitable |
+| `cluster_proxy.*` | cluster.yml | If in a proxy environment |
+| `operator_channels.lvm` | cluster.yml | If OpenShift version is not 4.22 |
+| `operator_channels.odf` | cluster.yml | Same as above |
+| `install_gpu_operator` | components.yml | For environments without GPU (set to `false`) |
+| `keycloak_users` | components.yml | Change to actual environment users |
+| `models` | components.yml | When using different models (define hf_repo, state, etc.) |
 
-### 変更不要（自動処理）
+### No Changes Needed (Automatic)
 
-| パラメーター | 理由 |
+| Parameter | Reason |
 |---|---|
-| `maas_db_password` / `ogx_db_password` / `keycloak_db_password` | 空にしておけば自動生成 |
-| 依存 Operator のフラグ | `install_rhoai: true` で自動有効化 |
-| `install_lvm` | `storage_class: lvms-*` で自動有効化 |
+| `maas_db_password` / `ogx_db_password` / `keycloak_db_password` | Auto-generated when left empty |
+| Dependency Operator flags | Auto-enabled by `install_rhoai: true` |
+| `install_lvm` | Auto-enabled by `storage_class: lvms-*` |
 
 ---
 
-## 10. Disconnected 環境でのデプロイ
+## 10. Deploying in Disconnected Environments
 
-### 概要
+### Overview
 
-Disconnected（インターネット接続なし）環境では以下の事前準備が必要です：
+In disconnected (no internet) environments, the following preparation is required:
 
-1. **Python パッケージ**: `vendor/wheels/` に事前ダウンロード
-2. **Ansible Galaxy collections**: `vendor/collections/` に事前ダウンロード
-3. **Operator カタログ**: OpenShift の OperatorHub をミラーリング
-4. **コンテナイメージ**: vLLM 等のイメージをミラーレジストリに配置
-5. **HuggingFace モデル**: モデルファイルを事前にダウンロード
+1. **Python packages**: Pre-download to `vendor/wheels/`
+2. **Ansible Galaxy collections**: Pre-download to `vendor/collections/`
+3. **Operator catalogs**: Mirror OperatorHub for OpenShift
+4. **Container images**: Place images like vLLM in a mirror registry
+5. **HuggingFace models**: Pre-download model files
 
-### Python / Ansible のオフラインインストール
+### Python / Ansible Offline Installation
 
 ```bash
-# オンライン環境で実行
+# Run in online environment
 cd ansible
 bash scripts/download-deps.sh
 
-# Disconnected 環境で実行
+# Run in disconnected environment
 cd ansible
 bash scripts/setup-env.sh
-# 以降は uv run でコマンド実行（activate 不要）
+# Use uv run for commands from here (no activate needed)
 uv run ansible-playbook site.yml -i inventory/myenv
 ```
 
-### HuggingFace モデルの事前ダウンロード
+### Pre-downloading HuggingFace Models
 
-Disconnected 環境では HuggingFace からのダウンロードができないため、モデルを事前にダウンロードして PVC にコピーする必要があります。
+In disconnected environments, models cannot be downloaded from HuggingFace, so they must be pre-downloaded and copied to the PVC.
 
 ```bash
-# オンライン環境で
+# In online environment
 pip install huggingface_hub
 huggingface-cli download Qwen/Qwen3-0.6B --local-dir ./qwen3-06b
 
-# Disconnected 環境でモデルを PVC にコピー
+# Copy model to PVC in disconnected environment
 oc rsync ./qwen3-06b/ <pod-name>:/models/qwen3-06b/ -n llm-serving
 ```
 
-### Operator カタログのミラーリング
+### Operator Catalog Mirroring
 
-`oc-mirror` を使用して必要な Operator をミラーリングしてください。必要な Operator 一覧は「6.1 Role 一覧と実行順序」を参照。
+Use `oc-mirror` to mirror the required Operators. See "6.1 Role List and Execution Order" for the list of required Operators.
 
-### コンテナイメージ
+### Container Images
 
-以下のイメージがミラーレジストリに必要です：
+The following images are needed in the mirror registry:
 
 - `vllm/vllm-openai:v0.28.0` (LLM Serving)
 - `quay.io/modh/kserve-storage-initializer:rhoai-2.22` (KServe)
-- `registry.access.redhat.com/ubi9/python-311:latest` (モデルダウンロード Job)
-- `registry.access.redhat.com/ubi9/ubi-minimal:latest` (PVC チェック)
+- `registry.access.redhat.com/ubi9/python-311:latest` (Model download Job)
+- `registry.access.redhat.com/ubi9/ubi-minimal:latest` (PVC check)
 
 ---
 
-## 11. ディレクトリ構成
+## 11. Directory Structure
 
 ```
 ansible/
-├── site.yml                      # メイン Playbook
-├── ansible.cfg                   # Ansible 設定（collections_paths, default inventory 等）
-├── pyproject.toml                # Python 依存定義 (uv 対応, find-links = vendor/wheels)
+├── site.yml                      # Main playbook
+├── ansible.cfg                   # Ansible configuration (collections_paths, default inventory, etc.)
+├── pyproject.toml                # Python dependency definitions (uv compatible, find-links = vendor/wheels)
 ├── requirements.yml              # Ansible Galaxy collections
 ├── inventory/
-│   ├── sample/                   # テンプレート（コピーして使う）
+│   ├── sample/                   # Template (copy to use)
 │   │   └── group_vars/all/
 │   │       ├── cluster.yml.sample
 │   │       ├── components.yml.sample
 │   │       └── vault.yml.sample
-│   └── myenv/                    # 環境固有の設定 (.gitignore 対象)
+│   └── myenv/                    # Environment-specific settings (gitignored)
 ├── playbooks/
-│   ├── uninstall.yml             # アンインストール（site.yml の逆順）
-│   ├── verify.yml                # デプロイ検証 + 環境サマリー
-│   ├── manage_maas_access.yml    # MaaS アクセス管理 (ユーザー + ポリシー)
-│   ├── llm_add_model.yml         # モデル追加 (deploy + MaaS + Keycloak)
-│   └── maas_create_apikey.yml    # API Key 発行
+│   ├── uninstall.yml             # Uninstall (reverse order of site.yml)
+│   ├── verify.yml                # Deployment verification + environment summary
+│   ├── manage_maas_access.yml    # MaaS access management (users + policies)
+│   ├── llm_add_model.yml         # Add model (deploy + MaaS + Keycloak)
+│   └── maas_create_apikey.yml    # API Key issuance
 ├── scripts/
-│   ├── cleanup-all.sh            # 全リソース削除
-│   ├── setup-opencode.sh         # OpenCode 設定生成 (API Key + opencode.json)
-│   ├── download-deps.sh          # Disconnected 用資材ダウンロード
-│   └── setup-env.sh              # Disconnected 環境セットアップ
+│   ├── cleanup-all.sh            # Delete all resources
+│   ├── setup-opencode.sh         # OpenCode config generation (API Key + opencode.json)
+│   ├── download-deps.sh          # Download dependencies for disconnected use
+│   └── setup-env.sh              # Disconnected environment setup
 ├── tasks/
-│   ├── resolve_dependencies.yml  # 依存関係自動解決
+│   ├── resolve_dependencies.yml  # Automatic dependency resolution
 │   └── _resolve_one.yml
 ├── roles/
-│   ├── preflight/                # 事前チェック + ファクト収集
+│   ├── preflight/                # Pre-checks + fact gathering
 │   │   └── tasks/
-│   │       ├── main.yml          # フル preflight
-│   │       └── light.yml         # 軽量 preflight（運用 Playbook 用）
-│   ├── common/                   # Operator install/wait 共通タスク
+│   │       ├── main.yml          # Full preflight
+│   │       └── light.yml         # Lightweight preflight (for operational playbooks)
+│   ├── common/                   # Shared Operator install/wait tasks
 │   │   └── tasks/
 │   │       ├── install_operator.yml
 │   │       ├── uninstall_operator.yml
@@ -853,48 +855,48 @@ ansible/
 │   ├── rhoai/                    # OpenShift AI
 │   ├── keycloak/                 # Keycloak + Group Sync
 │   ├── integration_keycloak_oauth/   # Keycloak → OpenShift OAuth
-│   ├── integration_keycloak_maas/    # Keycloak → MaaS ポリシー
+│   ├── integration_keycloak_maas/    # Keycloak → MaaS policies
 │   ├── integration_rhoai_oidc/       # AITenant OIDC
-│   ├── llm_serving/              # LLM モデルデプロイ
+│   ├── llm_serving/              # LLM model deployment
 │   ├── maas_resources/           # MaaS Dashboard RBAC
 │   ├── mlflow/                   # MLflow
 │   ├── ogx/                      # OGX Server
 │   ├── guardrails/               # NeMo Guardrails
 │   └── observability/            # Monitoring / Dashboards
 ├── docs/
-│   ├── operations.md             # 運用ガイド（モデル追加・ユーザー管理等）
-│   └── troubleshooting.md        # トラブルシューティング
-├── vendor/                       # Disconnected 用資材 (.gitignore 対象)
+│   ├── operations.md             # Operations guide (add models, user management, etc.)
+│   └── troubleshooting.md        # Troubleshooting
+├── vendor/                       # Disconnected dependencies (gitignored)
 │   ├── wheels/                   # Python wheels
 │   └── collections/              # Ansible Galaxy collections
-└── .venv/                        # Python 仮想環境 (.gitignore 対象)
+└── .venv/                        # Python virtual environment (gitignored)
 ```
 
 ---
 
-## 12. アンインストール
+## 12. Uninstall
 
-### 12.1 フルアンインストール
+### 12.1 Full Uninstall
 
 ```bash
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv
 ```
 
-インストールの逆順で全コンポーネントを削除します。各 Operator の公式アンインストール手順に基づいて、CR → Operator → Namespace の順で安全に削除します。
+Removes all components in reverse installation order. Each Operator is safely removed following official uninstall procedures: CR → Operator → Namespace.
 
-### 12.2 特定コンポーネントのアンインストール
+### 12.2 Uninstalling Specific Components
 
 ```bash
-# RHOAI + ワークロードのみ
+# RHOAI + workloads only
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags platform,workload
 
-# 特定のロールのみ（inventory で無効でも実行可能）
+# Specific roles only (can run even if disabled in inventory)
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags deps,gpu -e uninstall_gpu_operator=true
 ```
 
-### 12.3 使用可能なタグ
+### 12.3 Available Tags
 
-| タグ | 対象 |
+| Tag | Target |
 |---|---|
 | `infra, lvm` | LVM Operator |
 | `infra, metallb` | MetalLB |
@@ -919,54 +921,54 @@ uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv --tags deps,g
 | `workload, guardrails` | NeMo Guardrails |
 | `workload, observability` | Observability |
 
-### 12.4 アンインストール変数
+### 12.4 Uninstall Variables
 
-`uninstall_<role>` 変数で個別制御できます。未指定の場合は `install_<role>` の値にフォールバックします。
+Individual control is available via `uninstall_<role>` variables. When not specified, the value of `install_<role>` is used as fallback.
 
 ```bash
-# RHOAI だけアンインストール（他の install_* が true でも無視）
+# Uninstall only RHOAI (ignores other install_* even if true)
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv \
   --tags platform,rhoai -e uninstall_rhoai=true
 ```
 
-### 12.5 エラー時のリトライ
+### 12.5 Retrying on Errors
 
-途中で失敗した場合、エラーメッセージにリトライ用のコマンドが表示されます：
+If a failure occurs mid-process, a retry command is shown in the error message:
 
 ```
 TASK [Fail if PVCs using lvms-vg1 still exist] ********************************
 fatal: [localhost]: FAILED! =>
   msg: |-
-    LVM Operator のアンインストールに失敗しました。
-    再実行: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
+    LVM Operator uninstall failed.
+    Retry: ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags infra,lvm -e uninstall_lvm=true
 ```
 
-表示されたコマンドの `inventory/<env>` を実際のインベントリパスに置き換えて実行してください。
+Replace `inventory/<env>` with your actual inventory path and run the command.
 
-### 12.6 アンインストールの動作
+### 12.6 Uninstall Behavior
 
-各 Operator は公式ドキュメントに基づいた手順で削除されます：
+Each Operator is removed following official documentation procedures:
 
-| ロール | アンインストール方式 |
+| Role | Uninstall Method |
 |---|---|
-| **RHOAI** | 公式の ConfigMap+label トリガー方式。install で作成した全リソース（MaaS PostgreSQL, Gateway, HardwareProfile 等）を先に削除し、`delete-self-managed-odh` ConfigMap で Operator の自動クリーンアップをトリガー。namespace 削除完了を待機し、検証を実施 |
-| **ServiceMesh** | Istio CR → IstioCNI CR → namespace → Operator の順で削除 |
-| **GPU Operator** | ClusterPolicy CR 削除 → 削除完了待機 → Operator + namespace 削除 |
-| **cert-manager** | Certificate/Issuer/ClusterIssuer CR 一括削除 → 削除完了待機 → Operator + namespace 削除 |
-| **Kueue** | Kueue CRs 一括削除 → finalizer stuck 自動対処 → Operator + namespace 削除 |
-| **LVM** | PVC プリチェック（lvms-vg1 使用中の PVC があれば停止）→ LVMCluster 削除 → Operator + namespace 削除 |
-| **その他** | CR 削除 → 削除完了待機 → Operator + namespace 削除 の共通パターン |
+| **RHOAI** | Official ConfigMap+label trigger method. First deletes all resources created during install (MaaS PostgreSQL, Gateway, HardwareProfile, etc.), then triggers Operator auto-cleanup via `delete-self-managed-odh` ConfigMap. Waits for namespace deletion and runs verification |
+| **ServiceMesh** | Istio CR → IstioCNI CR → namespace → Operator in order |
+| **GPU Operator** | Delete ClusterPolicy CR → wait for deletion → delete Operator + namespace |
+| **cert-manager** | Bulk delete Certificate/Issuer/ClusterIssuer CRs → wait for deletion → delete Operator + namespace |
+| **Kueue** | Bulk delete Kueue CRs → auto-handle stuck finalizers → delete Operator + namespace |
+| **LVM** | PVC pre-check (stop if PVCs using lvms-vg1 exist) → delete LVMCluster → delete Operator + namespace |
+| **Others** | Common pattern: delete CR → wait for deletion → delete Operator + namespace |
 
-> **注意事項**:
-> - アンインストール前に PVC で使用される永続ディスクのバックアップを推奨します
-> - LVM Operator はノード上の LVM リソース（VG/LV）を自動削除しません。必要に応じて手動で対処してください
-> - cert-manager リソースの削除により、関連する TLS Secret も削除されます
+> **Notes**:
+> - Backing up persistent disks used by PVCs is recommended before uninstalling
+> - LVM Operator does not automatically delete LVM resources (VG/LV) on nodes. Handle manually if needed
+> - Deleting cert-manager resources also deletes associated TLS Secrets
 
 ---
 
-## 13. 関連ドキュメント
+## 13. Related Documentation
 
-| ドキュメント | 内容 |
+| Document | Contents |
 |---|---|
-| [docs/operations.md](docs/operations.md) | 運用ガイド — モデル追加手順、ユーザー/グループ管理、MaaS アクセス制御、API Key 発行、クォータ設定、削除手順 |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | トラブルシューティング — 過去のトラブル事例、デプロイ前チェックリスト、監視方法、失敗時の対処フロー、各リソースの正常状態確認コマンド集、Disconnected 環境固有の注意点 |
+| [docs/operations.md](docs/operations.md) | Operations guide — model addition procedures, user/group management, MaaS access control, API Key issuance, quota configuration, deletion procedures |
+| [docs/troubleshooting.md](docs/troubleshooting.md) | Troubleshooting — past incident examples, pre-deployment checklist, monitoring methods, failure recovery flows, resource health check commands, disconnected environment considerations |

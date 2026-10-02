@@ -5,6 +5,8 @@
     kind: CustomResourceDefinition
     name: "{{ crd_name }}"
   register: _crd
-  until: _crd.resources | length > 0
+  until: >-
+    _crd is not failed and
+    (_crd.resources | default([])) | length > 0
   retries: 30
   delay: 10

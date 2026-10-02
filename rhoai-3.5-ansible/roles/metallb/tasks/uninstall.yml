@@ -38,7 +38,9 @@
         name: metallb
         namespace: metallb-system
       register: _metallb
-      until: _metallb.resources | default([]) | length == 0
+      until: >-
+        _metallb is not failed and
+        (_metallb.resources | default([])) | length == 0
       retries: 20
       delay: 10
       failed_when: false

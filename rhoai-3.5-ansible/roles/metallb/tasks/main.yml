@@ -32,7 +32,9 @@
         field_selectors:
           - status.phase=Running
       register: _speaker
-      until: _speaker.resources | length > 0
+      until: >-
+        _speaker is not failed and
+        (_speaker.resources | default([])) | length > 0
       retries: 12
       delay: 10
 
@@ -54,6 +56,22 @@
           ansible.builtin.debug:
             msg: "MetalLB IP range (auto): {{ metallb_ip_range }}"
 
+    - name: Check existing IPAddressPools
+      kubernetes.core.k8s_info:
+        api_version: metallb.io/v1beta1
+        kind: IPAddressPool
+        namespace: metallb-system
+      register: _existing_pools
+
+    - name: Check if CIDR already covered
+      ansible.builtin.set_fact:
+        _cidr_already_exists: >-
+          {{ _existing_pools.resources | default([])
+             | map(attribute='spec.addresses', default=[])
+             | flatten
+             | select('search', metallb_ip_range)
+             | list | length > 0 }}
+
     - name: Apply IPAddressPool
       kubernetes.core.k8s:
         state: present
@@ -67,6 +85,7 @@
             addresses:
               - "{{ metallb_ip_range }}"
             autoAssign: true
+      when: not (_cidr_already_exists | bool)
 
     - name: Apply L2Advertisement
       kubernetes.core.k8s:

@@ -98,7 +98,9 @@
         kind: LLMInferenceService
         namespace: "{{ llm_namespace | default('llm-serving') }}"
       register: _lis_remaining
-      until: _lis_remaining.resources | default([]) | length == 0
+      until: >-
+        _lis_remaining is not failed and
+        (_lis_remaining.resources | default([])) | length == 0
       retries: 30
       delay: 10
       when: _all_lis.resources | default([]) | length > 0

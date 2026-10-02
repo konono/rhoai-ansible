@@ -33,7 +33,9 @@
         kind: Namespace
         name: redhat-ods-applications
       register: _rhoai_ns
-      until: _rhoai_ns.resources | length > 0
+      until: >-
+        _rhoai_ns is not failed and
+        (_rhoai_ns.resources | default([])) | length > 0
       retries: 24
       delay: 5
     
@@ -144,9 +146,9 @@
         name: default-dsc
       register: _dsc
       until:
-        - _dsc.resources | length > 0
+        - _dsc is not failed and (_dsc.resources | default([])) | length > 0
         - >-
-          _dsc.resources[0].status.conditions | default([])
+          (_dsc.resources[0].status | default({})).conditions | default([])
           | selectattr('type', 'equalto', 'Ready')
           | selectattr('status', 'equalto', 'True')
           | list | length > 0
@@ -159,10 +161,12 @@
         kind: Namespace
         name: redhat-ai-gateway-infra
       register: _gw_ns
-      until: _gw_ns.resources | length > 0
+      until: >-
+        _gw_ns is not failed and
+        (_gw_ns.resources | default([])) | length > 0
       retries: 12
       delay: 10
-    
+
     - name: Sync maas-db-config to gateway namespace
       kubernetes.core.k8s:
         state: present
@@ -192,7 +196,9 @@
         name: rhods-dashboard
         namespace: redhat-ods-applications
       register: _dashboard
-      until: _dashboard.resources | length > 0
+      until: >-
+        _dashboard is not failed and
+        (_dashboard.resources | default([])) | length > 0
       retries: 30
       delay: 10
     
@@ -354,7 +360,9 @@
         name: authorino-server-cert
         namespace: openshift-rhcl
       register: _authorino_cert
-      until: _authorino_cert.resources | length > 0
+      until: >-
+        _authorino_cert is not failed and
+        (_authorino_cert.resources | default([])) | length > 0
       retries: 12
       delay: 5
     
@@ -473,7 +481,9 @@
             name: maas-ui
             namespace: redhat-ods-applications
           register: _maas_ui
-          until: _maas_ui.resources | length > 0
+          until: >-
+            _maas_ui is not failed and
+            (_maas_ui.resources | default([])) | length > 0
           retries: 12
           delay: 10
           failed_when: false

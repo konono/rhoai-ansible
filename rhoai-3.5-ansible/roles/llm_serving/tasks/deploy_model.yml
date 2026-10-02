@@ -246,8 +246,9 @@
     namespace: "{{ _model_cfg.namespace }}"
   register: _lis_status
   until: >-
-    _lis_status.resources | length > 0 and
-    (_lis_status.resources[0].status.conditions | default([])
+    _lis_status is not failed and
+    (_lis_status.resources | default([])) | length > 0 and
+    ((_lis_status.resources[0].status | default({})).conditions | default([])
      | selectattr('type', 'equalto', 'Ready')
      | selectattr('status', 'equalto', 'True')
      | list | length > 0)
