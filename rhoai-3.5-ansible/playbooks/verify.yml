@@ -348,6 +348,7 @@
         -o jsonpath='{.items[0].metadata.name}'
       register: _maas_pod
       changed_when: false
+      failed_when: _maas_pod.stdout | length == 0
       when:
         - install_maas_resources | default(true)
         - install_keycloak | default(true)
@@ -355,23 +356,49 @@
       tags: [workload, maas]
 
     - name: "Verify: MaaS API Key issuable"
-      ansible.builtin.command: >-
-        oc exec -n redhat-ai-gateway-infra
-        {{ _maas_pod.stdout }}
-        -- curl -sk -o /dev/null -w '%{http_code}'
-        -X POST https://localhost:8443/v1/api-keys
-        -H 'X-MaaS-Username: admin1'
-        -H 'X-MaaS-Group: ["maas-admins"]'
-        -H 'Content-Type: application/json'
-        -d '{"name":"verify-test"}'
-      register: _apikey_test
-      failed_when: _apikey_test.stdout not in ['200', '201']
-      changed_when: false
+      block:
+        - name: Create verification API key
+          ansible.builtin.command: >-
+            oc exec -n redhat-ai-gateway-infra
+            {{ _maas_pod.stdout }}
+            -- curl -skfS
+            -X POST https://localhost:8443/v1/api-keys
+            -H 'X-MaaS-Username: admin1'
+            -H 'X-MaaS-Group: ["maas-admins"]'
+            -H 'Content-Type: application/json'
+            -d '{"name":"verify-test"}'
+          register: _apikey_create
+          no_log: true
+
+        - name: Check verification API key response
+          ansible.builtin.assert:
+            that:
+              - (_apikey_create.stdout | from_json).id | length > 0
+              - (_apikey_create.stdout | from_json).key is match('^sk-oai-')
+            quiet: true
+          no_log: true
+
+      always:
+        - name: Revoke verification API key
+          ansible.builtin.command: >-
+            oc exec -n redhat-ai-gateway-infra
+            {{ _maas_pod.stdout }}
+            -- curl -sk -o /dev/null -w '%{http_code}'
+            -X DELETE https://localhost:8443/v1/api-keys/{{ (_apikey_create.stdout | from_json).id }}
+            -H 'X-MaaS-Username: admin1'
+            -H 'X-MaaS-Group: ["maas-admins"]'
+          register: _apikey_revoke
+          failed_when: _apikey_revoke.stdout not in ['200', '204']
+          when:
+            - _apikey_create is defined
+            - _apikey_create.rc | default(1) == 0
+            - (_apikey_create.stdout | default('')).startswith('{')
+            - (_apikey_create.stdout | from_json).id is defined
+          no_log: true
       when:
         - install_maas_resources | default(true)
         - install_keycloak | default(true)
         - verify_maas_api_key_issuance | default(false) | bool
-        - _maas_pod.stdout | default('') | length > 0
       tags: [workload, maas]
 
     - name: "Verify: MLflow Available"
@@ -522,11 +549,18 @@
       failed_when: false
       tags: [always]
 
+    - name: Check saved credentials directory
+      ansible.builtin.stat:
+        path: "{{ ansible_root }}/.credentials"
+      register: _cred_dir
+      tags: [always]
+
     - name: Check for saved credentials
       ansible.builtin.find:
         paths: "{{ ansible_root }}/.credentials"
         patterns: "*.password"
       register: _cred_files
+      when: _cred_dir.stat.isdir | default(false)
       tags: [always]
 
     - name: Get Dashboard URL
@@ -558,10 +592,11 @@
 
     - name: Get MaaS endpoint
       ansible.builtin.command: >-
-        oc get route maas-gateway -n openshift-ingress -o jsonpath='https://{.spec.host}'
+        oc get gateway maas-default-gateway -n openshift-ingress
+        -o jsonpath='https://{.spec.listeners[0].hostname}'
       register: _maas_url
       changed_when: false
-      failed_when: false
+      when: install_rhoai | default(true)
       tags: [always]
 
     - name: Get MLflow URL

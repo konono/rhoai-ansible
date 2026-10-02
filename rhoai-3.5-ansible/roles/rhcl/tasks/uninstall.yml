@@ -1,7 +1,7 @@
 ---
 # Uninstall: rhcl (Kuadrant/Authorino)
 # Ref: https://docs.kuadrant.io/ (Red Hat Connectivity Link)
-# Order: AuthConfig → Authorino → Kuadrant → Operator + namespace
+# Order: AuthConfig → Kuadrant → Authorino → Operator + namespace
 
 - block:
     - name: Delete all AuthConfig CRs
@@ -16,22 +16,6 @@
       register: _ac_count
       until: _ac_count.stdout | trim | int == 0
       retries: 12
-      delay: 10
-      changed_when: false
-      failed_when: false
-
-    - name: Delete Authorino CR
-      ansible.builtin.shell: >-
-        oc delete authorino --all -n openshift-rhcl --wait=false 2>/dev/null || true
-      changed_when: true
-      failed_when: false
-
-    - name: Wait for Authorino CR deletion
-      ansible.builtin.shell: >-
-        oc get authorino -n openshift-rhcl --no-headers 2>/dev/null | wc -l
-      register: _authorino_count
-      until: _authorino_count.stdout | trim | int == 0
-      retries: 20
       delay: 10
       changed_when: false
       failed_when: false
@@ -57,7 +41,21 @@
         (_kuadrant.resources | default([])) | length == 0
       retries: 20
       delay: 10
+
+    - name: Delete Authorino CR after Kuadrant stops reconciling it
+      ansible.builtin.shell: >-
+        oc delete authorino --all -n openshift-rhcl --wait=false 2>/dev/null || true
+      changed_when: true
       failed_when: false
+
+    - name: Wait for Authorino CR deletion
+      ansible.builtin.shell: >-
+        oc get authorino -n openshift-rhcl --no-headers 2>/dev/null | wc -l
+      register: _authorino_count
+      until: _authorino_count.stdout | trim | int == 0
+      retries: 20
+      delay: 10
+      changed_when: false
 
     - name: Uninstall RHCL Operator
       ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"

@@ -263,13 +263,9 @@ cp -r inventory/sample inventory/myenv
 
 #### Proxy
 
-| 変数 | 説明 | デフォルト | 顧客変更 |
-|---|---|---|---|
-| `cluster_proxy.http_proxy` | HTTP プロキシ URL | `""` (空 = スキップ) | **Proxy 環境のみ** |
-| `cluster_proxy.https_proxy` | HTTPS プロキシ URL | `""` | **Proxy 環境のみ** |
-| `cluster_proxy.no_proxy` | プロキシ除外リスト | `"localhost,127.0.0.1,.cluster.local,.svc"` | **Proxy 環境のみ** — `.apps.<cluster_domain>` を含めないよう注意。含めると MaaS Gateway の通信に影響する |
+Proxy 設定は Proxy CR (`oc get proxy cluster`) の `.status` から自動取得します。`cluster_proxy` 変数は廃止されました。
 
-> **Proxy の注意**: 設定すると `rhoai` ロールが `kube-auth-proxy`, `rhods-dashboard`, `maas-ui` に環境変数として注入します。空の場合はスキップされます。
+> **Proxy の注意**: playbook は Deployment への proxy 環境変数を自動適用しません。Proxy CR に設定が検出された場合、診断コマンドと手動設定手順をデバッグメッセージで表示します。通信障害を確認してから手動で適用してください。詳細は `docs/troubleshooting.md` の 2.7, 2.8 を参照してください。
 
 #### Operator チャネル
 
@@ -543,7 +539,7 @@ models:
 | Gateway ConfigMap `maas-gateway-options` | openshift-ingress |
 
 **Wait**: Gateway `Programmed`, AITenant 存在, rhods-dashboard Deployment Ready
-**使用変数**: `storage_class`, `maas_db_password`, `operator_channels.rhoai`, `cluster_proxy.*`
+**使用変数**: `storage_class`, `maas_db_password`, `operator_channels.rhoai` (Proxy は Proxy CR status から取得)
 
 #### `keycloak`
 
@@ -718,7 +714,7 @@ rhoai-3.5-ansible/
 | `k8s_kubeconfig` | cluster.yml | `KUBECONFIG` 環境変数が未設定の場合 |
 | `storage_class` | cluster.yml | LVM 以外のストレージを使う場合（例: `gp3-csi`） |
 | `metallb_ip_range` | components.yml | 自動計算が不適切な場合 |
-| `cluster_proxy.*` | cluster.yml | Proxy 環境の場合 |
+| (Proxy) | Proxy CR status | 自動取得。手動適用は診断後に実施 |
 | `operator_channels.lvm` | cluster.yml | OpenShift バージョンが 4.22 以外の場合 |
 | `operator_channels.odf` | cluster.yml | 同上 |
 | `install_gpu_operator` | components.yml | GPU なし環境の場合 (`false` に) |
@@ -872,7 +868,7 @@ ansible/
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv
 ```
 
-インストールの逆順で全コンポーネントを削除します。各 Operator の公式アンインストール手順に基づいて、CR → Operator → Namespace の順で安全に削除します。
+有効なコンポーネントをインストールの逆順で削除します。RHOAI ロールは Red Hat 公式の ConfigMap とラベルによる手順を使用し、他のロールは依存リソースを Operator より先に削除します。
 
 ### 12.2 特定コンポーネントのアンインストール
 
@@ -937,7 +933,7 @@ fatal: [localhost]: FAILED! =>
 
 ### 12.6 アンインストールの動作
 
-各 Operator は公式ドキュメントに基づいた手順で削除されます：
+各ロールは次の手順で削除します：
 
 | ロール | アンインストール方式 |
 |---|---|
@@ -950,7 +946,8 @@ fatal: [localhost]: FAILED! =>
 | **その他** | CR 削除 → 削除完了待機 → Operator + namespace 削除 の共通パターン |
 
 > **注意事項**:
-> - アンインストール前に PVC で使用される永続ディスクのバックアップを推奨します
+> - アンインストール前に PVC で使用される永続ディスクをバックアップしてください。Red Hat の RHOAI 削除手順の前提条件ですが、playbook はバックアップの有無を確認できません。
+> - NooBaa を削除する前に ODF を利用する PVC と OBC を削除してください。ODF ロールは全 OBC の消滅を待ち、残っていれば停止します。
 > - LVM Operator はノード上の LVM リソース（VG/LV）を自動削除しません。必要に応じて手動で対処してください
 > - cert-manager リソースの削除により、関連する TLS Secret も削除されます
 

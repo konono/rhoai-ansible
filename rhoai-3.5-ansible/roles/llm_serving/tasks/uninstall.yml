@@ -123,12 +123,23 @@
     # -----------------------------------------------------------------------
     # Step 4: Delete remaining resources
     # -----------------------------------------------------------------------
-    - name: Delete ClusterStorageContainer
+    - name: Check if ClusterStorageContainer was created by this playbook
+      kubernetes.core.k8s_info:
+        api_version: serving.kserve.io/v1alpha1
+        kind: ClusterStorageContainer
+        name: default
+      register: _csc_check
+      failed_when: false
+
+    - name: Delete ClusterStorageContainer (only if managed by rhoai-ansible)
       kubernetes.core.k8s:
         state: absent
         api_version: serving.kserve.io/v1alpha1
         kind: ClusterStorageContainer
         name: default
+      when: >-
+        _csc_check.resources | default([]) | length > 0 and
+        (_csc_check.resources[0].metadata.labels | default({})).get('app.kubernetes.io/managed-by', '') == 'rhoai-ansible'
       failed_when: false
 
     - name: Delete hf-token Secret

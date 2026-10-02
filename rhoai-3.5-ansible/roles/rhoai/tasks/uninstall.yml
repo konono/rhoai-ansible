@@ -172,6 +172,18 @@
       retries: 60
       delay: 10
 
+    - name: Wait for operator-managed ai-tenants namespace deletion
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Namespace
+        name: ai-tenants
+      register: _ai_tenants_ns
+      until: >-
+        _ai_tenants_ns is not failed and
+        (_ai_tenants_ns.resources | default([])) | length == 0
+      retries: 30
+      delay: 10
+
     - name: Wait for redhat-ods-monitoring namespace deletion
       kubernetes.core.k8s_info:
         api_version: v1

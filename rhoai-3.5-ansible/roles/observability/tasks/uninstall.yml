@@ -1,6 +1,6 @@
 ---
 # Uninstall: observability
-# Order: ConfigMap → OpenTelemetry Operator → Cluster Observability Operator
+# Remove Perses resources while Cluster Observability Operator is still running.
 
 - block:
     - name: Delete user-workload-monitoring ConfigMap
@@ -11,6 +11,44 @@
         name: user-workload-monitoring-config
         namespace: openshift-user-workload-monitoring
       failed_when: false
+
+    - name: Delete observability manifests managed by this role
+      kubernetes.core.k8s:
+        state: absent
+        api_version: "{{ item.api_version }}"
+        kind: "{{ item.kind }}"
+        name: "{{ item.name }}"
+        namespace: "{{ item.namespace | default(omit) }}"
+      loop:
+        - { api_version: perses.dev/v1alpha2, kind: PersesDashboard, name: maas-gateway-performance, namespace: openshift-cluster-observability-operator }
+        - { api_version: perses.dev/v1alpha2, kind: PersesDashboard, name: maas-gateway-gpu-resources, namespace: openshift-cluster-observability-operator }
+        - { api_version: perses.dev/v1alpha2, kind: PersesGlobalDatasource, name: thanos-querier-datasource }
+        - { api_version: rbac.authorization.k8s.io/v1, kind: ClusterRoleBinding, name: perses-cluster-monitoring-view }
+        - { api_version: monitoring.coreos.com/v1, kind: PodMonitor, name: maas-gateway-istio-metrics, namespace: openshift-ingress }
+        - { api_version: monitoring.coreos.com/v1, kind: PodMonitor, name: maas-limitador, namespace: redhat-ods-monitoring }
+        - { api_version: monitoring.coreos.com/v1, kind: PrometheusRule, name: maas-limitador-recording-rules, namespace: openshift-rhcl }
+        - { api_version: monitoring.coreos.com/v1, kind: PrometheusRule, name: maas-limitador-recording-rules, namespace: redhat-ods-monitoring }
+        - { api_version: monitoring.rhobs/v1alpha1, kind: ScrapeConfig, name: maas-limitador, namespace: redhat-ods-monitoring }
+        - { api_version: networking.k8s.io/v1, kind: NetworkPolicy, name: allow-rhoai-monitoring-scrape, namespace: openshift-rhcl }
+      failed_when: false
+
+    - name: Delete monitoring UIPlugin before removing its operator
+      kubernetes.core.k8s:
+        state: absent
+        api_version: observability.openshift.io/v1alpha1
+        kind: UIPlugin
+        name: monitoring
+
+    - name: Wait for Perses instance owned by the UIPlugin to disappear
+      kubernetes.core.k8s_info:
+        api_version: perses.dev/v1alpha2
+        kind: Perses
+        name: perses
+        namespace: openshift-cluster-observability-operator
+      register: _observability_perses
+      until: _observability_perses.resources | length == 0
+      retries: 30
+      delay: 10
 
     - name: Uninstall OpenTelemetry Operator
       ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"

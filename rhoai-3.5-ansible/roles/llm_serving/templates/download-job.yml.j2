@@ -29,6 +29,12 @@ spec:
                 secretKeyRef:
                   name: hf-token
                   key: HF_TOKEN
+            - name: HTTP_PROXY
+              value: "{{ _http_proxy | default('') }}"
+            - name: HTTPS_PROXY
+              value: "{{ _https_proxy | default('') }}"
+            - name: NO_PROXY
+              value: "{{ _no_proxy | default('') }}"
           resources:
             requests:
               cpu: "1"

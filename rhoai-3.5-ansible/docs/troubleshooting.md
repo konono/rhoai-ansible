@@ -694,7 +694,7 @@ oc exec -n redhat-ods-applications deploy/rhods-dashboard -- curl -sk --connect-
 ```
 
 **解決策**:
-rhoai ロールの Proxy 設定ブロック（Step 11）が自動的に HostAliases と Proxy 環境変数を設定します。手動で設定する場合:
+Proxy 環境変数と HostAliases は通信障害を確認してから手動で設定してください:
 
 ```bash
 # Gateway Service の ClusterIP を取得
@@ -716,14 +716,31 @@ oc patch deploy maas-ui -n redhat-ods-applications --type=json \
 **原因**:
 kube-auth-proxy は OAuth サーバー (`oauth-openshift.apps...`) に token redemption リクエストを送信する。NO_PROXY に `.apps.*` を含めると OAuth サーバーもバイパスされ、外部 IP に直接接続しようとしてタイムアウトする。
 
-**重要なルール**:
-- `kube-auth-proxy`: NO_PROXY に `.apps.*` を**含めてはいけない**（OAuth サーバーは Proxy 経由でアクセス）
-- `core-bff`, `maas-ui`: NO_PROXY に `.apps.*` を**含めてよい**（HostAliases で内部 IP に解決するため）
+**確認済みの事実**:
+- `kube-auth-proxy`: OAuth サーバー (`oauth-openshift.apps.*`) へ token redemption を送信する。NO_PROXY に `.apps.*` を含めると直接接続になりタイムアウトする場合がある。→ 直接接続が失敗するクラスタでは、NO_PROXY から `.apps.*` 項目を除外して proxy を設定する
+- `core-bff`, `maas-ui`: 主な通信先はクラスタ内 Service。proxy 注入が必要かは通信障害の有無で判断する
 
-**確認コマンド**:
+playbook はいずれのコンポーネントにも proxy を自動適用しません。診断コマンドと手動設定手順をデバッグメッセージで表示します。
+
+**診断手順**:
 ```bash
+# OAuth Route のホスト名と Proxy URL を取得
+OAUTH_HOST=$(oc get route oauth-openshift -n openshift-authentication -o jsonpath='{.spec.host}')
+PROXY_URL=$(oc get proxy cluster -o jsonpath='{.status.httpsProxy}')
+[ -z "$PROXY_URL" ] && PROXY_URL=$(oc get proxy cluster -o jsonpath='{.status.httpProxy}')
+
+# 現在の環境変数を確認
 oc exec -n openshift-ingress deploy/kube-auth-proxy -- env | grep -i proxy
-oc exec -n openshift-ingress deploy/kube-auth-proxy -- curl -sk --connect-timeout 5 https://oauth-openshift.apps.<domain>/
+
+# 直接接続を試行 (--noproxy '*' で proxy を迂回)
+oc exec -n openshift-ingress deploy/kube-auth-proxy -- \
+  curl -sk --noproxy '*' --connect-timeout 5 -o /dev/null -w '%{http_code}' https://$OAUTH_HOST/healthz
+# → 200 なら直接接続可能
+
+# proxy 経由を試行 (--proxy で明示、--noproxy '' で除外設定を上書き)
+oc exec -n openshift-ingress deploy/kube-auth-proxy -- \
+  curl -sk --proxy "$PROXY_URL" --noproxy '' --connect-timeout 5 -o /dev/null -w '%{http_code}' https://$OAUTH_HOST/healthz
+# → 直接が失敗し proxy 経由が 200 なら、proxy 設定が必要
 ```
 
 ---
@@ -812,11 +829,11 @@ oc get secret mlflow-obc -n mlflow-workspace
 
 ### 3.4 Proxy 環境の注意点
 
-- クラスター Proxy 設定の確認: `oc get proxy cluster -o jsonpath='{.spec}'`
-- **kube-auth-proxy**: NO_PROXY に `.apps.*` を含めない（OAuth 通信に必要）
-- **core-bff, maas-ui**: NO_PROXY に `.apps.*` を含めてよい（HostAliases 使用時）
-- **rhods-dashboard**: HostAliases で Gateway Service ClusterIP を設定
-- rhoai ロールの Step 11 (Proxy configuration) が自動的に検出・設定する
+- クラスター Proxy 設定の確認: `oc get proxy cluster -o jsonpath='{.status}'`
+- playbook は Deployment への proxy を自動適用しない。診断コマンドを debug で表示する
+- **kube-auth-proxy**: OAuth サーバーへの直接接続が失敗し、proxy 経由で成功する場合に手動で設定する。NO_PROXY から `.apps.*` 項目を除外すること
+- **core-bff, maas-ui**: 主な通信先はクラスタ内 Service。通信障害を確認してから手動で設定する
+- 診断手順の詳細は 2.7, 2.8 を参照
 
 ### 3.5 GPU Operator の前提条件
 
@@ -1201,8 +1218,8 @@ oc get cm service-ca-bundle -n keycloak -o jsonpath='{.data.service-ca\.crt}' | 
 Disconnected 環境で Proxy を使用する場合:
 
 ```bash
-# クラスター Proxy 設定
-oc get proxy cluster -o yaml
+# Proxy CR の status を確認 (実効値が表示される)
+oc get proxy cluster -o jsonpath='{.status}' | python3 -m json.tool
 
 # 各コンポーネントの Proxy 環境変数
 oc exec -n openshift-ingress deploy/kube-auth-proxy -- env | grep -i proxy
@@ -1210,9 +1227,10 @@ oc exec -n redhat-ods-applications deploy/maas-ui -- env | grep -i proxy 2>/dev/
 ```
 
 **注意事項**:
-- `kube-auth-proxy` の NO_PROXY に `.apps.*` を含めない
-- rhoai ロールの Proxy 設定ブロックが自動的に検出・設定する
-- `cluster_proxy` が `components.yml` で空の場合、クラスター Proxy 設定がフォールバックとして使用される
+- playbook は Deployment への proxy を自動適用しない。Proxy CR 検出時に診断手順を表示する
+- 通信障害を確認してから手動で `oc set env` で適用する (2.7, 2.8 参照)
+- `kube-auth-proxy` に設定する場合は NO_PROXY から `.apps.*` 項目を除外すること
+- `cluster_proxy` 変数は廃止済み。Proxy CR の `.status` から値を取得する
 
 ### 8.4 Python / Ansible のオフラインインストール
 

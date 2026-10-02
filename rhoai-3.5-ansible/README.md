@@ -265,13 +265,9 @@ These parameters are referenced by multiple roles. Changes have wide impact.
 
 #### Proxy
 
-| Variable | Description | Default | Customer Change |
-|---|---|---|---|
-| `cluster_proxy.http_proxy` | HTTP proxy URL | `""` (empty = skip) | **Proxy environments only** |
-| `cluster_proxy.https_proxy` | HTTPS proxy URL | `""` | **Proxy environments only** |
-| `cluster_proxy.no_proxy` | Proxy exclusion list | `"localhost,127.0.0.1,.cluster.local,.svc"` | **Proxy environments only** — Be careful not to include `.apps.<cluster_domain>` as it affects MaaS Gateway communication |
+Proxy settings are automatically read from the Proxy CR (`.status`). The `cluster_proxy` variable has been deprecated.
 
-> **Proxy note**: When set, the `rhoai` role injects these as environment variables into `kube-auth-proxy`, `rhods-dashboard`, and `maas-ui`. Skipped when empty.
+> **Proxy note**: The playbook does not automatically inject proxy env vars into any Deployment. When a Proxy CR is detected, diagnostic commands and manual configuration instructions are displayed as debug messages. Apply manually after confirming connectivity issues. See `docs/troubleshooting.md` sections 2.7 and 2.8 for details.
 
 #### Operator Channels
 
@@ -545,7 +541,7 @@ models:
 | Gateway ConfigMap `maas-gateway-options` | openshift-ingress |
 
 **Wait**: Gateway `Programmed`, AITenant exists, rhods-dashboard Deployment Ready
-**Variables used**: `storage_class`, `maas_db_password`, `operator_channels.rhoai`, `cluster_proxy.*`
+**Variables used**: `storage_class`, `maas_db_password`, `operator_channels.rhoai` (Proxy read from Proxy CR status)
 
 #### `keycloak`
 
@@ -593,7 +589,7 @@ uv run ansible-playbook site.yml -i inventory/myenv
 # restore the required roles first and then run verification separately:
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
 
-# API key issuance verification creates a key, so it runs only when explicitly enabled:
+# API key issuance verification creates and revokes a test key, so it runs only when explicitly enabled:
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv -e verify_maas_api_key_issuance=true
 
 # Specific phase only
@@ -728,7 +724,7 @@ The following parameters **must be reviewed and changed** for each environment.
 | `k8s_kubeconfig` | cluster.yml | If `KUBECONFIG` environment variable is not set |
 | `storage_class` | cluster.yml | If using storage other than LVM (e.g., `gp3-csi`) |
 | `metallb_ip_range` | components.yml | If auto-calculation is unsuitable |
-| `cluster_proxy.*` | cluster.yml | If in a proxy environment |
+| (Proxy) | Proxy CR status | Auto-detected. Manual application after diagnosis |
 | `operator_channels.lvm` | cluster.yml | If OpenShift version is not 4.22 |
 | `operator_channels.odf` | cluster.yml | Same as above |
 | `install_gpu_operator` | components.yml | For environments without GPU (set to `false`) |
@@ -882,7 +878,7 @@ ansible/
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/myenv
 ```
 
-Removes all components in reverse installation order. Each Operator is safely removed following official uninstall procedures: CR → Operator → Namespace.
+Removes enabled components in reverse installation order. The RHOAI role uses Red Hat's ConfigMap and label uninstall procedure; the other roles remove their dependent resources before their Operators.
 
 ### 12.2 Uninstalling Specific Components
 
@@ -947,7 +943,7 @@ Replace `inventory/<env>` with your actual inventory path and run the command.
 
 ### 12.6 Uninstall Behavior
 
-Each Operator is removed following official documentation procedures:
+The roles use these removal steps:
 
 | Role | Uninstall Method |
 |---|---|
@@ -960,7 +956,8 @@ Each Operator is removed following official documentation procedures:
 | **Others** | Common pattern: delete CR → wait for deletion → delete Operator + namespace |
 
 > **Notes**:
-> - Backing up persistent disks used by PVCs is recommended before uninstalling
+> - Back up persistent disks used by PVCs before uninstalling. This is a prerequisite in Red Hat's RHOAI uninstall procedure; the playbook cannot verify that a backup exists.
+> - Remove ODF-backed PVCs and OBCs before removing NooBaa. The ODF role waits for all OBCs to disappear and stops if any remain.
 > - LVM Operator does not automatically delete LVM resources (VG/LV) on nodes. Handle manually if needed
 > - Deleting cert-manager resources also deletes associated TLS Secrets
 
