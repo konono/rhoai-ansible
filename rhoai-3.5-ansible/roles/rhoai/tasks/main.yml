@@ -418,84 +418,63 @@
     # ---------------------------------------------------------------------------
     # Step 11: Proxy configuration (conditional)
     # ---------------------------------------------------------------------------
-    - name: Check cluster proxy settings
+    # Proxy CR の status にはクラスタ内ネットワーク値が補完済み
+    - name: Get effective proxy settings from Proxy CR status
       ansible.builtin.command: >-
-        oc get proxy cluster -o jsonpath='{.spec.httpProxy}'
-      register: _http_proxy_result
+        oc get proxy cluster -o jsonpath='{.status.{{ item }}}'
+      loop:
+        - httpProxy
+        - httpsProxy
+        - noProxy
+      register: _proxy_status
       changed_when: false
       failed_when: false
-    
-    - name: Configure proxy for RHOAI components
-      when: _http_proxy_result.stdout | length > 0 or (cluster_proxy.http_proxy is defined and cluster_proxy.http_proxy | length > 0)
-      block:
-        - name: Get proxy settings from cluster
-          ansible.builtin.command: >-
-            oc get proxy cluster -o jsonpath='{.spec.{{ item }}}'
-          loop:
-            - httpsProxy
-            - noProxy
-          register: _proxy_results
-          changed_when: false
-          failed_when: false
-    
-        - name: Set proxy facts
-          ansible.builtin.set_fact:
-            _http_proxy: "{{ cluster_proxy.http_proxy | default(_http_proxy_result.stdout) }}"
-            _https_proxy: "{{ cluster_proxy.https_proxy | default(_proxy_results.results[0].stdout) }}"
-            _no_proxy: "{{ cluster_proxy.no_proxy | default(_proxy_results.results[1].stdout) }}"
-    
-        - name: Warn if cluster noProxy contains .apps
-          ansible.builtin.debug:
-            msg: >-
-              WARNING: クラスター noProxy に .apps が含まれています。
-              MaaS Gateway の通信に影響する可能性があります。
-              確認: oc get proxy cluster -o jsonpath='{.spec.noProxy}'
-          when: "'.apps.' in _no_proxy"
-    
-        - name: Set proxy on kube-auth-proxy
-          ansible.builtin.command: >-
-            oc set env deploy/kube-auth-proxy -n openshift-ingress
-            HTTP_PROXY={{ _http_proxy }} HTTPS_PROXY={{ _https_proxy }} NO_PROXY={{ _no_proxy }}
-          register: _set_env_kube_auth
-          changed_when: "'updated' in _set_env_kube_auth.stdout"
-          failed_when: false
-    
-        - name: Wait for kube-auth-proxy rollout
-          ansible.builtin.command: >-
-            oc rollout status deploy/kube-auth-proxy -n openshift-ingress --timeout=60s
-          changed_when: false
-          failed_when: false
-    
-        - name: Set proxy on rhods-dashboard core-bff
-          ansible.builtin.command: >-
-            oc set env deploy/rhods-dashboard -n redhat-ods-applications -c core-bff
-            HTTP_PROXY={{ _http_proxy }} HTTPS_PROXY={{ _https_proxy }} NO_PROXY={{ _no_proxy }}
-          register: _set_env_dashboard
-          changed_when: "'updated' in _set_env_dashboard.stdout"
-          failed_when: false
-    
-        - name: Wait for maas-ui deployment
-          kubernetes.core.k8s_info:
-            api_version: apps/v1
-            kind: Deployment
-            name: maas-ui
-            namespace: redhat-ods-applications
-          register: _maas_ui
-          until: >-
-            _maas_ui is not failed and
-            (_maas_ui.resources | default([])) | length > 0
-          retries: 12
-          delay: 10
-          failed_when: false
-    
-        - name: Set proxy on maas-ui
-          ansible.builtin.command: >-
-            oc set env deploy/maas-ui -n redhat-ods-applications
-            HTTP_PROXY={{ _http_proxy }} HTTPS_PROXY={{ _https_proxy }} NO_PROXY={{ _no_proxy }}
-          register: _set_env_maas_ui
-          changed_when: "'updated' in _set_env_maas_ui.stdout"
-          failed_when: false
-          when: _maas_ui.resources | default([]) | length > 0
+
+    - name: Set proxy facts from Proxy CR status
+      ansible.builtin.set_fact:
+        _http_proxy: "{{ _proxy_status.results[0].stdout }}"
+        _https_proxy: "{{ _proxy_status.results[1].stdout }}"
+        _no_proxy: "{{ _proxy_status.results[2].stdout }}"
+
+    - name: Display proxy diagnostic and manual configuration guidance
+      ansible.builtin.debug:
+        msg: |
+          Proxy CR に HTTP_PROXY または HTTPS_PROXY が設定されています。
+          proxy の自動適用は行いません。通信障害を診断してから手動で適用してください。
+
+          ---- kube-auth-proxy (OAuth token redemption) ----
+          以下の手順で直接接続と proxy 経由を比較し、proxy が必要か判断してください:
+
+          # 1. OAuth Route のホスト名と Proxy URL を取得
+          OAUTH_HOST=$(oc get route oauth-openshift -n openshift-authentication -o jsonpath='{.spec.host}')
+          PROXY_URL=$(oc get proxy cluster -o jsonpath='{.status.httpsProxy}')
+          [ -z "$PROXY_URL" ] && PROXY_URL=$(oc get proxy cluster -o jsonpath='{.status.httpProxy}')
+
+          # 2. 直接接続を試行 (--noproxy '*' で proxy を迂回)
+          oc exec -n openshift-ingress deploy/kube-auth-proxy -- \
+            curl -sk --noproxy '*' --connect-timeout 5 -o /dev/null -w '%{http_code}' https://$OAUTH_HOST/healthz
+          # → 200 なら proxy 不要。この手順は完了
+
+          # 3. 直接接続が失敗した場合: proxy 経由を試行 (--proxy で明示、--noproxy '' で除外設定を上書き)
+          #    oc exec -n openshift-ingress deploy/kube-auth-proxy -- \
+          #      curl -sk --proxy "$PROXY_URL" --noproxy '' --connect-timeout 5 -o /dev/null -w '%{http_code}' https://$OAUTH_HOST/healthz
+          #    → 200 なら proxy が必要。以下を実行:
+          #    NO_PROXY_KUBE_AUTH=$(oc get proxy cluster -o jsonpath='{.status.noProxy}' | python3 -c "import sys; print(','.join(i for i in sys.stdin.read().split(',') if '.apps.' not in i))")
+          #    oc set env deploy/kube-auth-proxy -n openshift-ingress \
+          #      HTTP_PROXY="$(oc get proxy cluster -o jsonpath='{.status.httpProxy}')" \
+          #      HTTPS_PROXY="$(oc get proxy cluster -o jsonpath='{.status.httpsProxy}')" \
+          #      NO_PROXY="$NO_PROXY_KUBE_AUTH"
+          #    oc rollout status deploy/kube-auth-proxy -n openshift-ingress --timeout=60s
+
+          ---- core-bff / maas-ui ----
+          # oc logs -n redhat-ods-applications deploy/rhods-dashboard -c core-bff --tail=50 | grep -i 'connect\|timeout\|ECONNREFUSED'
+          # oc logs -n redhat-ods-applications deploy/maas-ui --tail=50 | grep -i 'connect\|timeout\|ECONNREFUSED'
+          # 通信障害が確認された場合:
+          #   oc set env deploy/<name> -n <ns> \
+          #     HTTP_PROXY="$(oc get proxy cluster -o jsonpath='{.status.httpProxy}')" \
+          #     HTTPS_PROXY="$(oc get proxy cluster -o jsonpath='{.status.httpsProxy}')" \
+          #     NO_PROXY="$(oc get proxy cluster -o jsonpath='{.status.noProxy}')"
+      when: (_http_proxy | length > 0) or (_https_proxy | length > 0)
     
     # ---------------------------------------------------------------------------
     # Step 12: Dashboard Feature Flags

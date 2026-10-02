@@ -2,6 +2,15 @@
 # Uninstall: ogx
 
 - block:
+    - name: Delete OGX ObjectBucketClaim before RHOAI namespace cleanup
+      kubernetes.core.k8s:
+        state: absent
+        api_version: objectbucket.io/v1alpha1
+        kind: ObjectBucketClaim
+        name: ogx-obc
+        namespace: redhat-ods-applications
+      failed_when: false
+
     - name: Delete OGX vllm connection Secret
       kubernetes.core.k8s:
         state: absent

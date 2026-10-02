@@ -4,6 +4,25 @@
 # Order: NooBaa → Operator + namespace
 
 - block:
+    - name: Check whether ObjectBucketClaim CRD exists
+      kubernetes.core.k8s_info:
+        api_version: apiextensions.k8s.io/v1
+        kind: CustomResourceDefinition
+        name: objectbucketclaims.objectbucket.io
+      register: _obc_crd
+
+    - name: Wait for ObjectBucketClaims to be removed before NooBaa
+      kubernetes.core.k8s_info:
+        api_version: objectbucket.io/v1alpha1
+        kind: ObjectBucketClaim
+      register: _remaining_obcs
+      until: >-
+        _remaining_obcs is not failed and
+        (_remaining_obcs.resources | default([])) | length == 0
+      retries: 30
+      delay: 10
+      when: (_obc_crd.resources | default([])) | length > 0
+
     - name: Delete NooBaa
       kubernetes.core.k8s:
         state: absent
@@ -25,7 +44,6 @@
         (_noobaa.resources | default([])) | length == 0
       retries: 30
       delay: 10
-      failed_when: false
 
     - name: Uninstall ODF Operator
       ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/uninstall_operator.yml"

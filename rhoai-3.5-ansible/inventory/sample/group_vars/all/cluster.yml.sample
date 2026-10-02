@@ -18,12 +18,10 @@ ansible_root: "{{ playbook_dir ~ ('/..' if '/playbooks' in playbook_dir else '')
 storage_class: lvms-vg1
 
 # ---- Proxy ----
-# 設定すると rhoai role が kube-auth-proxy, rhods-dashboard, maas-ui に注入
-# 空ならスキップ
-cluster_proxy:
-  http_proxy: ""
-  https_proxy: ""
-  no_proxy: "localhost,127.0.0.1,.cluster.local,.svc"
+# Proxy 設定は Proxy CR (oc get proxy cluster) の status から自動取得します。
+# status.noProxy にはクラスタ内ネットワークの値が OCP によって自動補完されます。
+# 参考: https://docs.redhat.com/en/documentation/openshift_container_platform/4.18/html-single/configuring_network_settings/index
+# cluster_proxy 変数は廃止 — Proxy CR の status を使用してください。
 
 # ---- Operator チャネル ----
 # 全 Operator のバージョンを一元管理

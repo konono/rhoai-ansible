@@ -5,7 +5,25 @@
 # =============================================================================
 
 - block:
-    
+
+    # === Proxy CR status から実効値を取得 (単独実行対応) ===
+    - name: Get effective proxy settings from Proxy CR status
+      ansible.builtin.command: >-
+        oc get proxy cluster -o jsonpath='{.status.{{ item }}}'
+      loop:
+        - httpProxy
+        - httpsProxy
+        - noProxy
+      register: _llm_proxy_status
+      changed_when: false
+      failed_when: false
+
+    - name: Set proxy facts for download Jobs
+      ansible.builtin.set_fact:
+        _http_proxy: "{{ _http_proxy | default(_llm_proxy_status.results[0].stdout) }}"
+        _https_proxy: "{{ _https_proxy | default(_llm_proxy_status.results[1].stdout) }}"
+        _no_proxy: "{{ _no_proxy | default(_llm_proxy_status.results[2].stdout) }}"
+
     # === GPU キャパシティチェック ===
     - name: Calculate total GPU required by present models
       ansible.builtin.set_fact:
@@ -110,6 +128,8 @@
           kind: ClusterStorageContainer
           metadata:
             name: default
+            labels:
+              app.kubernetes.io/managed-by: rhoai-ansible
           spec:
             container:
               name: storage-initializer
