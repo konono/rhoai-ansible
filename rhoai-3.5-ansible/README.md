@@ -591,6 +591,9 @@ uv run ansible-playbook site.yml -i inventory/myenv
 # 必要なロールを復旧してから次を別途実行してください。
 uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
 
+# API Key 発行まで試す検証は Key を作成するため、明示的に指定した時だけ実行します。
+uv run ansible-playbook playbooks/verify.yml -i inventory/myenv -e verify_maas_api_key_issuance=true
+
 # 特定フェーズのみ実行
 uv run ansible-playbook site.yml -i inventory/myenv --tags platform
 uv run ansible-playbook site.yml -i inventory/myenv --tags workload

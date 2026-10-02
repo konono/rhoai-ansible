@@ -348,7 +348,10 @@
         -o jsonpath='{.items[0].metadata.name}'
       register: _maas_pod
       changed_when: false
-      when: install_maas_resources | default(true) and install_keycloak | default(true)
+      when:
+        - install_maas_resources | default(true)
+        - install_keycloak | default(true)
+        - verify_maas_api_key_issuance | default(false) | bool
       tags: [workload, maas]
 
     - name: "Verify: MaaS API Key issuable"
@@ -367,6 +370,7 @@
       when:
         - install_maas_resources | default(true)
         - install_keycloak | default(true)
+        - verify_maas_api_key_issuance | default(false) | bool
         - _maas_pod.stdout | default('') | length > 0
       tags: [workload, maas]
 
