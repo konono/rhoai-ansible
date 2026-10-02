@@ -586,6 +586,11 @@ models:
 # フルデプロイ
 uv run ansible-playbook site.yml -i inventory/myenv
 
+# フルデプロイの最後に、除外なしの verify.yml が自動実行されます。
+# exit 0 が全構成の検証完了を意味します。タグ指定の部分実行後は、
+# 必要なロールを復旧してから次を別途実行してください。
+uv run ansible-playbook playbooks/verify.yml -i inventory/myenv
+
 # 特定フェーズのみ実行
 uv run ansible-playbook site.yml -i inventory/myenv --tags platform
 uv run ansible-playbook site.yml -i inventory/myenv --tags workload

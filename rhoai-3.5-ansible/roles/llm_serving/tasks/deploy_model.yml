@@ -253,3 +253,17 @@
      | list | length > 0)
   retries: 120
   delay: 10
+
+- name: "Wait for MaaSModelRef Ready ({{ _model_name }})"
+  kubernetes.core.k8s_info:
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: MaaSModelRef
+    name: "{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+  register: _modelref_status
+  until: >-
+    _modelref_status is not failed and
+    (_modelref_status.resources | default([])) | length > 0 and
+    (_modelref_status.resources[0].status.phase | default('')) == 'Ready'
+  retries: 60
+  delay: 10

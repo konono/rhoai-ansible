@@ -178,3 +178,9 @@
           手動で実行: bash scripts/setup-opencode.sh setup
       when: _opencode.rc | default(0) != 0
       tags: [post_deploy, opencode]
+
+# A full deployment is complete only after the unscoped verification passes.
+# Tagged recovery runs verify their selected components separately; they must
+# not claim that the whole cluster has been restored.
+- import_playbook: playbooks/verify.yml
+  when: "'all' in ansible_run_tags"
