@@ -97,6 +97,12 @@
       when: install_rhoai
       tags: [platform, rhoai]
 
+    - name: Recover stale Keycloak admin credentials
+      ansible.builtin.import_role:
+        name: keycloak_admin_recovery
+      when: install_keycloak and keycloak_admin_recovery | default(false) | bool
+      tags: [platform, keycloak, keycloak_recovery]
+
     - name: Keycloak
       ansible.builtin.import_role:
         name: keycloak

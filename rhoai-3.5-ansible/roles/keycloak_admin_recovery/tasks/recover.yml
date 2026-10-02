@@ -1,0 +1,355 @@
+---
+- name: Generate unique temporary recovery identity
+  ansible.builtin.set_fact:
+    _kc_recovery_nonce: "{{ lookup('password', '/dev/null length=10 chars=ascii_lowercase,digits') }}"
+    _kc_temp_password: "{{ lookup('password', '/dev/null length=32 chars=ascii_letters,digits') }}"
+  no_log: true
+
+- name: Set recovery resource names
+  ansible.builtin.set_fact:
+    _kc_temp_username: "oc-deps-recovery-{{ _kc_recovery_nonce }}"
+    _kc_temp_secret: "keycloak-admin-recovery-{{ _kc_recovery_nonce }}"
+    _kc_temp_job: "keycloak-admin-recovery-{{ _kc_recovery_nonce }}"
+
+# The fixed ConfigMap name is an atomic lock. An existing lock is never
+# overwritten or deleted by this run.
+- name: Bootstrap temporary admin while all Keycloak Pods are stopped
+  block:
+    - name: Acquire Keycloak recovery lock
+      ansible.builtin.command:
+        argv:
+          - oc
+          - create
+          - configmap
+          - keycloak-admin-recovery-lock
+          - -n
+          - "{{ keycloak_namespace | default('keycloak') }}"
+          - "--from-literal=run-id={{ _kc_recovery_nonce }}"
+      changed_when: true
+
+    - name: Mark recovery lock as owned by this run
+      ansible.builtin.set_fact:
+        _kc_lock_acquired: true
+
+    - name: Create temporary recovery password Secret
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ _kc_temp_secret }}"
+            namespace: "{{ keycloak_namespace | default('keycloak') }}"
+          type: Opaque
+          stringData:
+            password: "{{ _kc_temp_password }}"
+      no_log: true
+
+    - name: Record that the original replica count must be restored
+      ansible.builtin.set_fact:
+        _kc_restore_needed: true
+
+    - name: Stop all Keycloak instances
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: k8s.keycloak.org/v2beta1
+          kind: Keycloak
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace | default('keycloak') }}"
+          spec:
+            instances: 0
+
+    - name: Wait until all Keycloak server Pods have stopped
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: "{{ keycloak_namespace | default('keycloak') }}"
+        label_selectors:
+          - app=keycloak
+          - app.kubernetes.io/managed-by=keycloak-operator
+      register: _kc_stopped_pods
+      until: _kc_stopped_pods.resources | length == 0
+      retries: 60
+      delay: 5
+
+    - name: Mark temporary admin Job as potentially submitted
+      ansible.builtin.set_fact:
+        _kc_job_submitted: true
+
+    - name: Create temporary admin using the running Pod image and DB settings
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: "{{ _kc_temp_job }}"
+            namespace: "{{ keycloak_namespace | default('keycloak') }}"
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                automountServiceAccountToken: false
+                restartPolicy: Never
+                containers:
+                  - name: bootstrap-admin
+                    image: "{{ _kc_image }}"
+                    command:
+                      - /opt/keycloak/bin/kc.sh
+                      - bootstrap-admin
+                      - user
+                      - --username
+                      - "{{ _kc_temp_username }}"
+                      - --password:env
+                      - KC_TEMP_ADMIN_PASSWORD
+                      - --no-prompt
+                    env: >-
+                      {{ _kc_db_env + [
+                        {'name': 'KC_TEMP_ADMIN_PASSWORD',
+                         'valueFrom': {'secretKeyRef':
+                           {'name': _kc_temp_secret, 'key': 'password'}}}
+                      ] }}
+                    resources:
+                      requests:
+                        cpu: 250m
+                        memory: 512Mi
+                      limits:
+                        cpu: "1"
+                        memory: 1Gi
+                    securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                        drop: [ALL]
+      no_log: true
+
+    - name: Wait for bootstrap Job to finish
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        name: "{{ _kc_temp_job }}"
+        namespace: "{{ keycloak_namespace | default('keycloak') }}"
+      register: _kc_bootstrap_job
+      until: >-
+        _kc_bootstrap_job.resources | length == 1 and
+        ((_kc_bootstrap_job.resources[0].status.succeeded | default(0) | int) > 0 or
+         (_kc_bootstrap_job.resources[0].status.failed | default(0) | int) > 0)
+      retries: 60
+      delay: 5
+
+    - name: Require successful temporary admin bootstrap
+      ansible.builtin.assert:
+        that:
+          - _kc_bootstrap_job.resources[0].status.succeeded | default(0) | int == 1
+        fail_msg: >-
+          The bootstrap Job did not complete successfully. Its temporary
+          Secret and lock are retained for investigation.
+        quiet: true
+
+  rescue:
+    - name: Record bootstrap failure
+      ansible.builtin.set_fact:
+        _kc_bootstrap_failed: true
+
+  always:
+    - name: Restore the original Keycloak replica count
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: k8s.keycloak.org/v2beta1
+          kind: Keycloak
+          metadata:
+            name: keycloak
+            namespace: "{{ keycloak_namespace | default('keycloak') }}"
+          spec:
+            instances: "{{ _kc_original_instances | int }}"
+      when: _kc_restore_needed | default(false) | bool
+
+    - name: Wait for Keycloak to become Ready again
+      kubernetes.core.k8s_info:
+        api_version: k8s.keycloak.org/v2beta1
+        kind: Keycloak
+        name: keycloak
+        namespace: "{{ keycloak_namespace | default('keycloak') }}"
+      register: _kc_restored_cr
+      until: >-
+        _kc_restored_cr.resources | length == 1 and
+        (_kc_restored_cr.resources[0].status.conditions | default([])
+         | selectattr('type', 'equalto', 'Ready')
+         | selectattr('status', 'equalto', 'True') | list | length > 0)
+      retries: 60
+      delay: 5
+      when: _kc_restore_needed | default(false) | bool
+
+- name: Delete temporary Secret when no bootstrap Job was submitted
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: Secret
+    name: "{{ _kc_temp_secret }}"
+    namespace: "{{ keycloak_namespace | default('keycloak') }}"
+  when:
+    - _kc_bootstrap_failed | default(false) | bool
+    - not (_kc_job_submitted | default(false) | bool)
+    - _kc_lock_acquired | default(false) | bool
+  no_log: true
+
+- name: Release recovery lock when no bootstrap Job was submitted
+  ansible.builtin.command:
+    argv:
+      - oc
+      - delete
+      - configmap
+      - keycloak-admin-recovery-lock
+      - -n
+      - "{{ keycloak_namespace | default('keycloak') }}"
+  changed_when: true
+  when:
+    - _kc_bootstrap_failed | default(false) | bool
+    - not (_kc_job_submitted | default(false) | bool)
+    - _kc_lock_acquired | default(false) | bool
+
+- name: Stop after bootstrap failure and retain recovery access if needed
+  ansible.builtin.fail:
+    msg: >-
+      Keycloak replicas were restored, but temporary admin bootstrap failed.
+      Inspect Job {{ _kc_temp_job }} in {{ keycloak_namespace | default('keycloak') }}.
+      Any submitted recovery Secret and the lock were left intact so that
+      credentials are not lost during investigation.
+  when: _kc_bootstrap_failed | default(false) | bool
+
+- name: Reset original admin password and remove temporary admin
+  block:
+    - name: Obtain temporary admin token
+      ansible.builtin.uri:
+        url: "{{ _kc_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ _kc_temp_username }}"
+          password: "{{ _kc_temp_password }}"
+          grant_type: password
+        validate_certs: false
+        status_code: 200
+      register: _kc_temp_token
+      no_log: true
+
+    - name: Find the original admin user by exact username
+      ansible.builtin.uri:
+        url: "{{ _kc_url }}/admin/realms/master/users?username={{ _kc_original_username | urlencode }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _kc_temp_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: _kc_original_users
+      no_log: true
+
+    - name: Require exactly one matching original admin user
+      ansible.builtin.assert:
+        that:
+          - _kc_original_users.json | length == 1
+          - _kc_original_users.json[0].username == _kc_original_username
+        fail_msg: >-
+          The username in keycloak-initial-admin does not identify exactly
+          one master realm user. Temporary recovery access was retained.
+        quiet: true
+
+    - name: Set the original admin password to the existing Secret value
+      ansible.builtin.uri:
+        url: "{{ _kc_url }}/admin/realms/master/users/{{ _kc_original_users.json[0].id }}/reset-password"
+        method: PUT
+        headers:
+          Authorization: "Bearer {{ _kc_temp_token.json.access_token }}"
+        body_format: json
+        body:
+          type: password
+          value: "{{ _kc_original_password }}"
+          temporary: false
+        validate_certs: false
+        status_code: 204
+      no_log: true
+
+    - name: Verify the original admin credentials now work
+      ansible.builtin.uri:
+        url: "{{ _kc_url }}/realms/master/protocol/openid-connect/token"
+        method: POST
+        body_format: form-urlencoded
+        body:
+          client_id: admin-cli
+          username: "{{ _kc_original_username }}"
+          password: "{{ _kc_original_password }}"
+          grant_type: password
+        validate_certs: false
+        status_code: 200
+      no_log: true
+
+    - name: Find the temporary admin user by exact username
+      ansible.builtin.uri:
+        url: "{{ _kc_url }}/admin/realms/master/users?username={{ _kc_temp_username | urlencode }}&exact=true"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ _kc_temp_token.json.access_token }}"
+        validate_certs: false
+        status_code: 200
+      register: _kc_temp_users
+      no_log: true
+
+    - name: Require exactly one temporary admin user before deletion
+      ansible.builtin.assert:
+        that:
+          - _kc_temp_users.json | length == 1
+          - _kc_temp_users.json[0].username == _kc_temp_username
+        fail_msg: Temporary admin identity is ambiguous; no user was deleted.
+        quiet: true
+
+    - name: Delete the temporary admin user
+      ansible.builtin.uri:
+        url: "{{ _kc_url }}/admin/realms/master/users/{{ _kc_temp_users.json[0].id }}"
+        method: DELETE
+        headers:
+          Authorization: "Bearer {{ _kc_temp_token.json.access_token }}"
+        validate_certs: false
+        status_code: 204
+      no_log: true
+
+    - name: Delete temporary bootstrap Job
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        name: "{{ _kc_temp_job }}"
+        namespace: "{{ keycloak_namespace | default('keycloak') }}"
+
+    - name: Delete temporary recovery Secret
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ _kc_temp_secret }}"
+        namespace: "{{ keycloak_namespace | default('keycloak') }}"
+      no_log: true
+
+    - name: Release Keycloak recovery lock
+      ansible.builtin.command:
+        argv:
+          - oc
+          - delete
+          - configmap
+          - keycloak-admin-recovery-lock
+          - -n
+          - "{{ keycloak_namespace | default('keycloak') }}"
+      changed_when: true
+      when: _kc_lock_acquired | default(false) | bool
+
+  rescue:
+    - name: Stop without deleting temporary recovery access
+      ansible.builtin.fail:
+        msg: >-
+          Keycloak replicas are restored, but password reset or cleanup did
+          not finish. Temporary user {{ _kc_temp_username }}, Job
+          {{ _kc_temp_job }}, Secret {{ _kc_temp_secret }}, and the recovery
+          lock may remain. Inspect the state and verify original admin login
+          before manually removing recovery access.

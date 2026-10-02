@@ -1,0 +1,25 @@
+---
+# Targeted entry point for the same recovery role used by site.yml.
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  tasks:
+    - name: Require explicit Keycloak recovery option
+      ansible.builtin.assert:
+        that:
+          - keycloak_admin_recovery | default(false) | bool
+        fail_msg: >-
+          This playbook can temporarily stop Keycloak. Invoke it explicitly
+          with -e keycloak_admin_recovery=true.
+        quiet: true
+
+    - name: Verify cluster login
+      ansible.builtin.command: oc whoami
+      changed_when: false
+
+    - name: Recover Keycloak admin access
+      ansible.builtin.import_role:
+        name: keycloak_admin_recovery

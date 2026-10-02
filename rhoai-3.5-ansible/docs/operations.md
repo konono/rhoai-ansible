@@ -604,7 +604,17 @@ Keycloak の PostgreSQL が PVC をマウントできていない場合、LVMClu
 PostgreSQL PVC の再作成後に `keycloak-initial-admin` Secret のパスワードで
 admin token を取得できず、HTTP 401 になることがあります。master realm が既に
 存在する場合、Secret の削除や Pod の再起動では DB 内の管理者パスワードは
-再設定されません。既存環境を守るため、この復旧は通常のデプロイ時に自動実行しません。
+再設定されません。`inventory/*/group_vars/all/components.yml` の
+`keycloak_admin_recovery: true` で、`site.yml` の Keycloak デプロイ前に
+復旧ロールを有効にできます。既存の Keycloak が Ready で、Secret の認証が
+成功すれば読み取りのみで終了します。新規構築時は Keycloak CR がないため
+スキップします。HTTP 401 の `Invalid user credentials` を確認した場合だけ
+一時管理者による復旧を実行します。必要なら `false` で無効化できます。
+
+復旧中は Keycloak を一時停止するため、Keycloak を使うログインも停止します。
+元の管理者パスワードを既存 Secret の値に合わせます。DB パスワード、PVC、
+realm データは変更しません。成功後は一時管理者、Job、Secret を削除します。
+対象だけ実行する場合は `site.yml --tags keycloak_recovery` を利用できます。
 
 今回のクラスタでは、DB と realm データを保持したまま次の手順で復旧しました。
 
