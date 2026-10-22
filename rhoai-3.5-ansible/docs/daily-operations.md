@@ -857,12 +857,34 @@ for p in d['items']:
 | ログの内容 | 原因 | 対処 |
 |---|---|---|
 | `No available memory for the cache blocks` | KV キャッシュ不足 | `--max-model-len` か `--max-num-seqs` を下げる |
-| `speculative` / `mtp` 関連のエラー | モデルが MTP 非対応 | `--speculative-config` を ngram 版に差し替える |
+| `speculative` / `mtp` 関連のエラー | 起動時に設定が拒否された可能性 | 下記の B1 診断で Pod 引数と起動ログを切り分ける |
 | CUDA graph 関連で起動しない | CUDA graph の問題 | 一時的に `--enforce-eager` を `vllm_args` に足す |
 | `config.json not found` | ダウンロード失敗 | download Job のログを見る。`hf_repo` の綴りを確認 |
 | GPU 不足で role が fail | present モデルの合計 > GPU 数 | いずれかを `state: absent` にする |
 | MaaSModelRef が Pending のまま | MaaSAuthPolicy / MaaSSubscription が未適用 | `playbooks/manage_maas_access.yml` を実行する |
 | transformers の `... is part of ...InitKwargs, but not documented` | 単なる警告（stderr に出るだけ） | 無視してよい |
+
+### Qwen3.8-27B-FP8 の MTP 診断 (B1、読み取り専用)
+
+クラスタにログインした端末で実行します。デフォルトは `llm-serving/qwen3-8-27b-fp8` です。
+
+```bash
+python3 scripts/diagnose-mtp.py
+# 名前や namespace が異なる場合:
+python3 scripts/diagnose-mtp.py <model-key> --namespace <namespace>
+```
+
+全 Pod を個別に調べ、① `speculative-config` が Pod の `args` に JSON として
+渡ったか、②末尾 500 行の起動ログに関連エラーがあるか、③ Pod 内の
+`localhost:8000/metrics` に HTTPS (失敗時は HTTP) で到達でき、
+`spec_decode` の draft/accepted token 累積カウンタが正の値かを表示します。
+ログ本文、環境変数、Secret、metrics のラベルは表示しません。
+
+①が正常でも vLLM が受理したとは限りません。②の関連行が 0 件でも
+起動ログが末尾 500 行から外れた可能性があります。③のカウンタが 0 なら
+リクエストを送った後に再実行し、前後の値を比較します。このスクリプトは
+1 回の測定値を表示し、増加自体は判定しません。HTTP/HTTPS の取得失敗や Pod が 0 件の場合は
+「MTP 無効」と判断せず、接続・Pod 状態を先に確認してください。
 
 ---
 
