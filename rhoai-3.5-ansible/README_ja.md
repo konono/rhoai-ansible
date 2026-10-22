@@ -1,5 +1,23 @@
 # RHOAI 3.5 Ansible Installer
 
+## Playbook の更新とリリース
+
+GitHub Release の最新版を確認し、変更一覧を表示します。クラスタへの適用は行いません。
+
+```bash
+python3 scripts/self-update.py
+python3 scripts/self-update.py --apply
+```
+
+オフライン環境では Release の `rhoai-3.5-ansible.tar.gz` と `checksums.txt` を持ち込みます。
+
+```bash
+python3 scripts/self-update.py --archive /path/rhoai-3.5-ansible.tar.gz --checksums /path/checksums.txt
+python3 scripts/self-update.py --archive /path/rhoai-3.5-ansible.tar.gz --checksums /path/checksums.txt --apply
+```
+
+更新は SHA-256 を検証し、実行環境の inventory、Secret、`.venv`、vendor を保持します。新しい依存関係がある場合は更新後に `bash scripts/setup-env.sh` を実行してください。タグからの Release 作成手順は [release-process.md](docs/release-process.md) を参照してください。
+
 ## 1. 概要
 
 OpenShift AI (RHOAI) 3.5 を OpenShift 環境にデプロイする Ansible Playbook です。Single Node OpenShift (SNO) およびマルチノードクラスターの両方に対応しています。

@@ -2,6 +2,17 @@
 
 # RHOAI 3.5 Ansible Installer
 
+## Playbook updates and releases
+
+Preview the latest GitHub Release, then apply the verified source update:
+
+```bash
+python3 scripts/self-update.py
+python3 scripts/self-update.py --apply
+```
+
+For disconnected hosts, transfer the Release assets `rhoai-3.5-ansible.tar.gz` and `checksums.txt`, then use `--archive PATH --checksums PATH` (and `--apply` after previewing). The updater preserves environment inventories, secrets, `.venv`, and vendor files. See [release-process.md](docs/release-process.md) for publishing steps.
+
 ## 1. Overview
 
 An Ansible Playbook for deploying OpenShift AI (RHOAI) 3.5 to an OpenShift environment. It supports both Single Node OpenShift (SNO) and multi-node clusters.
