@@ -485,6 +485,215 @@ class TestRenderParity(unittest.TestCase):
                     self.assertEqual(ans["metadata"]["namespace"], "custom-serving")
             self.assertGreater(checked, 0, "比較できたモデルがありません")
 
+    @unittest.skipUnless(ansible_available(), "ansible-core が無い環境ではスキップ")
+    def test_partial_model_defaults_override_behaves_identically(self):
+        """model_defaults を部分的に上書きしても両者が同じ結果になること
+
+        inventory の model_defaults は role defaults を丸ごと置き換えるため、
+        一部のキーだけ書くと replicas / resources / gpu_count / startupProbe が
+        欠ける。テンプレートは `| default(...)` で補うので Ansible は成功するが、
+        render.py が直接参照していると KeyError で落ちていた（実際に発生）。
+        両者が同じ既定値で補うことを検証する。
+        """
+        base = "sample" if "sample" in INVENTORIES else (
+            INVENTORIES[0] if INVENTORIES else None)
+        self.assertIsNotNone(base, "inventory がありません")
+
+        role_defaults = yaml.safe_load(LLM_DEFAULTS.read_text())["model_defaults"]
+        override = json.loads(json.dumps(role_defaults))
+        # テンプレートが default() で補うキーを落とす
+        for k in ("replicas", "resources", "gpu_count",
+                  "startup_probe_failure_threshold", "startup_probe_period_seconds"):
+            override.pop(k, None)
+        override["namespace"] = "custom-serving"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invdir = materialize_inventory(base, tmp)
+            comp = invdir / "group_vars" / "all" / "components.yml"
+            data = yaml.safe_load(comp.read_text())
+            data["model_defaults"] = override
+            # レシピに resources がないモデルも含める。Qwen3.8 のように
+            # レシピが全リソースを指定するモデルだけでは既定値消失を検出できない。
+            data.setdefault("models", {})["parity-fallback"] = {
+                "hf_repo": "Example/Unlisted-Model", "state": "present",
+            }
+            comp.write_text(yaml.safe_dump(data, allow_unicode=True))
+
+            ans_dir = Path(tmp) / "ansible-out"
+            env = {**os.environ,
+                   "ANSIBLE_COLLECTIONS_PATH": os.environ.get(
+                       "ANSIBLE_COLLECTIONS_PATH",
+                       str(Path.home() / ".ansible" / "collections"))}
+            r = subprocess.run(
+                ansible_cmd() + [
+                    str(ANSIBLE_DIR / "playbooks" / "llm_show_manifest.yml"),
+                    "-i", str(invdir), "-e", f"dest={ans_dir}",
+                ],
+                capture_output=True, cwd=str(ANSIBLE_DIR), env=env)
+            self.assertEqual(r.returncode, 0,
+                             "部分上書きで Ansible が失敗しました:\n"
+                             + r.stdout.decode()[-2000:])
+
+            rnd_dir = Path(tmp) / "render-out"
+            self._render_with_render_py_dir(invdir, rnd_dir)
+
+            checked = 0
+            for name, entry in (data.get("models") or {}).items():
+                if entry.get("state", "present") != "present":
+                    continue
+                af = ans_dir / f"{name}-llminferenceservice.yml"
+                if not af.exists():
+                    continue
+                checked += 1
+                ans = yaml.safe_load(af.read_text())
+                rnd = self._extract(
+                    rnd_dir / "manifests" / "09-llm-serving"
+                    / f"model-{name}-deploy.yml", "LLMInferenceService")
+                with self.subTest(model=name):
+                    self.assertIsNotNone(rnd)
+                    self.assertEqual(ans, rnd,
+                                     "差分:\n" + "\n".join(_diff(ans, rnd)))
+            self.assertGreater(checked, 0, "比較できたモデルがありません")
+
+    @unittest.skipUnless(ansible_available(), "ansible-core が無い環境ではスキップ")
+    def test_nested_dicts_are_merged_recursively(self):
+        """レシピと inventory の両方にある dict が再帰マージされること
+
+        Ansible は combine(..., recursive=True)。render.py が浅いマージだと
+        vllm_env のようなネスト dict が丸ごと置き換わり、レシピ由来の値が
+        静かに落ちる（実際に発生した）。
+        """
+        base = "sample" if "sample" in INVENTORIES else (
+            INVENTORIES[0] if INVENTORIES else None)
+        self.assertIsNotNone(base, "inventory がありません")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invdir = materialize_inventory(base, tmp)
+            data = yaml.safe_load(
+                (invdir / "group_vars" / "all" / "components.yml").read_text())
+
+            # inventory 側が vllm_env を持つモデルを選ぶ
+            target = next((n for n, e in (data.get("models") or {}).items()
+                           if e.get("state", "present") == "present"
+                           and e.get("vllm_env")), None)
+            self.assertIsNotNone(
+                target, "vllm_env を持つ present なモデルが inventory にありません")
+
+            # レシピ側にも別キーの vllm_env を足す
+            recipes_path = MODEL_RECIPES
+            original = recipes_path.read_text()
+            try:
+                rd = yaml.safe_load(original)
+                hf = data["models"][target]["hf_repo"]
+                rd["model_recipes"].setdefault(hf, {})["vllm_env"] = {
+                    "PARITY_RECIPE_ONLY": "yes"}
+                recipes_path.write_text(
+                    yaml.safe_dump(rd, allow_unicode=True, sort_keys=False))
+
+                ans_dir = Path(tmp) / "ansible-out"
+                env = {**os.environ,
+                       "ANSIBLE_COLLECTIONS_PATH": os.environ.get(
+                           "ANSIBLE_COLLECTIONS_PATH",
+                           str(Path.home() / ".ansible" / "collections"))}
+                r = subprocess.run(
+                    ansible_cmd() + [
+                        str(ANSIBLE_DIR / "playbooks" / "llm_show_manifest.yml"),
+                        "-i", str(invdir), "-e", f"dest={ans_dir}",
+                    ],
+                    capture_output=True, cwd=str(ANSIBLE_DIR), env=env)
+                self.assertEqual(r.returncode, 0, r.stdout.decode()[-2000:])
+
+                rnd_dir = Path(tmp) / "render-out"
+                self._render_with_render_py_dir(invdir, rnd_dir)
+
+                ans = yaml.safe_load(
+                    (ans_dir / f"{target}-llminferenceservice.yml").read_text())
+                rnd = self._extract(
+                    rnd_dir / "manifests" / "09-llm-serving"
+                    / f"model-{target}-deploy.yml", "LLMInferenceService")
+                names = [e["name"]
+                         for e in ans["spec"]["template"]["containers"][0]["env"]]
+                self.assertIn("PARITY_RECIPE_ONLY", names,
+                              "レシピ側の vllm_env が Ansible で反映されていません")
+                self.assertEqual(ans, rnd,
+                                 "差分:\n" + "\n".join(_diff(ans, rnd)))
+            finally:
+                recipes_path.write_text(original)
+
+    def test_model_cfg_resolution_chain_is_consistent(self):
+        """モデル設定を解決する箇所がすべて同じチェーンを使っていること
+
+        wait_modelref.yml だけレシピ層を飛ばしており、レシピが namespace を
+        指定すると存在しない namespace を待ち続ける不具合があった。
+        """
+        targets = [
+            ANSIBLE_DIR / "roles" / "llm_serving" / "tasks" / "main.yml",
+            ANSIBLE_DIR / "roles" / "llm_serving" / "tasks" / "wait_modelref.yml",
+            ANSIBLE_DIR / "playbooks" / "llm_show_manifest.yml",
+            ANSIBLE_DIR / "playbooks" / "llm_edit_args.yml",
+        ]
+        for p in targets:
+            with self.subTest(path=p.name):
+                text = p.read_text()
+                self.assertIn(
+                    "model_recipes['_fallback']", text,
+                    f"{p.name} が _fallback 層を参照していません",
+                )
+                self.assertTrue(
+                    "model_recipes.get(" in text or "model_recipes[" in text,
+                    f"{p.name} が hf_repo によるレシピ参照をしていません",
+                )
+                # subscript は hf_repo 欠落時に落ちるので .get を使う
+                self.assertNotIn(
+                    "model_recipes[item.value.hf_repo]", text,
+                    f"{p.name}: subscript ではなく .get を使ってください",
+                )
+
+    def test_absent_models_do_not_abort_rendering(self):
+        """absent なモデルがあるだけでレンダリング全体が止まらないこと
+
+        削除エントリは name/namespace しか要らない。必須キー検査を
+        一律にかけると、inventory が model_defaults を置き換えていて
+        vllm_image が欠けた瞬間に render.py 全体が止まっていた。
+        hf_repo を持たない削除エントリでも同様。
+        """
+        base = "sample" if "sample" in INVENTORIES else (
+            INVENTORIES[0] if INVENTORIES else None)
+        self.assertIsNotNone(base, "inventory がありません")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invdir = materialize_inventory(base, tmp)
+            comp = invdir / "group_vars" / "all" / "components.yml"
+            data = yaml.safe_load(comp.read_text())
+
+            role_defaults = yaml.safe_load(LLM_DEFAULTS.read_text())["model_defaults"]
+            override = json.loads(json.dumps(role_defaults))
+            override.pop("vllm_image", None)
+            data["model_defaults"] = override
+            for name, entry in (data.get("models") or {}).items():
+                if entry.get("state", "present") == "present":
+                    entry["vllm_image"] = role_defaults["vllm_image"]
+            # hf_repo を持たない削除エントリ
+            data.setdefault("models", {})["parity-absent"] = {"state": "absent"}
+            comp.write_text(yaml.safe_dump(data, allow_unicode=True))
+
+            rnd_dir = Path(tmp) / "render-out"
+            self._render_with_render_py_dir(invdir, rnd_dir)
+            self.assertTrue((rnd_dir / "manifests").is_dir(),
+                            "manifests が生成されていません")
+
+    def test_recipe_metadata_keys_are_not_stripped(self):
+        """レシピのメタキーを render.py 側だけ落とさないこと
+
+        Ansible は combine でそのまま取り込むため、render.py だけ落とすと
+        解決後の設定が両者でずれる。
+        """
+        src = RENDER_PY.read_text()
+        self.assertNotIn(
+            'if not k.startswith("_")', src,
+            "render.py がレシピのメタキーを落としています（Ansible 側は落としません）",
+        )
+
     def test_render_py_defaults_have_no_vllm_args(self):
         """vLLM 引数は model_recipes 側で持つ方針。render.py が独自に持たないこと"""
         src = RENDER_PY.read_text()

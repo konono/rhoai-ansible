@@ -45,12 +45,17 @@ if [ -z "$INVENTORY" ]; then
     # inventory が 1 つだけならそれを使う（sample は除く）
     mapfile -t _invs < <(find "${ANSIBLE_DIR}/inventory" -maxdepth 1 -mindepth 1 -type d \
                            ! -name sample -printf '%p\n' 2>/dev/null | sort)
+    # mapfile は空でも配列を定義するので長さ取得は安全。
+    # 危険なのは "${_invs[@]}" の展開側（bash 4.4 未満で unbound variable）。
     if [ "${#_invs[@]}" -eq 1 ]; then
         INVENTORY="${_invs[0]}"
         echo "inventory: ${INVENTORY}"
+    elif [ "${#_invs[@]}" -eq 0 ]; then
+        echo "-i で inventory を指定してください (inventory/ に sample 以外がありません)" >&2
+        exit 1
     else
         echo "-i で inventory を指定してください。候補:" >&2
-        printf '  %s\n' "${_invs[@]}" >&2
+        printf '  %s\n' ${_invs[@]+"${_invs[@]}"} >&2
         exit 1
     fi
 fi

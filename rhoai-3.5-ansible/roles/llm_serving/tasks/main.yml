@@ -165,12 +165,30 @@
         src: "{{ role_path }}/files/chat_template.jinja"
       register: _chat_template
     
+    # chat_template_configmap は model_recipes でも指定できるため、
+    # LLMInferenceService と同じ解決順で求める。
+    # models の値だけを見ていると、レシピが独自名を指定した場合に
+    # ConfigMap が作られず Pod が起動できない。
+    # 逆にレシピが "" を指定していても不要な ConfigMap を作ってしまう。
+    - name: Resolve chat template ConfigMap name per model
+      ansible.builtin.set_fact:
+        _chat_template_configmaps: >-
+          {{ (_chat_template_configmaps | default([]))
+             + [ (model_defaults
+                  | combine(model_recipes['_fallback'], recursive=True)
+                  | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
+                  | combine(item.value, recursive=True)).chat_template_configmap
+                 | default('') ] }}
+      loop: "{{ models | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      # absent のモデルの ConfigMap は不要（render.py も present のみ生成する）
+      when: (item.value.state | default(model_defaults.state)) == 'present'
+
     - name: Collect unique chat template ConfigMap names
       ansible.builtin.set_fact:
         _chat_template_configmaps: >-
-          {{ models | dict2items
-             | map(attribute='value')
-             | map(attribute='chat_template_configmap', default=model_defaults.chat_template_configmap)
+          {{ _chat_template_configmaps | default([])
              | select('ne', '') | unique | list }}
     
     - name: Apply chat template ConfigMaps
@@ -229,7 +247,7 @@
         _model_cfg: >-
           {{ model_defaults
              | combine(model_recipes['_fallback'], recursive=True)
-             | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
+             | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
              | combine(item.value, recursive=True) }}
       loop: "{{ models | dict2items }}"
       loop_control:
@@ -246,7 +264,7 @@
         _model_cfg: >-
           {{ model_defaults
              | combine(model_recipes['_fallback'], recursive=True)
-             | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
+             | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
              | combine(item.value, recursive=True) }}
       loop: "{{ models | dict2items }}"
       loop_control:

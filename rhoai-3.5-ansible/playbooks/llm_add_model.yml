@@ -29,6 +29,10 @@
     # MaaSModelRef は AuthPolicy / Subscription の適用後に Ready になるため、
     # 待機は manage_maas_access より後に置く（llm_serving 内で待つと
     # ポリシー未適用のままデッドロックする）。
+    - name: Load per-model vLLM recipes
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/vars/model_recipes.yml"
+
     - name: Wait for MaaSModelRef Ready
       ansible.builtin.include_role:
         name: llm_serving

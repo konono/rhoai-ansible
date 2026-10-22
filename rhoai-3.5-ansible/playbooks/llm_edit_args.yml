@@ -68,7 +68,7 @@
         _cfg: >-
           {{ model_defaults | default(_llm_role_defaults.model_defaults)
              | combine(model_recipes['_fallback'], recursive=True)
-             | combine(model_recipes[models[model].hf_repo] | default({}), recursive=True)
+             | combine(model_recipes.get(models[model].hf_repo | default(''), {}), recursive=True)
              | combine(models[model], recursive=True) }}
 
     - name: Read current args from the cluster

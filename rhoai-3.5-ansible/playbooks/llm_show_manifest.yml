@@ -81,7 +81,7 @@
         _model_cfg: >-
           {{ model_defaults | default(_rd.model_defaults)
              | combine(model_recipes['_fallback'], recursive=True)
-             | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
+             | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
              | combine(item.value, recursive=True) }}
       loop: "{{ _targets }}"
       loop_control:

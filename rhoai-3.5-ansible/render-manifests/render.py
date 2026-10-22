@@ -105,6 +105,45 @@ def render_operator(name: str, namespace: str, channel: str,
 
 
 
+# テンプレートが `| default(...)` で補うキー。
+# 値は roles/llm_serving/defaults/main.yml の model_defaults から読む
+# （render.py 内に同じ値を二重に持たないため）。
+# inventory が model_defaults を丸ごと置き換えてキーが欠けても、
+# Ansible 側と同じ結果になるよう揃える。
+_TEMPLATE_DEFAULT_KEYS = (
+    "replicas",
+    "gpu_count",
+    "startup_probe_failure_threshold",
+    "startup_probe_period_seconds",
+    "resources",
+)
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Ansible の combine(recursive=True) 相当"""
+    out = dict(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _fill_missing(target: dict, defaults: dict) -> dict:
+    """欠けているキーだけ再帰的に補う（既存の値は上書きしない）"""
+    out = dict(target)
+    for k, v in (defaults or {}).items():
+        if isinstance(v, dict):
+            out[k] = _fill_missing(out.get(k) or {}, v)
+        elif k not in out:
+            out[k] = v
+    return out
+
+
+_REQUIRED_MODEL_KEYS = ("hf_repo", "namespace", "vllm_image")
+
+
 class _QuotingDumper(yaml.SafeDumper):
     """JSON を値に含む文字列をシングルクォートで出力する Dumper。
 
@@ -142,6 +181,7 @@ class ManifestRenderer:
         self.storage_class = cfg.get("storage_class", "lvms-vg1")
         self.models = cfg.get("models", {})
         self._recipes_cache = None
+        self._role_defaults_cache = None
         self.model_defaults = {
             "namespace": "llm-serving",
             "state": "present",
@@ -1360,6 +1400,29 @@ class ManifestRenderer:
             "```"
         ))
 
+    def _load_role_defaults(self) -> dict:
+        """roles/llm_serving/defaults/main.yml の model_defaults を読む。
+
+        テンプレートが `| default(...)` で補う値の出所。render.py 内に
+        同じ既定値を書くと二重管理になるため、ファイルから読む。
+        """
+        if getattr(self, "_role_defaults_cache", None) is not None:
+            return self._role_defaults_cache
+        path = (Path(__file__).resolve().parent.parent
+                / "roles" / "llm_serving" / "defaults" / "main.yml")
+        try:
+            with open(path) as f:
+                loaded = (yaml.safe_load(f) or {}).get("model_defaults") or {}
+        except (OSError, yaml.YAMLError) as e:
+            # 黙って {} にすると resources や replicas の無い不完全な
+            # manifest を出してしまう。テンプレートは既定値を持つので
+            # Ansible とずれる。読めない時点で止める。
+            raise SystemExit(f"role defaults を読めません: {path}\n  {e}")
+        if not loaded:
+            raise SystemExit(f"role defaults に model_defaults がありません: {path}")
+        self._role_defaults_cache = loaded
+        return self._role_defaults_cache
+
     def _load_model_recipes(self) -> dict:
         """roles/llm_serving/vars/model_recipes.yml を読む（hf_repo -> 設定）。"""
         if getattr(self, "_recipes_cache", None) is not None:
@@ -1368,9 +1431,12 @@ class ManifestRenderer:
                 / "roles" / "llm_serving" / "vars" / "model_recipes.yml")
         try:
             with open(path) as f:
-                self._recipes_cache = yaml.safe_load(f).get("model_recipes", {}) or {}
-        except (OSError, yaml.YAMLError):
-            self._recipes_cache = {}
+                loaded = (yaml.safe_load(f) or {}).get("model_recipes") or {}
+        except (OSError, yaml.YAMLError) as e:
+            raise SystemExit(f"model_recipes.yml を読めません: {path}\n  {e}")
+        if not loaded:
+            raise SystemExit(f"model_recipes が空です: {path}")
+        self._recipes_cache = loaded
         return self._recipes_cache
 
     def _merge_model_cfg(self, cfg: dict) -> dict:
@@ -1380,17 +1446,35 @@ class ManifestRenderer:
         resources のようなネスト dict は再帰的にマージする。
         """
         recipes = self._load_model_recipes()
+        # _source / _notes などのメタキーは落とさない。
+        # Ansible 側は combine でそのまま取り込むため、落とすと
+        # 解決後の設定が両者でずれる（テンプレートは参照しないので出力は同じだが、
+        # 将来キーを列挙する処理を足したときに差が出る）。
         recipe = {**(recipes.get("_fallback") or {}),
                   **(recipes.get(cfg.get("hf_repo", ""), {}) or {})}
-        recipe = {k: v for k, v in recipe.items() if not k.startswith("_")}
-        merged = {**self.model_defaults, **recipe, **cfg}
-        default_res = {**self.model_defaults.get("resources", {}),
-                       **(recipe.get("resources", {}) or {})}
-        cfg_res = cfg.get("resources", {}) or {}
-        merged["resources"] = {
-            section: {**default_res.get(section, {}), **(cfg_res.get(section, {}) or {})}
-            for section in ("requests", "limits")
-        }
+
+        # Ansible 側は combine(..., recursive=True) なので再帰マージで揃える。
+        # 浅いマージだと vllm_env や resources のようなネスト dict が
+        # 丸ごと置き換わり、レシピ由来の値が落ちる。
+        merged = _deep_merge(_deep_merge(self.model_defaults, recipe), cfg)
+
+        # absent のモデルは削除に name/namespace しか要らない。
+        # 必須キー検査を一律にかけると、削除エントリがあるだけで
+        # レンダリング全体が止まってしまう。
+        missing = ([k for k in _REQUIRED_MODEL_KEYS if not merged.get(k)]
+                   if merged.get("state", "present") == "present" else [])
+        if missing:
+            raise SystemExit(
+                f"models の設定に必須キーがありません: {', '.join(missing)}\n"
+                "  inventory で model_defaults を定義すると role defaults を\n"
+                "  丸ごと置き換えるため、必要なキーは自分で書く必要があります。"
+            )
+
+        # テンプレートの | default(...) と同じ補完。欠けているキーだけ埋める。
+        role_defaults = self._load_role_defaults()
+        merged = _fill_missing(merged, {k: role_defaults[k]
+                                        for k in _TEMPLATE_DEFAULT_KEYS
+                                        if k in role_defaults})
         return merged
 
     def _render_maas_policies(self) -> list[dict]:

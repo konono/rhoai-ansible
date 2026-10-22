@@ -49,15 +49,23 @@ spec:
           - name: {{ k }}
             value: "{{ v }}"
 {% endfor %}
+{# inventory が model_defaults を定義すると role defaults を丸ごと置き換えるため、
+   一部のキーだけ書いた場合に未定義になる。replicas や startupProbe と同様に
+   既定値を持たせて部分上書きでも動くようにする。
+   既定値は roles/llm_serving/defaults/main.yml の model_defaults と同じ値。
+   render-manifests/render.py の _TEMPLATE_DEFAULTS とも揃えること。 #}
+{% set _res = _model_cfg.resources | default({}) %}
+{% set _req = _res.requests | default({}) %}
+{% set _lim = _res.limits | default({}) %}
         resources:
           requests:
-            cpu: "{{ _model_cfg.resources.requests.cpu }}"
-            memory: {{ _model_cfg.resources.requests.memory }}
-            nvidia.com/gpu: "{{ _model_cfg.gpu_count }}"
+            cpu: "{{ _req.cpu | default('500m') }}"
+            memory: {{ _req.memory | default('4Gi') }}
+            nvidia.com/gpu: "{{ _model_cfg.gpu_count | default(1) }}"
           limits:
-            cpu: "{{ _model_cfg.resources.limits.cpu }}"
-            memory: {{ _model_cfg.resources.limits.memory }}
-            nvidia.com/gpu: "{{ _model_cfg.gpu_count }}"
+            cpu: "{{ _lim.cpu | default('2') }}"
+            memory: {{ _lim.memory | default('8Gi') }}
+            nvidia.com/gpu: "{{ _model_cfg.gpu_count | default(1) }}"
         startupProbe:
           httpGet:
             path: /health
