@@ -9,6 +9,3 @@ dependencies = [
     "kubernetes>=29.0",
     "jmespath>=1.0",
 ]
-
-[tool.uv]
-find-links = ["vendor/wheels"]

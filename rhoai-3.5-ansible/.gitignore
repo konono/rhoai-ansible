@@ -30,3 +30,15 @@ inventory/*
 
 # OS
 .DS_Store
+
+# OpenCode
+opencode.json
+.opencode/
+
+# render-manifests の出力（generated-passwords.yml を含むため必ず除外する）
+*_manifests/
+*-manifests/
+test_manifest/
+render-out/
+output/
+generated-passwords.yml

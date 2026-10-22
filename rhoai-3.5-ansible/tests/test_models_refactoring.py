@@ -12,6 +12,7 @@ models 変数リファクタリングの統合テスト
 
 import fcntl
 import os
+import json
 import re
 import subprocess
 import sys
@@ -47,18 +48,45 @@ MODEL_DEFAULTS = {
     "namespace": "llm-serving",
     "state": "present",
     "vllm_image": "vllm/vllm-openai:v0.28.0",
-    "tool_call_parser": "qwen3_coder",
-    "reasoning_parser": "",
     "chat_template_configmap": "qwen3-chat-template",
+    "replicas": 1,
     "gpu_count": 1,
-    "vllm_extra_args": ["--max-model-len=4096", "--enable-auto-tool-choice"],
+    "vllm_args": [
+        "--enable-prefix-caching",
+        "--gpu-memory-utilization=0.90",
+        "--max-model-len=4096",
+        "--tool-call-parser=qwen3_coder",
+        "--enable-auto-tool-choice",
+        '--speculative-config={"method":"ngram","num_speculative_tokens":3,'
+        '"prompt_lookup_min":2,"prompt_lookup_max":4}',
+    ],
+    "vllm_env": {},
+    "resources": {
+        "requests": {"cpu": "500m", "memory": "4Gi"},
+        "limits": {"cpu": "2", "memory": "8Gi"},
+    },
+    "shm_size": "",
+    "startup_probe_failure_threshold": 120,
+    "startup_probe_period_seconds": 10,
     "purge": False,
 }
 
 
+def combine_recursive(a, b):
+    """Ansible の combine(recursive=True) 相当"""
+    out = dict(a)
+    for k, v in b.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = combine_recursive(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def make_jinja_env(template_dir):
     env = Environment(loader=FileSystemLoader(str(template_dir)))
-    env.filters["combine"] = lambda a, b: {**a, **b}
+    env.filters["combine"] = combine_recursive
+    env.filters["to_json"] = json.dumps
     env.filters["default"] = lambda val, d="": val if val else d
     return env
 
@@ -77,11 +105,10 @@ class TestDefaultsFile(unittest.TestCase):
             "namespace",
             "state",
             "vllm_image",
-            "tool_call_parser",
-            "reasoning_parser",
             "chat_template_configmap",
             "gpu_count",
-            "vllm_extra_args",
+            "vllm_env",
+            "resources",
             "purge",
         ]:
             self.assertIn(key, md, f"model_defaults missing key: {key}")
@@ -93,6 +120,49 @@ class TestDefaultsFile(unittest.TestCase):
         self.assertEqual(md["state"], "present")
         self.assertEqual(md["gpu_count"], 1)
         self.assertFalse(md["purge"])
+
+
+class TestModelRecipes(unittest.TestCase):
+    """roles/llm_serving/vars/model_recipes.yml の検証"""
+
+    RECIPES = LLM_DEFAULTS.parent.parent / "vars" / "model_recipes.yml"
+
+    def setUp(self):
+        self.assertTrue(self.RECIPES.exists(), f"{self.RECIPES} がありません")
+        self.data = yaml.safe_load(self.RECIPES.read_text())["model_recipes"]
+
+    def test_fallback_exists(self):
+        self.assertIn("_fallback", self.data)
+        self.assertIn("vllm_args", self.data["_fallback"])
+
+    def test_every_recipe_has_vllm_args_and_source(self):
+        for name, cfg in self.data.items():
+            with self.subTest(recipe=name):
+                self.assertIn("vllm_args", cfg)
+                self.assertIsInstance(cfg["vllm_args"], list)
+                self.assertGreater(len(cfg["vllm_args"]), 0)
+                # 出典とメモを必須にする（ナレッジとして残すため）
+                self.assertIn("_source", cfg)
+                self.assertIn("_notes", cfg)
+
+    def test_args_look_like_flags(self):
+        for name, cfg in self.data.items():
+            for a in cfg["vllm_args"]:
+                with self.subTest(recipe=name, arg=a):
+                    self.assertTrue(a.startswith("--"), f"{a} が -- で始まっていません")
+
+    def test_role_defaults_no_longer_define_vllm_args(self):
+        md = yaml.safe_load(LLM_DEFAULTS.read_text())["model_defaults"]
+        self.assertNotIn("vllm_args", md,
+                         "vllm_args は model_recipes 側で持つ方針です")
+
+    def test_speculative_config_has_no_spaces(self):
+        """--speculative-config の JSON に空白があるとシェル経由で分割される"""
+        for name, cfg in self.data.items():
+            for a in cfg["vllm_args"]:
+                if a.startswith("--speculative-config="):
+                    with self.subTest(recipe=name):
+                        self.assertNotIn(" ", a)
 
 
 class TestComponentsYml(unittest.TestCase):
@@ -384,7 +454,7 @@ class TestLLMInferenceServiceTemplate(unittest.TestCase):
         self.template = self.env.get_template("llminferenceservice.yml.j2")
 
     def _render(self, model_name, model_cfg):
-        cfg = {**MODEL_DEFAULTS, **model_cfg}
+        cfg = combine_recursive(MODEL_DEFAULTS, model_cfg)
         rendered = self.template.render(_model_name=model_name, _model_cfg=cfg)
         return yaml.safe_load(rendered)
 
@@ -401,42 +471,84 @@ class TestLLMInferenceServiceTemplate(unittest.TestCase):
         args = doc["spec"]["template"]["containers"][0]["args"]
         self.assertIn("--served-model-name=qwen3-4b", args)
 
-    def test_tool_call_parser(self):
-        doc = self._render(
-            "qwen3-4b",
-            {"hf_repo": "Qwen/Qwen3-4B", "tool_call_parser": "hermes"},
-        )
-        args = doc["spec"]["template"]["containers"][0]["args"]
-        self.assertIn("--tool-call-parser=hermes", args)
-
-    def test_reasoning_parser_omitted_when_empty(self):
-        doc = self._render(
-            "qwen3-4b",
-            {"hf_repo": "Qwen/Qwen3-4B", "reasoning_parser": ""},
-        )
-        args = doc["spec"]["template"]["containers"][0]["args"]
-        reasoning_args = [a for a in args if "--reasoning-parser" in a]
-        self.assertEqual(len(reasoning_args), 0)
-
-    def test_reasoning_parser_included_when_set(self):
-        doc = self._render(
-            "qwen3-06b",
-            {"hf_repo": "Qwen/Qwen3-0.6B", "reasoning_parser": "qwen3"},
-        )
-        args = doc["spec"]["template"]["containers"][0]["args"]
-        self.assertIn("--reasoning-parser=qwen3", args)
-
-    def test_extra_args(self):
+    def test_vllm_args_passed_through_verbatim(self):
         doc = self._render(
             "qwen3-4b",
             {
                 "hf_repo": "Qwen/Qwen3-4B",
-                "vllm_extra_args": ["--max-model-len=8192", "--custom-flag"],
+                "vllm_args": ["--max-model-len=8192", "--custom-flag"],
             },
         )
         args = doc["spec"]["template"]["containers"][0]["args"]
         self.assertIn("--max-model-len=8192", args)
         self.assertIn("--custom-flag", args)
+
+    def test_vllm_args_replace_defaults(self):
+        """モデル側の vllm_args は model_defaults のリストを完全に置き換える"""
+        doc = self._render(
+            "qwen3-4b",
+            {"hf_repo": "Qwen/Qwen3-4B", "vllm_args": ["--max-model-len=8192"]},
+        )
+        args = doc["spec"]["template"]["containers"][0]["args"]
+        self.assertNotIn("--enable-prefix-caching", args)
+        self.assertNotIn("--max-model-len=4096", args)
+
+    def test_only_served_model_name_and_chat_template_are_auto_added(self):
+        doc = self._render(
+            "qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B", "vllm_args": []}
+        )
+        args = doc["spec"]["template"]["containers"][0]["args"]
+        self.assertEqual(
+            args,
+            [
+                "--served-model-name=qwen3-4b",
+                "--chat-template=/chat-templates/chat_template.jinja",
+            ],
+        )
+
+    def test_chat_template_arg_omitted_when_configmap_empty(self):
+        doc = self._render(
+            "qwen3-4b",
+            {"hf_repo": "Qwen/Qwen3-4B", "chat_template_configmap": ""},
+        )
+        args = doc["spec"]["template"]["containers"][0]["args"]
+        self.assertFalse([a for a in args if "--chat-template" in a])
+
+    def test_gpu_count_applied_to_resources(self):
+        doc = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B", "gpu_count": 4})
+        res = doc["spec"]["template"]["containers"][0]["resources"]
+        self.assertEqual(res["requests"]["nvidia.com/gpu"], "4")
+        self.assertEqual(res["limits"]["nvidia.com/gpu"], "4")
+
+    def test_resources_merged_recursively(self):
+        doc = self._render(
+            "qwen3-4b",
+            {"hf_repo": "Qwen/Qwen3-4B", "resources": {"requests": {"cpu": "8"}}},
+        )
+        res = doc["spec"]["template"]["containers"][0]["resources"]
+        self.assertEqual(res["requests"]["cpu"], "8")
+        self.assertEqual(res["requests"]["memory"], "4Gi")
+        self.assertEqual(res["limits"]["cpu"], "2")
+
+    def test_vllm_env_appended(self):
+        doc = self._render(
+            "qwen3-4b",
+            {"hf_repo": "Qwen/Qwen3-4B", "vllm_env": {"NCCL_DEBUG": "WARN"}},
+        )
+        env = doc["spec"]["template"]["containers"][0]["env"]
+        self.assertIn({"name": "NCCL_DEBUG", "value": "WARN"}, env)
+
+    def test_shm_volume_only_when_shm_size_set(self):
+        without = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B"})
+        self.assertFalse(
+            [v for v in without["spec"]["template"]["volumes"] if v["name"] == "dshm"]
+        )
+        with_shm = self._render(
+            "qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B", "shm_size": "16Gi"}
+        )
+        dshm = [v for v in with_shm["spec"]["template"]["volumes"] if v["name"] == "dshm"]
+        self.assertEqual(len(dshm), 1)
+        self.assertEqual(dshm[0]["emptyDir"]["sizeLimit"], "16Gi")
 
     def test_vllm_image(self):
         doc = self._render(
@@ -538,14 +650,14 @@ class TestModelDefaultsMerge(unittest.TestCase):
     """model_defaults と models エントリのマージ動作の検証"""
 
     def test_override_specific_field(self):
-        model_entry = {"hf_repo": "Qwen/Qwen3-4B", "tool_call_parser": "hermes"}
-        merged = {**MODEL_DEFAULTS, **model_entry}
-        self.assertEqual(merged["tool_call_parser"], "hermes")
+        model_entry = {"hf_repo": "Qwen/Qwen3-4B", "vllm_args": ["--custom"]}
+        merged = combine_recursive(MODEL_DEFAULTS, model_entry)
+        self.assertEqual(merged["vllm_args"], ["--custom"])
         self.assertEqual(merged["vllm_image"], "vllm/vllm-openai:v0.28.0")
 
     def test_defaults_preserved(self):
         model_entry = {"hf_repo": "Qwen/Qwen3-4B", "state": "present"}
-        merged = {**MODEL_DEFAULTS, **model_entry}
+        merged = combine_recursive(MODEL_DEFAULTS, model_entry)
         self.assertEqual(merged["gpu_count"], 1)
         self.assertEqual(merged["namespace"], "llm-serving")
         self.assertFalse(merged["purge"])
@@ -556,14 +668,12 @@ class TestModelDefaultsMerge(unittest.TestCase):
             "state": "present",
             "namespace": "custom",
             "vllm_image": "custom:v1",
-            "tool_call_parser": "hermes",
-            "reasoning_parser": "deep",
             "chat_template_configmap": "custom-tpl",
             "gpu_count": 4,
-            "vllm_extra_args": ["--flag"],
+            "vllm_args": ["--flag"],
             "purge": True,
         }
-        merged = {**MODEL_DEFAULTS, **model_entry}
+        merged = combine_recursive(MODEL_DEFAULTS, model_entry)
         for k, v in model_entry.items():
             self.assertEqual(merged[k], v, f"Field {k} not properly overridden")
 
@@ -753,7 +863,9 @@ class TestMainYmlModelLoop(unittest.TestCase):
     def test_passes_model_vars(self):
         self.assertIn("_model_name:", self.content)
         self.assertIn("_model_cfg:", self.content)
-        self.assertIn("model_defaults | combine", self.content)
+        # vLLM 引数は hf_repo をキーにした model_recipes から解決する
+        self.assertIn("model_recipes", self.content)
+        self.assertIn("combine(item.value, recursive=True)", self.content)
 
 
 if __name__ == "__main__":

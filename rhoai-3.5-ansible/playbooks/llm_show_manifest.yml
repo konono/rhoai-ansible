@@ -1,0 +1,108 @@
+---
+# Ansible が実際にクラスタへ適用する LLMInferenceService を、
+# クラスタに触らずにレンダリングして確認する。
+#
+# roles/llm_serving が kubernetes.core.k8s に渡しているものと同じテンプレート・
+# 同じ変数解決（model_defaults → _fallback → model_recipes → inventory）を使うため、
+# 「Ansible で入るもの」をそのまま目視できる。
+#
+# 全 present モデルを表示:
+#   uv run ansible-playbook playbooks/llm_show_manifest.yml -i inventory/<env>
+#
+# モデルを指定:
+#   uv run ansible-playbook playbooks/llm_show_manifest.yml -i inventory/<env> \
+#     -e model=qwen3-8-27b-fp8
+#
+# absent も含めて全部:
+#   ... -e all_models=true
+#
+# ファイルにも残す:
+#   ... -e dest=/tmp/llm-manifests
+#
+# 注: oc ログインは不要。クラスタへの変更も行わない。
+#     MaaSModelRef は role のタスク内で直接定義しているためここには出ない。
+#     全リソースをファイルで見たい場合は render-manifests/render.py を使う。
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    all_models: false
+    dest: ""
+  tasks:
+    - name: Load llm_serving role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/defaults/main.yml"
+        name: _rd
+
+    - name: Load per-model vLLM recipes
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/vars/model_recipes.yml"
+
+    - name: Select target models
+      ansible.builtin.set_fact:
+        _targets: >-
+          {{ models | dict2items
+             | selectattr('key', 'equalto', model) | list
+             if model is defined
+             else (models | dict2items
+                   if all_models | bool
+                   else models | dict2items
+                        | rejectattr('value.state', 'defined') | list
+                        + models | dict2items
+                          | selectattr('value.state', 'defined')
+                          | selectattr('value.state', 'equalto', 'present') | list) }}
+
+    - name: Fail when the model is not defined
+      ansible.builtin.fail:
+        msg: >-
+          対象モデルがありません。
+          定義済み: {{ models | default({}) | list | join(', ') }}
+      when: _targets | length == 0
+
+    - name: Create output directory
+      ansible.builtin.file:
+        path: "{{ dest }}"
+        state: directory
+        mode: "0755"
+      when: dest | length > 0
+
+    - name: Render LLMInferenceService
+      ansible.builtin.set_fact:
+        _rendered: >-
+          {{ (_rendered | default({}))
+             | combine({item.key: lookup('template',
+                 playbook_dir ~ '/../roles/llm_serving/templates/llminferenceservice.yml.j2')}) }}
+      vars:
+        _model_name: "{{ item.key }}"
+        # roles/llm_serving/tasks/main.yml と同じ解決順
+        _model_cfg: >-
+          {{ _rd.model_defaults
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
+             | combine(item.value, recursive=True) }}
+      loop: "{{ _targets }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Show rendered manifests
+      ansible.builtin.debug:
+        msg: "{{ item.value.split('\n') }}"
+      loop: "{{ _rendered | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Write rendered manifests to files
+      ansible.builtin.copy:
+        content: "{{ item.value }}"
+        dest: "{{ dest }}/{{ item.key }}-llminferenceservice.yml"
+        mode: "0644"
+      loop: "{{ _rendered | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when: dest | length > 0
+
+    - name: Show output location
+      ansible.builtin.debug:
+        msg: "ファイル出力: {{ dest }}/"
+      when: dest | length > 0

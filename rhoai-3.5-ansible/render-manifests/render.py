@@ -104,6 +104,26 @@ def render_operator(name: str, namespace: str, channel: str,
     return docs
 
 
+
+class _QuotingDumper(yaml.SafeDumper):
+    """JSON を値に含む文字列をシングルクォートで出力する Dumper。
+
+    --speculative-config={"method":"mtp",...} のような引数は、素の PyYAML だと
+    プレーンスカラーで出力される。YAML としては正しく読み戻せるが、
+    手でコピーしてシェルに貼ったときにクォートが外れて壊れる。
+    Ansible テンプレート側も同じくシングルクォートで出力しているので揃える。
+    """
+
+
+def _represent_str(dumper, data):
+    if any(c in data for c in ('{', '}', '"')):
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="'")
+    return dumper.represent_scalar("tag:yaml.org,2002:str", data)
+
+
+_QuotingDumper.add_representer(str, _represent_str)
+
+
 class ManifestRenderer:
     def __init__(self, cfg: dict[str, Any], output_dir: Path):
         self.cfg = cfg
@@ -121,15 +141,25 @@ class ManifestRenderer:
         })
         self.storage_class = cfg.get("storage_class", "lvms-vg1")
         self.models = cfg.get("models", {})
+        self._recipes_cache = None
         self.model_defaults = {
             "namespace": "llm-serving",
             "state": "present",
             "vllm_image": "vllm/vllm-openai:v0.28.0",
-            "tool_call_parser": "qwen3_coder",
-            "reasoning_parser": "",
             "chat_template_configmap": "qwen3-chat-template",
+            "replicas": 1,
             "gpu_count": 1,
-            "vllm_extra_args": ["--max-model-len=4096", "--enable-auto-tool-choice"],
+            # vLLM 引数は hf_repo をキーにした model_recipes から解決する
+            # （roles/llm_serving/vars/model_recipes.yml）
+            "vllm_args": [],
+            "vllm_env": {},
+            "resources": {
+                "requests": {"cpu": "500m", "memory": "4Gi"},
+                "limits": {"cpu": "2", "memory": "8Gi"},
+            },
+            "shm_size": "",
+            "startup_probe_failure_threshold": 120,
+            "startup_probe_period_seconds": 10,
             "purge": False,
         }
 
@@ -179,7 +209,8 @@ class ManifestRenderer:
         d.mkdir(parents=True, exist_ok=True)
         p = d / filename
         with open(p, "w") as f:
-            yaml.dump_all(docs, f, default_flow_style=False, allow_unicode=True)
+            yaml.dump_all(docs, f, Dumper=_QuotingDumper,
+                          default_flow_style=False, allow_unicode=True)
         os.chmod(p, 0o600)
 
     def _write_file(self, subdir: str, filename: str, content: str):
@@ -1321,6 +1352,39 @@ class ManifestRenderer:
             "```"
         ))
 
+    def _load_model_recipes(self) -> dict:
+        """roles/llm_serving/vars/model_recipes.yml を読む（hf_repo -> 設定）。"""
+        if getattr(self, "_recipes_cache", None) is not None:
+            return self._recipes_cache
+        path = (Path(__file__).resolve().parent.parent
+                / "roles" / "llm_serving" / "vars" / "model_recipes.yml")
+        try:
+            with open(path) as f:
+                self._recipes_cache = yaml.safe_load(f).get("model_recipes", {}) or {}
+        except (OSError, yaml.YAMLError):
+            self._recipes_cache = {}
+        return self._recipes_cache
+
+    def _merge_model_cfg(self, cfg: dict) -> dict:
+        """model_defaults とモデル個別設定をマージする。
+
+        Ansible 側の `model_defaults | combine(item.value, recursive=True)` に合わせ、
+        resources のようなネスト dict は再帰的にマージする。
+        """
+        recipes = self._load_model_recipes()
+        recipe = {**(recipes.get("_fallback") or {}),
+                  **(recipes.get(cfg.get("hf_repo", ""), {}) or {})}
+        recipe = {k: v for k, v in recipe.items() if not k.startswith("_")}
+        merged = {**self.model_defaults, **recipe, **cfg}
+        default_res = {**self.model_defaults.get("resources", {}),
+                       **(recipe.get("resources", {}) or {})}
+        cfg_res = cfg.get("resources", {}) or {}
+        merged["resources"] = {
+            section: {**default_res.get(section, {}), **(cfg_res.get(section, {}) or {})}
+            for section in ("requests", "limits")
+        }
+        return merged
+
     def _render_maas_policies(self) -> list[dict]:
         """Generate MaasTenantConfig, MaaS AuthPolicy, MaaSSubscription, RBAC manifests."""
         docs = []
@@ -1334,7 +1398,7 @@ class ManifestRenderer:
         keycloak_groups = self.cfg.get("keycloak_groups", {})
         active_models = {}
         for name, cfg in self.models.items():
-            merged = {**self.model_defaults, **cfg}
+            merged = self._merge_model_cfg(cfg)
             if merged.get("state", "present") == "present":
                 active_models[name] = merged
 
@@ -1522,7 +1586,7 @@ class ManifestRenderer:
         absent_steps = []
         cm_names_created: set[str] = set()
         for model_name, model_cfg_raw in self.models.items():
-            model_cfg = {**self.model_defaults, **model_cfg_raw}
+            model_cfg = self._merge_model_cfg(model_cfg_raw)
 
             # Handle absent models — generate deletion steps
             if model_cfg.get("state", "present") == "absent":
@@ -1589,19 +1653,31 @@ class ManifestRenderer:
             }
 
             # LLMInferenceService
-            vllm_args = [
-                f"--served-model-name={model_name}",
-                "--enable-prefix-caching",
-                "--gpu-memory-utilization=0.90",
-                "--max-model-len=32768",
-                "--enforce-eager",
-                f"--tool-call-parser={model_cfg['tool_call_parser']}",
-            ]
-            if model_cfg.get("reasoning_parser"):
-                vllm_args.append(f"--reasoning-parser={model_cfg['reasoning_parser']}")
-            vllm_args.append("--enable-auto-tool-choice")
-            vllm_args.append("--chat-template=/chat-templates/chat_template.jinja")
-            vllm_args.extend(model_cfg.get("vllm_extra_args", []))
+            # roles/llm_serving/templates/llminferenceservice.yml.j2 と同じ順序で組み立てる。
+            # 自動付与は --served-model-name と --chat-template のみ。
+            # それ以外の vLLM 引数は inventory の vllm_args をそのまま渡す。
+            vllm_args = [f"--served-model-name={model_name}"]
+            if model_cfg.get("chat_template_configmap"):
+                vllm_args.append("--chat-template=/chat-templates/chat_template.jinja")
+            vllm_args.extend(model_cfg.get("vllm_args", []))
+
+            gpu_count = str(model_cfg["gpu_count"])
+            res = model_cfg["resources"]
+            vllm_env = [
+                {"name": "HOME", "value": "/tmp"},
+                {"name": "LOGNAME", "value": "vllm"},
+                {"name": "TORCHINDUCTOR_CACHE_DIR", "value": "/tmp/torchinductor_cache"},
+                {"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": "hf-token", "key": "HF_TOKEN"}}},
+            ] + [{"name": k, "value": str(v)} for k, v in (model_cfg.get("vllm_env") or {}).items()]
+
+            volume_mounts = []
+            volumes = []
+            if model_cfg.get("chat_template_configmap"):
+                volume_mounts.append({"name": "chat-template", "mountPath": "/chat-templates", "readOnly": True})
+                volumes.append({"name": "chat-template", "configMap": {"name": cm_name, "items": [{"key": "chat_template.jinja", "path": "chat_template.jinja"}]}})
+            if str(model_cfg.get("shm_size", "")) != "":
+                volume_mounts.append({"name": "dshm", "mountPath": "/dev/shm"})
+                volumes.append({"name": "dshm", "emptyDir": {"medium": "Memory", "sizeLimit": model_cfg["shm_size"]}})
 
             lis = {
                 "apiVersion": "serving.kserve.io/v1alpha2",
@@ -1613,25 +1689,29 @@ class ManifestRenderer:
                 },
                 "spec": {
                     "model": {"uri": f"pvc://hf-model-cache/{model_name}", "name": model_name},
-                    "replicas": 1,
+                    "replicas": model_cfg["replicas"],
                     "router": {"route": {}, "gateway": {"refs": [{"name": "maas-default-gateway", "namespace": "openshift-ingress"}]}},
                     "template": {
                         "containers": [{
                             "name": "main",
                             "image": model_cfg["vllm_image"],
                             "args": vllm_args,
-                            "env": [
-                                {"name": "HOME", "value": "/tmp"},
-                                {"name": "LOGNAME", "value": "vllm"},
-                                {"name": "TORCHINDUCTOR_CACHE_DIR", "value": "/tmp/torchinductor_cache"},
-                                {"name": "HF_TOKEN", "valueFrom": {"secretKeyRef": {"name": "hf-token", "key": "HF_TOKEN"}}},
-                            ],
-                            "resources": {"requests": {"cpu": "500m", "memory": "4Gi", "nvidia.com/gpu": "1"}, "limits": {"cpu": "2", "memory": "8Gi", "nvidia.com/gpu": "1"}},
-                            "startupProbe": {"httpGet": {"path": "/health", "port": 8000, "scheme": "HTTPS"}, "failureThreshold": 120, "periodSeconds": 10, "timeoutSeconds": 1},
-                            "volumeMounts": [{"name": "chat-template", "mountPath": "/chat-templates", "readOnly": True}],
+                            "env": vllm_env,
+                            "resources": {
+                                "requests": {**{k: str(v) for k, v in res["requests"].items()}, "nvidia.com/gpu": gpu_count},
+                                "limits": {**{k: str(v) for k, v in res["limits"].items()}, "nvidia.com/gpu": gpu_count},
+                            },
+                            "startupProbe": {
+                                "httpGet": {"path": "/health", "port": 8000, "scheme": "HTTPS"},
+                                "failureThreshold": model_cfg["startup_probe_failure_threshold"],
+                                "periodSeconds": model_cfg["startup_probe_period_seconds"],
+                                "timeoutSeconds": 1,
+                            },
+                            # Ansible テンプレートは空のとき キー自体を出さないので合わせる
+                            **({"volumeMounts": volume_mounts} if volume_mounts else {}),
                         }],
                         "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
-                        "volumes": [{"name": "chat-template", "configMap": {"name": cm_name, "items": [{"key": "chat_template.jinja", "path": "chat_template.jinja"}]}}],
+                        **({"volumes": volumes} if volumes else {}),
                     },
                 },
             }
@@ -1646,8 +1726,9 @@ class ManifestRenderer:
             self._write_manifests("09-llm-serving", f"model-{model_name}-download.yml", [job])
             self._write_manifests("09-llm-serving", f"model-{model_name}-deploy.yml", [lis, modelref])
 
-            # Track unique ConfigMap names
-            cm_names_created.add(cm_name)
+            # Track unique ConfigMap names（空なら chat template を使わない）
+            if model_cfg.get("chat_template_configmap"):
+                cm_names_created.add(cm_name)
 
             model_steps.append(
                 f"### モデル: {model_name} ({model_cfg['hf_repo']})\n\n"
@@ -1660,6 +1741,13 @@ class ManifestRenderer:
                 f"```\n\n"
                 + self._wait_step(f"{model_name} Ready 待機",
                                   f"oc wait --for=condition=Ready llminferenceservice/{model_name} -n {model_cfg['namespace']} --timeout=900s")
+                + f"\n\n**MaaSModelRef の確認**\n\n"
+                f"```bash\n"
+                f"oc get maasmodelref {model_name} -n {model_cfg['namespace']} -o jsonpath='{{.status.phase}}{{\"\\n\"}}'\n"
+                f"# Ready にならない場合は MaaSAuthPolicy / MaaSSubscription が未適用。\n"
+                f"# Step 16 の maas-policies.yml を再適用してから再確認する:\n"
+                f"#   oc apply --server-side --force-conflicts -f manifests/07-integration/maas-policies.yml\n"
+                f"```\n"
             )
 
         # Generate ConfigMap creation commands for all unique names

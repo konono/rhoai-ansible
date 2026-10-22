@@ -6,6 +6,13 @@
 
 - block:
 
+    # === モデルごとのレシピを読み込む ===
+    # roles/llm_serving/vars/model_recipes.yml に hf_repo をキーとした
+    # 検証済みパラメータを持つ。解決順は _fallback → レシピ → inventory。
+    - name: Load per-model vLLM recipes
+      ansible.builtin.include_vars:
+        file: "{{ role_path }}/vars/model_recipes.yml"
+
     # === Proxy CR status から実効値を取得 (単独実行対応) ===
     - name: Get effective proxy settings from Proxy CR status
       ansible.builtin.command: >-
@@ -56,6 +63,7 @@
       vars:
         _cluster_gpu_total: "{{ _cluster_gpus.stdout_lines | default([]) | select('ne', '') | map('int') | sum }}"
       when:
+        - not (download_only | default(false) | bool)
         - _cluster_gpus.rc == 0
         - (_required_gpus | int) > (_cluster_gpu_total | int)
     
@@ -163,7 +171,7 @@
           {{ models | dict2items
              | map(attribute='value')
              | map(attribute='chat_template_configmap', default=model_defaults.chat_template_configmap)
-             | unique | list }}
+             | select('ne', '') | unique | list }}
     
     - name: Apply chat template ConfigMaps
       kubernetes.core.k8s:
@@ -218,18 +226,28 @@
       ansible.builtin.include_tasks: remove_model.yml
       vars:
         _model_name: "{{ item.key }}"
-        _model_cfg: "{{ model_defaults | combine(item.value) }}"
+        _model_cfg: >-
+          {{ model_defaults
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
+             | combine(item.value, recursive=True) }}
       loop: "{{ models | dict2items }}"
       loop_control:
         label: "{{ item.key }} (absent)"
-      when: (item.value.state | default(model_defaults.state)) == 'absent'
+      when:
+        - not (download_only | default(false) | bool)
+        - (item.value.state | default(model_defaults.state)) == 'absent'
     
     # === Phase 2: present モデルのデプロイ ===
     - name: "Deploy present models"
       ansible.builtin.include_tasks: deploy_model.yml
       vars:
         _model_name: "{{ item.key }}"
-        _model_cfg: "{{ model_defaults | combine(item.value) }}"
+        _model_cfg: >-
+          {{ model_defaults
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
+             | combine(item.value, recursive=True) }}
       loop: "{{ models | dict2items }}"
       loop_control:
         label: "{{ item.key }} (present)"
@@ -240,3 +258,4 @@
         msg: |
           LLM Serving のインストールに失敗しました。
           再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags workload,llm
+          モデルのダウンロードのみ再実行: uv run ansible-playbook site.yml -i inventory/<env> --tags llm -e download_only=true

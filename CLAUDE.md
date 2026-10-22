@@ -123,6 +123,28 @@ python3 render-manifests/render.py -c inventory/sample -o /tmp/test-output
 render.py では `render_all()` 内で `self.cfg.get("install_*")` チェックとして実装済み。
 新しい install フラグを追加した場合は components.yml.sample と render_all() の両方を更新する。
 
+## モデルキーの命名規約
+
+`models` の各キー (`_model_name`) は、以下すべてにそのまま使われる。変換処理は一切入らない。
+
+- PVC 上のダウンロード先ディレクトリ: `/models/<key>` (`roles/llm_serving/templates/download-job.yml.j2`)
+- キャッシュ判定: `/models/<key>/config.json` の存在確認 (`roles/llm_serving/tasks/deploy_model.yml`)
+- LLMInferenceService の `metadata.name` と `spec.model.uri: pvc://hf-model-cache/<key>`
+- vLLM の `--served-model-name` (= API から指定するモデル名)
+- Keycloak グループ名 `maas-<key>-users`
+
+命名ルール:
+
+1. `hf_repo` のモデル名部分を小文字化し、**`.` は `-` に置き換える**。`/` と組織名は落とす
+   - `Qwen/Qwen3.8-27B-FP8` → `qwen3-8-27b-fp8`
+   - `deepseek-ai/DeepSeek-R1-0528` → `deepseek-r1-0528`
+2. k8s リソース名になるため RFC1123 準拠 (小文字英数と `-` のみ、`.` と大文字は不可)
+3. **一度決めたキーは変更しない。** 改名すると PVC 上のキャッシュがヒットせず再ダウンロードになり、
+   API のモデル名と Keycloak グループ名も変わる
+
+例外: 既存の `qwen3-06b` (`Qwen/Qwen3-0.6B`) はこの規約の制定前に付けた名前。
+改名はキャッシュ無効化を招くためそのまま維持する。新規モデルのみ上記ルールに従う。
+
 ## Role 一覧と依存関係
 
 site.yml の実行順序:

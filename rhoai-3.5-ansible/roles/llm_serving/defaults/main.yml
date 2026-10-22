@@ -1,15 +1,49 @@
 ---
 llm_namespace: llm-serving
 
+# true なら PVC へのモデルダウンロードだけ行い、LLMInferenceService は作らない。
+# GPU 容量チェックと absent モデルの削除もスキップする。
+#   uv run ansible-playbook site.yml -i inventory/<env> --tags llm -e download_only=true
+#   uv run ansible-playbook playbooks/llm_download.yml -i inventory/<env>
+download_only: false
+
+# model_defaults は models.<name> の各エントリで再帰的に上書きされる。
+#
+# vLLM の引数は `vllm_args` に生の文字列で書く。vLLM のバージョンアップで
+# フラグが増減しても role 側の変更は不要（Ansible 側に名前付きキーを増やさない方針）。
+# role が自動付与するのは --served-model-name と --chat-template のみ。
 model_defaults:
   namespace: llm-serving
   state: present
   vllm_image: vllm/vllm-openai:v0.28.0
-  tool_call_parser: qwen3_coder
-  reasoning_parser: ""
-  chat_template_configmap: qwen3-chat-template
+  chat_template_configmap: qwen3-chat-template   # 空文字にすると --chat-template を付けない
+  replicas: 1
+
+  # --- vLLM 引数 ---
+  # vLLM のパラメータはモデルのアーキテクチャ・量子化方式・ハードウェアで変わるため、
+  # 全モデル共通の既定値は持たない。検証済みのレシピを hf_repo をキーに
+  # roles/llm_serving/vars/model_recipes.yml へ蓄積している。
+  # inventory の models.<key>.vllm_args を書けばレシピを完全に上書きできる。
+  # （ここでは定義しない。未定義のまま model_recipes から解決される）
+
+  # --- コンテナ環境変数の追加 (VLLM_* / NCCL_* など) ---
+  vllm_env: {}
+
+  # --- Pod リソース (nvidia.com/gpu は gpu_count から設定) ---
   gpu_count: 1
-  vllm_extra_args:
-    - "--max-model-len=4096"
-    - "--enable-auto-tool-choice"
+  resources:
+    requests:
+      cpu: "500m"
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 8Gi
+
+  # --- /dev/shm サイズ。空なら emptyDir を追加しない (tensor parallel で必要) ---
+  shm_size: ""
+
+  # --- 起動待ち (failureThreshold * periodSeconds 秒まで待つ) ---
+  startup_probe_failure_threshold: 120
+  startup_probe_period_seconds: 10
+
   purge: false
