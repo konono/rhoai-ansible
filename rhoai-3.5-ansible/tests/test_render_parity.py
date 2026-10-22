@@ -376,6 +376,78 @@ class TestRenderParity(unittest.TestCase):
                             "差分:\n" + "\n".join(_diff(expected[key], actual[key])),
                         )
 
+    @unittest.skipUnless(ansible_available(), "ansible-core が無い環境ではスキップ")
+    def test_inventory_model_defaults_override_is_honored(self):
+        """inventory の model_defaults による上書きが両方に効くこと
+
+        Ansible は inventory の group_vars が role defaults に優先する。
+        render.py が role defaults 相当を固定で持っていると、この上書きが
+        無視されて確認用 manifest と実際の配信設定がずれる。
+        """
+        base = INVENTORIES[0] if INVENTORIES else None
+        self.assertIsNotNone(base, "inventory がありません")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            invdir = materialize_inventory(base, tmp)
+            comp = invdir / "group_vars" / "all" / "components.yml"
+            data = yaml.safe_load(comp.read_text())
+
+            # 上書きを注入する
+            data["model_defaults"] = {
+                "namespace": "custom-serving",
+                "resources": {"limits": {"memory": "64Gi"}},
+            }
+            # レシピが resources を持たないモデルを対象にする
+            # （レシピ側の値が勝つのは正しい挙動のため）
+            target = None
+            for name, entry in (data.get("models") or {}).items():
+                if entry.get("state", "present") != "present":
+                    continue
+                recipe = self.recipes.get(entry.get("hf_repo", ""), {})
+                if "resources" not in recipe:
+                    target = name
+                    break
+            if target is None:
+                # 全モデルがレシピで resources を持つ場合は素のモデルを足す
+                target = "parity-probe"
+                data.setdefault("models", {})[target] = {
+                    "hf_repo": "org/parity-probe", "state": "present"}
+            comp.write_text(yaml.safe_dump(data, allow_unicode=True))
+
+            ans_dir = Path(tmp) / "ansible-out"
+            r = subprocess.run(
+                ansible_cmd() + [
+                    str(ANSIBLE_DIR / "playbooks" / "llm_show_manifest.yml"),
+                    "-i", str(invdir), "-e", f"dest={ans_dir}", "-e", "all_models=true",
+                ],
+                capture_output=True, cwd=str(ANSIBLE_DIR),
+                env={**os.environ,
+                     "ANSIBLE_COLLECTIONS_PATH": os.environ.get(
+                         "ANSIBLE_COLLECTIONS_PATH",
+                         str(Path.home() / ".ansible" / "collections"))},
+            )
+            self.assertEqual(r.returncode, 0, r.stdout.decode()[-2000:])
+
+            rnd_dir = Path(tmp) / "render-out"
+            self._render_with_render_py_dir(invdir, rnd_dir)
+
+            ans = yaml.safe_load(
+                (ans_dir / f"{target}-llminferenceservice.yml").read_text())
+            rnd = self._extract(
+                rnd_dir / "manifests" / "09-llm-serving"
+                / f"model-{target}-deploy.yml", "LLMInferenceService")
+
+            # 上書きが Ansible 側に効いていること
+            self.assertEqual(ans["metadata"]["namespace"], "custom-serving",
+                             "Ansible が inventory の model_defaults を無視しています")
+            self.assertEqual(
+                ans["spec"]["template"]["containers"][0]["resources"]["limits"]["memory"],
+                "64Gi")
+            # render.py も同じであること
+            self.assertIsNotNone(rnd, "render.py が manifest を生成していません")
+            self.assertEqual(ans, rnd,
+                             "差分:\n" + "\n".join(_diff(ans, rnd)))
+
     def test_render_py_defaults_have_no_vllm_args(self):
         """vLLM 引数は model_recipes 側で持つ方針。render.py が独自に持たないこと"""
         src = RENDER_PY.read_text()

@@ -120,6 +120,7 @@ jobs:
           **/.credentials/**
           **/.kube/**
           **/.vllm-token
+          **/.vllm-token.meta
           **/opencode.json
           **/vault.yml
           **/.maas-policies-generated.yaml

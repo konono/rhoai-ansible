@@ -760,7 +760,17 @@ cp .vllm-token   ~/.config/opencode/.vllm-token
 ```bash
 OPENCODE_API_USER=testuser1 bash scripts/setup-opencode.sh setup   # キーの発行ユーザー
 OPENCODE_MODEL=qwen3-06b    bash scripts/setup-opencode.sh setup   # 既定モデルの指定
+OPENCODE_API_GROUPS='["maas-admins"]' bash scripts/setup-opencode.sh setup  # グループを明示
+OPENCODE_INVENTORY=inventory/<env>    bash scripts/setup-opencode.sh setup  # グループ検索先
 ```
+
+API キーに紐づくグループは、既定では inventory の `keycloak_users` から
+そのユーザーの `groups` を引く。引けない場合のみ `["maas-admins"]` になる。
+
+発行済みキーの使い回しは **同じユーザーかつ同じグループのときだけ**行う。
+発行先は `.vllm-token.meta` に記録され、`setup-opencode.sh show` で確認できる。
+ユーザーを切り替えて再実行すると新しいキーを発行して差し替えるので、
+管理者のキーが一般ユーザー向けの設定に残ることはない。
 
 > モデルを入れ替えたら再実行すること。`opencode.json` の provider はモデルキーに
 > 紐づくため、キーが変わると古い設定のままでは繋がらない。

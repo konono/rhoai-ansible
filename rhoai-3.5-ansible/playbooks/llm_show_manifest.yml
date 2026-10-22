@@ -78,6 +78,7 @@
         # roles/llm_serving/tasks/main.yml と同じ解決順
         _model_cfg: >-
           {{ _rd.model_defaults
+             | combine(model_defaults | default({}), recursive=True)
              | combine(model_recipes['_fallback'], recursive=True)
              | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
              | combine(item.value, recursive=True) }}

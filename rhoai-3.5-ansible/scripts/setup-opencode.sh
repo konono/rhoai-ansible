@@ -18,12 +18,21 @@ set -euo pipefail
 #
 # 環境変数:
 #   OPENCODE_API_USER   キーを発行するユーザー名 (既定: admin1)
+#   OPENCODE_API_GROUPS キーに紐づけるグループ (JSON 配列。既定: inventory から
+#                       そのユーザーの groups を引く。引けなければ ["maas-admins"])
+#   OPENCODE_INVENTORY  グループ検索に使う inventory ディレクトリ
 #   OPENCODE_MODEL      既定モデルのキー (既定: 最初に見つかった present モデル)
+#
+# 発行済みキーの使い回しは「同じユーザー かつ 同じグループ」のときだけ行う。
+# ユーザーを切り替えて再実行すると新しいキーを発行して差し替える。
 #
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ANSIBLE_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TOKEN_FILE="${ANSIBLE_DIR}/.vllm-token"
+# どのユーザー / グループで発行したキーかを記録する。
+# これが無いと別ユーザーで再実行しても前のキーを使い回してしまう。
+TOKEN_META="${ANSIBLE_DIR}/.vllm-token.meta"
 CONFIG_FILE="${ANSIBLE_DIR}/opencode.json"
 API_USER="${OPENCODE_API_USER:-admin1}"
 GATEWAY_NS=openshift-ingress
@@ -65,11 +74,59 @@ for r in json.load(sys.stdin)["items"]:
 }
 
 # API キーを発行する（.vllm-token があれば再利用）
-ensure_api_key() {
-    if [ -s "$TOKEN_FILE" ]; then
-        echo "既存の API キーを使用します: ${TOKEN_FILE}" >&2
-        cat "$TOKEN_FILE"
+# 発行対象ユーザーのグループを決める。
+# 明示指定 > inventory の keycloak_users > maas-admins の順。
+resolve_api_groups() {
+    if [ -n "${OPENCODE_API_GROUPS:-}" ]; then
+        printf '%s' "$OPENCODE_API_GROUPS"
         return
+    fi
+    local inv="${OPENCODE_INVENTORY:-}"
+    if [ -z "$inv" ]; then
+        # sample 以外の inventory が 1 つだけならそれを使う
+        mapfile -t _invs < <(find "${ANSIBLE_DIR}/inventory" -maxdepth 1 -mindepth 1 \
+                               -type d ! -name sample -printf '%p\n' 2>/dev/null | sort)
+        [ "${#_invs[@]}" -eq 1 ] && inv="${_invs[0]}"
+    fi
+    if [ -n "$inv" ] && [ -f "$inv/group_vars/all/components.yml" ]; then
+        python3 - "$inv/group_vars/all/components.yml" "$API_USER" <<'PY'
+import json, sys, yaml
+try:
+    d = yaml.safe_load(open(sys.argv[1])) or {}
+except Exception:
+    d = {}
+for u in d.get("keycloak_users") or []:
+    if u.get("username") == sys.argv[2]:
+        g = u.get("groups") or []
+        if g:
+            print(json.dumps(g))
+            sys.exit()
+print(json.dumps(["maas-admins"]))
+PY
+        return
+    fi
+    printf '%s' '["maas-admins"]'
+}
+
+ensure_api_key() {
+    local groups
+    groups="$(resolve_api_groups)"
+
+    if [ -s "$TOKEN_FILE" ] && [ -f "$TOKEN_META" ]; then
+        local prev_user prev_groups
+        prev_user="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("user",""))' "$TOKEN_META" 2>/dev/null)"
+        prev_groups="$(python3 -c 'import json,sys;print(json.dumps(json.load(open(sys.argv[1])).get("groups")))' "$TOKEN_META" 2>/dev/null)"
+        if [ "$prev_user" = "$API_USER" ] && [ "$prev_groups" = "$(python3 -c 'import json,sys;print(json.dumps(json.loads(sys.argv[1])))' "$groups")" ]; then
+            echo "既存の API キーを使用します (${API_USER}): ${TOKEN_FILE}" >&2
+            cat "$TOKEN_FILE"
+            return
+        fi
+        echo "発行時のユーザー/グループが異なるため再発行します" >&2
+        echo "  前回: ${prev_user} ${prev_groups}" >&2
+        echo "  今回: ${API_USER} ${groups}" >&2
+    elif [ -s "$TOKEN_FILE" ]; then
+        # 旧バージョンが作った meta 無しのキーは所有者が不明なので再発行する
+        echo "発行時のユーザーが不明なキーがあるため再発行します: ${TOKEN_FILE}" >&2
     fi
 
     local pod
@@ -81,7 +138,7 @@ ensure_api_key() {
     resp="$(oc exec -n "$MAAS_NS" "$pod" -- curl -skfS \
         -X POST https://localhost:8443/v1/api-keys \
         -H "X-MaaS-Username: ${API_USER}" \
-        -H 'X-MaaS-Group: ["maas-admins"]' \
+        -H "X-MaaS-Group: ${groups}" \
         -H 'Content-Type: application/json' \
         -d "{\"name\":\"opencode-${API_USER}\"}" 2>/dev/null)" \
         || die "API キーの発行に失敗しました"
@@ -90,7 +147,9 @@ ensure_api_key() {
         || die "API キーの応答を解析できませんでした: ${resp}"
 
     ( umask 077; printf '%s' "$key" > "$TOKEN_FILE" )
-    echo "API キーを発行しました: ${TOKEN_FILE}" >&2
+    ( umask 077; python3 -c 'import json,sys;json.dump({"user":sys.argv[1],"groups":json.loads(sys.argv[2])},open(sys.argv[3],"w"))' \
+        "$API_USER" "$groups" "$TOKEN_META" )
+    echo "API キーを発行しました: ${TOKEN_FILE} (user=${API_USER} groups=${groups})" >&2
     printf '%s' "$key"
 }
 
@@ -210,6 +269,7 @@ cmd_show() {
     echo
     if [ -s "$TOKEN_FILE" ]; then
         echo "API キー: ${TOKEN_FILE} ($(wc -c < "$TOKEN_FILE") bytes)"
+        [ -f "$TOKEN_META" ] && echo "  発行先: $(cat "$TOKEN_META")"
     else
         echo "API キー: 未発行"
     fi

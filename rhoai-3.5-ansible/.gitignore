@@ -22,6 +22,7 @@ inventory/*
 .credentials/
 .kube/
 .vllm-token
+.vllm-token.meta
 .envrc
 
 # Work logs
