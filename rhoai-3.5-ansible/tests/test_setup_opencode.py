@@ -8,6 +8,10 @@ scripts/setup-opencode.sh の API キー発行まわりの回帰テスト。
     管理者のキーが設定に残ってしまう。
   - X-MaaS-Group が常に ["maas-admins"] だった。一般ユーザー向けのキーにも
     管理者グループが紐づいていた。
+  - inventory に居ないユーザーを指定すると maas-admins にフォールバックし、
+    未登録ユーザーへ管理者権限のキーを発行していた。
+  - グループ解決に PyYAML を使っており、素の bash で動かす環境
+    （venv の外）で ModuleNotFoundError になっていた。
 
 oc をスタブして、クラスタ無しでスクリプトの振る舞いを検証する。
 
@@ -148,6 +152,88 @@ class TestSetupOpencodeApiKey(unittest.TestCase):
             len(self._issued_groups()), before,
             "同じユーザーなのに API キーが再発行されています",
         )
+
+    def test_unknown_user_is_rejected(self):
+        """inventory に居ないユーザーにはキーを発行しない"""
+        r = self._run("unknown-user")
+        self.assertNotEqual(r.returncode, 0,
+                            "未登録ユーザーなのに成功しています")
+        self.assertFalse((self.workdir / ".vllm-token").exists(),
+                         "未登録ユーザーにキーが発行されています")
+        self.assertEqual(self._issued_groups(), [],
+                         "未登録ユーザーで API キー発行が呼ばれています")
+        err = r.stderr.decode()
+        self.assertIn("OPENCODE_API_GROUPS", err,
+                      "明示指定の方法が案内されていません")
+
+    def test_unknown_user_works_with_explicit_groups(self):
+        """明示指定があれば未登録ユーザーでも発行できる"""
+        env_groups = '["maas-admins"]'
+        r = subprocess.run(
+            ["bash", "scripts/setup-opencode.sh", "setup"],
+            cwd=str(self.workdir), capture_output=True,
+            env={**os.environ,
+                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
+                 "CALL_LOG": str(self.call_log),
+                 "OPENCODE_API_USER": "unknown-user",
+                 "OPENCODE_API_GROUPS": env_groups,
+                 "OPENCODE_INVENTORY": str(
+                     self.workdir / "inventory" / "myenv")},
+        )
+        self.assertEqual(r.returncode, 0, r.stderr.decode()[-2000:])
+        self.assertIn("maas-admins", self._issued_groups()[-1])
+
+    def test_group_lookup_does_not_require_pyyaml(self):
+        """グループ解決が PyYAML 不在でも動くこと
+
+        スクリプトは素の bash（venv の外）からも実行されるため、
+        標準ライブラリだけで inventory を読めなければならない。
+        """
+        blocker = self.bin_dir / "sitecustomize.py"
+        blocker.write_text(
+            "import sys\n"
+            "class _Block:\n"
+            "    def find_module(self, name, path=None):\n"
+            "        return self if name == 'yaml' else None\n"
+            "    def load_module(self, name):\n"
+            "        raise ImportError('PyYAML is unavailable in this test')\n"
+            "sys.meta_path.insert(0, _Block())\n"
+        )
+        r = subprocess.run(
+            ["bash", "scripts/setup-opencode.sh", "setup"],
+            cwd=str(self.workdir), capture_output=True,
+            env={**os.environ,
+                 "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
+                 "PYTHONPATH": str(self.bin_dir),
+                 "CALL_LOG": str(self.call_log),
+                 "OPENCODE_API_USER": "testuser1",
+                 "OPENCODE_INVENTORY": str(
+                     self.workdir / "inventory" / "myenv")},
+        )
+        self.assertEqual(r.returncode, 0,
+                         "PyYAML 不在で失敗しています:\n"
+                         + r.stderr.decode()[-2000:])
+        self.assertIn("maas-demo-model-users", self._issued_groups()[-1])
+
+    def test_group_lookup_supports_block_style_groups(self):
+        """groups がブロック形式でも解決できること"""
+        (self.workdir / "inventory" / "myenv" / "group_vars" / "all"
+         / "components.yml").write_text(
+            "keycloak_users:\n"
+            "  - username: blockuser\n"
+            "    email: blockuser@example.com\n"
+            "    groups:\n"
+            "      - maas-block-users\n"
+            "      - maas-extra-users\n"
+            "models:\n"
+            "  demo-model:\n"
+            "    hf_repo: org/demo\n"
+        )
+        r = self._run("blockuser")
+        self.assertEqual(r.returncode, 0, r.stderr.decode()[-2000:])
+        issued = self._issued_groups()[-1]
+        self.assertIn("maas-block-users", issued)
+        self.assertIn("maas-extra-users", issued)
 
     def test_token_files_are_not_world_readable(self):
         self._run("admin1")

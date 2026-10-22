@@ -377,76 +377,113 @@ class TestRenderParity(unittest.TestCase):
                         )
 
     @unittest.skipUnless(ansible_available(), "ansible-core が無い環境ではスキップ")
-    def test_inventory_model_defaults_override_is_honored(self):
-        """inventory の model_defaults による上書きが両方に効くこと
+    def test_inventory_model_defaults_replaces_role_defaults(self):
+        """inventory の model_defaults は role defaults を丸ごと置き換えること
 
-        Ansible は inventory の group_vars が role defaults に優先する。
-        render.py が role defaults 相当を固定で持っていると、この上書きが
-        無視されて確認用 manifest と実際の配信設定がずれる。
+        Ansible では inventory の group_vars で定義した変数が role defaults を
+        **置き換える**（キー単位の再帰マージではない）。プレビュー用 playbook と
+        render.py がこれをマージ扱いにしていると、確認結果と実際の配信設定がずれる。
+
+        実 role が見る値を別 playbook（role を roles: で適用）で取得し、
+        プレビュー経路・render.py の 3 者が一致することを確認する。
         """
-        base = INVENTORIES[0] if INVENTORIES else None
+        base = "sample" if "sample" in INVENTORIES else (
+            INVENTORIES[0] if INVENTORIES else None)
         self.assertIsNotNone(base, "inventory がありません")
+
+        # 置き換え semantics なので、部分的な上書きは role defaults のキーを
+        # 失わせて実 role ごと壊れる（それが Ansible の正しい挙動）。
+        # 現実的な使い方に合わせて role defaults 全体をベースに一部だけ変える。
+        # role defaults にしか無い purge をわざと落とし、マージではなく
+        # 置き換えになっていることを後段で確認する。
+        role_defaults = yaml.safe_load(LLM_DEFAULTS.read_text())["model_defaults"]
+        override = json.loads(json.dumps(role_defaults))
+        override.pop("purge", None)
+        override["namespace"] = "custom-serving"
+        override.setdefault("resources", {}).setdefault("limits", {})["memory"] = "64Gi"
 
         with tempfile.TemporaryDirectory() as tmp:
             invdir = materialize_inventory(base, tmp)
             comp = invdir / "group_vars" / "all" / "components.yml"
             data = yaml.safe_load(comp.read_text())
-
-            # 上書きを注入する
-            data["model_defaults"] = {
-                "namespace": "custom-serving",
-                "resources": {"limits": {"memory": "64Gi"}},
-            }
-            # レシピが resources を持たないモデルを対象にする
-            # （レシピ側の値が勝つのは正しい挙動のため）
-            target = None
-            for name, entry in (data.get("models") or {}).items():
-                if entry.get("state", "present") != "present":
-                    continue
-                recipe = self.recipes.get(entry.get("hf_repo", ""), {})
-                if "resources" not in recipe:
-                    target = name
-                    break
-            if target is None:
-                # 全モデルがレシピで resources を持つ場合は素のモデルを足す
-                target = "parity-probe"
-                data.setdefault("models", {})[target] = {
-                    "hf_repo": "org/parity-probe", "state": "present"}
+            data["model_defaults"] = override
             comp.write_text(yaml.safe_dump(data, allow_unicode=True))
 
+            # --- (a) Ansible の変数優先順そのものを確認する ---
+            # 合成 role に同名の defaults を置き、inventory 側が
+            # 「丸ごと」勝つ（キー単位のマージではない）ことを確かめる。
+            rdir = Path(tmp) / "probe_roles" / "probe"
+            (rdir / "defaults").mkdir(parents=True)
+            (rdir / "tasks").mkdir(parents=True)
+            (rdir / "defaults" / "main.yml").write_text(yaml.safe_dump(
+                {"model_defaults": {"namespace": "llm-serving", "state": "present",
+                                    "gpu_count": 1,
+                                    "resources": {"requests": {"cpu": "500m"},
+                                                  "limits": {"cpu": "2",
+                                                             "memory": "8Gi"}}}}))
+            (rdir / "tasks" / "main.yml").write_text(
+                "- ansible.builtin.copy:\n"
+                '    content: "{{ model_defaults | to_json }}"\n'
+                f"    dest: {tmp}/role_defaults.json\n"
+            )
+            probe = Path(tmp) / "probe.yml"
+            probe.write_text("- hosts: localhost\n  connection: local\n"
+                             "  gather_facts: false\n  roles: [probe]\n")
+            env = {**os.environ,
+                   "ANSIBLE_ROLES_PATH": str(Path(tmp) / "probe_roles"),
+                   "ANSIBLE_COLLECTIONS_PATH": os.environ.get(
+                       "ANSIBLE_COLLECTIONS_PATH",
+                       str(Path.home() / ".ansible" / "collections"))}
+            r = subprocess.run(ansible_cmd() + [str(probe), "-i", str(invdir)],
+                               capture_output=True, cwd=str(tmp), env=env)
+            self.assertEqual(r.returncode, 0, r.stdout.decode()[-2000:])
+            role_view = json.loads((Path(tmp) / "role_defaults.json").read_text())
+
+            self.assertEqual(
+                role_view, override,
+                "inventory の model_defaults は role defaults を丸ごと置き換えるはずです",
+            )
+            self.assertNotIn(
+                "purge", role_view,
+                "置き換えなので、上書き側に無いキーは残らないはずです"
+                "（キー単位のマージになっている）",
+            )
+
+            env.pop("ANSIBLE_ROLES_PATH")
+
+            # --- (b) プレビュー playbook と (c) render.py が一致すること ---
             ans_dir = Path(tmp) / "ansible-out"
             r = subprocess.run(
                 ansible_cmd() + [
                     str(ANSIBLE_DIR / "playbooks" / "llm_show_manifest.yml"),
                     "-i", str(invdir), "-e", f"dest={ans_dir}", "-e", "all_models=true",
                 ],
-                capture_output=True, cwd=str(ANSIBLE_DIR),
-                env={**os.environ,
-                     "ANSIBLE_COLLECTIONS_PATH": os.environ.get(
-                         "ANSIBLE_COLLECTIONS_PATH",
-                         str(Path.home() / ".ansible" / "collections"))},
+                capture_output=True, cwd=str(ANSIBLE_DIR), env=env,
             )
-            self.assertEqual(r.returncode, 0, r.stdout.decode()[-2000:])
+            self.assertEqual(r.returncode, 0, r.stdout.decode()[-2500:])
 
             rnd_dir = Path(tmp) / "render-out"
             self._render_with_render_py_dir(invdir, rnd_dir)
 
-            ans = yaml.safe_load(
-                (ans_dir / f"{target}-llminferenceservice.yml").read_text())
-            rnd = self._extract(
-                rnd_dir / "manifests" / "09-llm-serving"
-                / f"model-{target}-deploy.yml", "LLMInferenceService")
-
-            # 上書きが Ansible 側に効いていること
-            self.assertEqual(ans["metadata"]["namespace"], "custom-serving",
-                             "Ansible が inventory の model_defaults を無視しています")
-            self.assertEqual(
-                ans["spec"]["template"]["containers"][0]["resources"]["limits"]["memory"],
-                "64Gi")
-            # render.py も同じであること
-            self.assertIsNotNone(rnd, "render.py が manifest を生成していません")
-            self.assertEqual(ans, rnd,
-                             "差分:\n" + "\n".join(_diff(ans, rnd)))
+            checked = 0
+            for name, entry in (data.get("models") or {}).items():
+                if entry.get("state", "present") != "present":
+                    continue
+                af = ans_dir / f"{name}-llminferenceservice.yml"
+                if not af.exists():
+                    continue
+                checked += 1
+                ans = yaml.safe_load(af.read_text())
+                rnd = self._extract(
+                    rnd_dir / "manifests" / "09-llm-serving"
+                    / f"model-{name}-deploy.yml", "LLMInferenceService")
+                with self.subTest(model=name):
+                    self.assertIsNotNone(rnd)
+                    self.assertEqual(ans, rnd,
+                                     "差分:\n" + "\n".join(_diff(ans, rnd)))
+                    # 上書きが反映されていること
+                    self.assertEqual(ans["metadata"]["namespace"], "custom-serving")
+            self.assertGreater(checked, 0, "比較できたモデルがありません")
 
     def test_render_py_defaults_have_no_vllm_args(self):
         """vLLM 引数は model_recipes 側で持つ方針。render.py が独自に持たないこと"""

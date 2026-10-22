@@ -75,12 +75,17 @@ for r in json.load(sys.stdin)["items"]:
 
 # API キーを発行する（.vllm-token があれば再利用）
 # 発行対象ユーザーのグループを決める。
-# 明示指定 > inventory の keycloak_users > maas-admins の順。
+# 明示指定 > inventory の keycloak_users。どちらからも引けない場合は発行しない。
+# （未登録ユーザーに管理者グループを与えてしまうため、フォールバックしない）
+#
+# inventory の読み取りは標準ライブラリだけで行う。PyYAML は
+# スクリプトを素の bash で動かす環境に無いことがあるため依存しない。
 resolve_api_groups() {
     if [ -n "${OPENCODE_API_GROUPS:-}" ]; then
         printf '%s' "$OPENCODE_API_GROUPS"
-        return
+        return 0
     fi
+
     local inv="${OPENCODE_INVENTORY:-}"
     if [ -z "$inv" ]; then
         # sample 以外の inventory が 1 つだけならそれを使う
@@ -88,29 +93,91 @@ resolve_api_groups() {
                                -type d ! -name sample -printf '%p\n' 2>/dev/null | sort)
         [ "${#_invs[@]}" -eq 1 ] && inv="${_invs[0]}"
     fi
-    if [ -n "$inv" ] && [ -f "$inv/group_vars/all/components.yml" ]; then
-        python3 - "$inv/group_vars/all/components.yml" "$API_USER" <<'PY'
-import json, sys, yaml
+
+    local comp="${inv}/group_vars/all/components.yml"
+    [ -n "$inv" ] && [ -f "$comp" ] || return 1
+
+    python3 - "$comp" "$API_USER" <<'PY'
+import json, re, sys
+
+# keycloak_users: 配下から該当ユーザーの groups を取り出す。
+# 想定する書き方:
+#   keycloak_users:
+#     - username: alice
+#       groups: [g1, g2]        # フロー形式
+#     - username: bob
+#       groups:                 # ブロック形式
+#         - g1
+path, want = sys.argv[1], sys.argv[2]
 try:
-    d = yaml.safe_load(open(sys.argv[1])) or {}
-except Exception:
-    d = {}
-for u in d.get("keycloak_users") or []:
-    if u.get("username") == sys.argv[2]:
-        g = u.get("groups") or []
-        if g:
-            print(json.dumps(g))
-            sys.exit()
-print(json.dumps(["maas-admins"]))
+    lines = open(path, encoding="utf-8").read().splitlines()
+except OSError:
+    sys.exit(1)
+
+in_users = False
+entries, cur, item_indent = [], None, None
+for raw in lines:
+    if re.match(r"^keycloak_users:\s*$", raw):
+        in_users = True
+        continue
+    if not in_users:
+        continue
+    if raw.strip() and not raw.startswith((" ", "\t")):
+        break                                   # 次のトップレベルキー
+    m = re.match(r"^(\s*)-\s+(.*)$", raw)
+    # リスト要素の開始は「最初の - と同じインデント」のときだけ。
+    # groups: のブロック形式 (- g1) を新しいユーザーと誤認しないため。
+    if m and (item_indent is None or len(m.group(1)) == item_indent):
+        item_indent = len(m.group(1))
+        cur = {"_lines": [m.group(2)]}
+        entries.append(cur)
+    elif cur is not None and raw.strip():
+        cur["_lines"].append(raw.strip())
+
+def parse(entry):
+    user, groups, collecting = None, [], False
+    for ln in entry["_lines"]:
+        mu = re.match(r"^username:\s*(\S+)", ln)
+        if mu:
+            user = mu.group(1).strip("'\"")
+            collecting = False
+            continue
+        mg = re.match(r"^groups:\s*(.*)$", ln)
+        if mg:
+            rest = mg.group(1).strip()
+            if rest.startswith("["):
+                groups = [g.strip().strip("'\"")
+                          for g in rest.strip("[]").split(",") if g.strip()]
+                collecting = False
+            else:
+                collecting = True
+            continue
+        if collecting:
+            mi = re.match(r"^-\s*(\S+)", ln)
+            if mi:
+                groups.append(mi.group(1).strip("'\""))
+            else:
+                collecting = False
+    return user, groups
+
+for e in entries:
+    u, g = parse(e)
+    if u == want and g:
+        print(json.dumps(g))
+        sys.exit(0)
+sys.exit(1)
 PY
-        return
-    fi
-    printf '%s' '["maas-admins"]'
 }
 
 ensure_api_key() {
     local groups
-    groups="$(resolve_api_groups)"
+    if ! groups="$(resolve_api_groups)" || [ -z "$groups" ]; then
+        die "ユーザー '${API_USER}' のグループを解決できませんでした。
+  inventory の keycloak_users に登録するか、明示的に指定してください:
+    OPENCODE_API_GROUPS='[\"maas-admins\"]' bash scripts/setup-opencode.sh setup
+    OPENCODE_INVENTORY=inventory/<env>       bash scripts/setup-opencode.sh setup
+  （未登録ユーザーに管理者グループのキーを発行しないよう、既定値は設けていません）"
+    fi
 
     if [ -s "$TOKEN_FILE" ] && [ -f "$TOKEN_META" ]; then
         local prev_user prev_groups

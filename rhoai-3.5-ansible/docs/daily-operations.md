@@ -764,8 +764,10 @@ OPENCODE_API_GROUPS='["maas-admins"]' bash scripts/setup-opencode.sh setup  # �
 OPENCODE_INVENTORY=inventory/<env>    bash scripts/setup-opencode.sh setup  # グループ検索先
 ```
 
-API キーに紐づくグループは、既定では inventory の `keycloak_users` から
-そのユーザーの `groups` を引く。引けない場合のみ `["maas-admins"]` になる。
+API キーに紐づくグループは inventory の `keycloak_users` から
+そのユーザーの `groups` を引く。**引けない場合はキーを発行せずエラーになる**
+（未登録ユーザーに管理者グループのキーを発行しないため、既定値は設けていない）。
+inventory に無いユーザーへ発行するときは `OPENCODE_API_GROUPS` で明示する。
 
 発行済みキーの使い回しは **同じユーザーかつ同じグループのときだけ**行う。
 発行先は `.vllm-token.meta` に記録され、`setup-opencode.sh show` で確認できる。

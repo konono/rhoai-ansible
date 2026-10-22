@@ -105,21 +105,6 @@ def render_operator(name: str, namespace: str, channel: str,
 
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """Ansible の combine(recursive=True) 相当の再帰マージ。
-
-    浅いマージだと resources.limits のようなネストした dict を
-    丸ごと置き換えてしまい、上書きしていないキー (cpu など) が消える。
-    """
-    out = dict(base)
-    for k, v in (override or {}).items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
 class _QuotingDumper(yaml.SafeDumper):
     """JSON を値に含む文字列をシングルクォートで出力する Dumper。
 
@@ -181,8 +166,10 @@ class ManifestRenderer:
         # inventory が model_defaults を上書きしている場合は反映する。
         # Ansible 側は inventory の group_vars が role defaults に優先するため、
         # ここで同じ優先順を再現しないと両者の出力がずれる。
-        self.model_defaults = _deep_merge(self.model_defaults,
-                                         cfg.get("model_defaults") or {})
+        # Ansible では inventory の group_vars が role defaults を「丸ごと」
+        # 置き換える（キー単位のマージではない）。同じ挙動を再現する。
+        if "model_defaults" in cfg:
+            self.model_defaults = dict(cfg["model_defaults"] or {})
 
         # Load existing generated passwords to preserve across re-runs
         existing_pw_file = output_dir / "generated-passwords.yml"

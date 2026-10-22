@@ -75,10 +75,11 @@
                  playbook_dir ~ '/../roles/llm_serving/templates/llminferenceservice.yml.j2')}) }}
       vars:
         _model_name: "{{ item.key }}"
-        # roles/llm_serving/tasks/main.yml と同じ解決順
+        # roles/llm_serving/tasks/main.yml と同じ解決順。
+        # inventory が model_defaults を定義していれば role defaults を
+        # 「丸ごと」置き換える（Ansible の変数優先順と同じ。キー単位のマージではない）。
         _model_cfg: >-
-          {{ _rd.model_defaults
-             | combine(model_defaults | default({}), recursive=True)
+          {{ model_defaults | default(_rd.model_defaults)
              | combine(model_recipes['_fallback'], recursive=True)
              | combine(model_recipes[item.value.hf_repo] | default({}), recursive=True)
              | combine(item.value, recursive=True) }}
