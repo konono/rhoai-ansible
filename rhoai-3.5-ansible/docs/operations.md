@@ -380,6 +380,43 @@ models:
 
 `vllm_args` はそのまま vLLM に渡るため、モデル固有のフラグもここに追加するだけで済みます。
 
+#### 【移行時の注意】chat template が opt-in になりました
+
+以前は role 同梱の qwen3 用テンプレートを**全モデルへ無条件に**差し込んでいました。
+この挙動を `custom_chat_template` 指定時のみに変更したため、既存環境を更新する
+ときに次の 2 点が影響します。
+
+**1. 対象モデルを動かしている環境はテンプレートファイルの配置が必要**
+
+`Qwen/Qwen3-0.6B` と `Qwen/Qwen3-4B` はレシピ側で `custom_chat_template: qwen3`
+を指定しているため、これらを `state: present` で動かしている inventory には
+テンプレートの実体が要ります。無いと role が明示的に停止します（黙って
+テンプレート無しでデプロイはしません）。
+
+```bash
+mkdir -p inventory/<env>/chat_templates
+cp inventory/sample/chat_templates/qwen3.jinja inventory/<env>/chat_templates/
+```
+
+上記 2 モデルを使っていない環境では不要です。
+
+**2. ConfigMap 名が変わるため、対象モデルは一度だけ Pod が再作成されます**
+
+`qwen3-chat-template`（全モデル共有）から `<モデル名>-chat-template`
+（モデルごと）に変わります。`volumes` の差分として検出され、通常どおり
+更新または作り直しが行われます。旧 ConfigMap は参照されなくなるだけで
+自動削除はしないので、不要なら手で消してください。
+
+```bash
+oc delete configmap qwen3-chat-template -n llm-serving
+```
+
+**3. レシピ未登録のモデルは chat template が付かなくなります**
+
+元々この差し込みは特定モデルのテンプレート不具合に対する回避策でした。
+モデル同梱のテンプレートが使われるようになります。差し込みが必要だと
+分かっている場合は `custom_chat_template` を明示してください。
+
 #### チャットテンプレートの変更が必要な場合
 
 既定ではモデル同梱の chat template をそのまま使い、`--chat-template` は付けない。
