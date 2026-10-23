@@ -1,3 +1,11 @@
+{#- chat template の解決。
+    custom_chat_template を指定したときだけ role が ConfigMap を作り、
+    その名前は chat_template_configmap で上書きできる（既定は <model>-chat-template）。
+    chat_template_configmap だけを指定した場合は、利用者が別途作成済みの
+    ConfigMap をマウントする。どちらも空ならモデル同梱の chat template を使い、
+    --chat-template は付けない。 -#}
+{% set _ctcm = (_model_cfg.chat_template_configmap | default('')) if (_model_cfg.chat_template_configmap | default('')) | length > 0
+               else ((_model_name ~ '-chat-template') if (_model_cfg.custom_chat_template | default('')) | length > 0 else '') %}
 apiVersion: serving.kserve.io/v1alpha2
 kind: LLMInferenceService
 metadata:
@@ -23,15 +31,32 @@ spec:
         args:
 {# --served-model-name と --chat-template は playbook 側の都合で決まるため自動付与。
    それ以外の vLLM 引数は inventory の vllm_args にそのまま書く（vLLM の版差はここで吸収する）。 #}
-          - "--served-model-name={{ _model_name }}"
-{% if _model_cfg.chat_template_configmap | default('') | length > 0 %}
+{# --served-model-name は KServe/llm-d の起動スクリプトが
+   --served-model-name "<name>" "publishers/<ns>/models/<name>" として
+   既に付与する。ここで足すと duplicate keys 警告になるため付けない。 #}
+{% if _ctcm | length > 0 %}
           - --chat-template=/chat-templates/chat_template.jinja
 {% endif %}
-{# 引数値に JSON (ダブルクォート) を含むケースがあるため必ずクォートする。
-   YAML のシングルクォート文字列は '' で単一引用符をエスケープできるので、
-   --speculative-config={"method": ...} のような値もそのまま 1 要素で渡せる。 #}
+{# KServe/llm-d が生成する起動スクリプトは
+     eval "exec vllm serve ... $@"
+   の形で引数を評価する。そのため argv として 1 要素で渡しても、
+   bash のブレース展開とクォート除去を受ける。実測:
+     --speculative-config={"method":"mtp","num_speculative_tokens":1}
+       -> --speculative-config=method:mtp
+          --speculative-config=num_speculative_tokens:1
+   に分割され "duplicate keys" 警告と JSON パースエラーになる。
+   値側をシングルクォートで囲むと eval を 1 回通っても原形を保つ。
+   対象は {} , * ? [] を含む値（ブレース展開・glob の対象になる文字）。 #}
 {% for arg in _model_cfg.vllm_args | default([]) %}
-          - '{{ arg | replace("'", "''") }}'
+{%   set _needs_quote = arg is search('[{}(),*?\[\]]') %}
+{%   if _needs_quote and '=' in arg %}
+{%     set _k = arg.split('=', 1)[0] %}
+{%     set _v = arg.split('=', 1)[1] %}
+{%     set _arg = _k ~ "='" ~ _v ~ "'" %}
+{%   else %}
+{%     set _arg = arg %}
+{%   endif %}
+          - '{{ _arg | replace("'", "''") }}'
 {% endfor %}
         env:
           - name: HOME
@@ -75,11 +100,11 @@ spec:
           periodSeconds: {{ _model_cfg.startup_probe_period_seconds | default(10) }}
           timeoutSeconds: 1
 {# chat template も shm も無い場合は volumeMounts キー自体を出さない #}
-{% if (_model_cfg.chat_template_configmap | default('') | length > 0)
+{% if (_ctcm | length > 0)
       or (_model_cfg.shm_size | default('') | string | length > 0) %}
         volumeMounts:
 {% endif %}
-{% if _model_cfg.chat_template_configmap | default('') | length > 0 %}
+{% if _ctcm | length > 0 %}
           - name: chat-template
             mountPath: /chat-templates
             readOnly: true
@@ -92,14 +117,14 @@ spec:
       - key: nvidia.com/gpu
         operator: Exists
         effect: NoSchedule
-{% if (_model_cfg.chat_template_configmap | default('') | length > 0)
+{% if (_ctcm | length > 0)
       or (_model_cfg.shm_size | default('') | string | length > 0) %}
     volumes:
 {% endif %}
-{% if _model_cfg.chat_template_configmap | default('') | length > 0 %}
+{% if _ctcm | length > 0 %}
       - name: chat-template
         configMap:
-          name: {{ _model_cfg.chat_template_configmap }}
+          name: {{ _ctcm }}
           items:
             - key: chat_template.jinja
               path: chat_template.jinja

@@ -2,6 +2,9 @@
 
 デプロイ後の運用操作をまとめます。初回セットアップは [README.md](../README.md) を参照してください。
 
+- 日々の依頼対応（ユーザー追加、quota 変更、モデル入れ替え等）: [daily-operations.md](daily-operations.md)
+- オフライン実行環境の構築・移行: [offline-environment.md](offline-environment.md)
+
 > **注意**: すべてのコマンドは `ansible/` ディレクトリから、`-i inventory/myenv` を付けて実行してください。
 
 ---
@@ -231,7 +234,7 @@ spec:
 |---|---|---|---|
 | モデルデプロイ | PVC `hf-model-cache` | llm-serving | モデルファイルの永続ストレージ（初回のみ作成） |
 | モデルデプロイ | Job `download-<model>` | llm-serving | HuggingFace からモデルをダウンロード |
-| モデルデプロイ | ConfigMap `<chat-template>` | llm-serving | チャットテンプレート |
+| モデルデプロイ | ConfigMap `<モデル名>-chat-template` | llm-serving | チャットテンプレート (`custom_chat_template` 指定時のみ) |
 | モデルデプロイ | LLMInferenceService | llm-serving | vLLM Pod + ルーティング + オートスケール |
 | MaaS 登録 | MaaSModelRef | llm-serving | MaaS Gateway へのモデル登録 |
 | アクセス権 | MaaSAuthPolicy | models-as-a-service | グループ → モデルのアクセス許可 |
@@ -379,21 +382,30 @@ models:
 
 #### チャットテンプレートの変更が必要な場合
 
-1. テンプレートファイルを配置:
+既定ではモデル同梱の chat template をそのまま使い、`--chat-template` は付けない。
+差し替えが必要なモデルにだけ `custom_chat_template` を指定する。
+
+1. テンプレートファイルを inventory に配置:
    ```bash
-   cp my-template.jinja manifests/07-llm-serving/chat_template.jinja
+   cp my-template.jinja inventory/<env>/chat_templates/my-template.jinja
    ```
 
-2. `models` に ConfigMap 名を指定:
+2. `models` でテンプレート名を指定:
    ```yaml
    models:
      my-model:
        hf_repo: org/my-model
        state: present
-       chat_template_configmap: my-model-chat-template
+       custom_chat_template: my-template   # 拡張子 .jinja は書かない
    ```
 
-> **注意**: 現状、チャットテンプレートファイルのパス (`manifests/07-llm-serving/chat_template.jinja`) は固定です。異なるテンプレートが必要な場合は、このファイルを差し替えてから実行してください。
+これで `<my-model>-chat-template` ConfigMap が作られ、`--chat-template` が付与される。
+ConfigMap 名を変えたい場合は `chat_template_configmap` で上書きする。
+
+> **補足**: 以前は qwen3 用テンプレートを全モデルへ無条件に差し込んでいたが、
+> これは特定モデルのテンプレート不具合に対する回避策だった。正しいテンプレートを
+> 持つモデルまで上書きしてしまうため、opt-in に変更した。既存の qwen3 用テンプレートは
+> `inventory/sample/chat_templates/qwen3.jinja` にある。
 
 #### モデル追加時に更新が必要な設定一覧
 

@@ -7,12 +7,19 @@
 {% endif %}
 {% endfor %}
 {% set active_models = ns.active %}
+{# present なモデルが 1 つも無いと modelRefs が null になり
+   CRD の "spec.modelRefs in body must be of type array" で apply が失敗する。
+   全モデルを absent にしたときに manage_maas_access が落ちていたため、
+   モデルが無いときは admin-auth-policy 自体を出力しない。 #}
+{% if active_models | length > 0 %}
 ---
 apiVersion: maas.opendatahub.io/v1alpha1
 kind: MaaSAuthPolicy
 metadata:
   name: admin-auth-policy
   namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: ansible-maas-access
 spec:
   subjects:
     groups:
@@ -25,6 +32,7 @@ spec:
     - name: {{ model_name }}
       namespace: {{ model_cfg.namespace }}
 {% endfor %}
+{% endif %}
 {% for group_name, group_cfg in keycloak_groups.items() %}
 {% set group_models = group_cfg.models | default([]) %}
 {% if group_models | length > 0 and '*' not in group_models %}
@@ -41,6 +49,8 @@ kind: MaaSAuthPolicy
 metadata:
   name: {{ group_name }}-auth-policy
   namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: ansible-maas-access
 spec:
   subjects:
     groups:
@@ -71,6 +81,8 @@ kind: MaaSSubscription
 metadata:
   name: {{ group_name }}-subscription
   namespace: models-as-a-service
+  labels:
+    app.kubernetes.io/managed-by: ansible-maas-access
 spec:
   owner:
     groups:

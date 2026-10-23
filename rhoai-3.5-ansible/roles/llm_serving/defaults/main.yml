@@ -11,12 +11,29 @@ download_only: false
 #
 # vLLM の引数は `vllm_args` に生の文字列で書く。vLLM のバージョンアップで
 # フラグが増減しても role 側の変更は不要（Ansible 側に名前付きキーを増やさない方針）。
-# role が自動付与するのは --served-model-name と --chat-template のみ。
+# role が自動付与するのは --chat-template のみ（custom_chat_template 指定時）。
+# --served-model-name は KServe/llm-d の起動スクリプトが付与するため付けない。
 model_defaults:
   namespace: llm-serving
   state: present
   vllm_image: vllm/vllm-openai:v0.28.0
-  chat_template_configmap: qwen3-chat-template   # 空文字にすると --chat-template を付けない
+  # --- chat template ---
+  # 既定はモデル同梱の chat template をそのまま使う（--chat-template を付けない）。
+  # もともと role 同梱の qwen3 用テンプレートを常に差し込んでいたが、これは
+  # 特定モデルのテンプレート不具合を回避するための対処だった。全モデルに
+  # 適用すると、本来正しいテンプレートを持つモデルまで上書きしてしまう。
+  #
+  # custom_chat_template: 差し込む chat template の名前。
+  #   実体は inventory 配下の chat_templates/<名前>.jinja に置く。
+  #   例) custom_chat_template: qwen3
+  #       -> inventory/<env>/chat_templates/qwen3.jinja
+  #   どのモデルにどれを当てるかは model_recipes.yml 側の知識として持ち、
+  #   ファイルの実体は環境ごとに差し替えられるよう inventory に置く。
+  # chat_template_configmap: 作成する ConfigMap 名の上書き
+  #   (既定は <model>-chat-template)。custom_chat_template なしで
+  #   これだけ指定した場合は、利用者が別途作成済みの ConfigMap をマウントする。
+  custom_chat_template: ""
+  chat_template_configmap: ""
   replicas: 1
 
   # --- vLLM 引数 ---

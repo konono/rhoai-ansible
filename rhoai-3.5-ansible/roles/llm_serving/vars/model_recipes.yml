@@ -63,8 +63,7 @@ model_recipes:
       limits: {cpu: "16", memory: 32Gi}
     # 27B はロードが長い。180 x 10s = 30 分まで待つ
     startup_probe_failure_threshold: 180
-    # モデル同梱の chat template を使う
-    chat_template_configmap: ""
+    # モデル同梱の chat template を使う（custom_chat_template を指定しない）
 
   # ---------------------------------------------------------------------------
   Qwen/Qwen3.8-27B:
@@ -90,7 +89,106 @@ model_recipes:
       requests: {cpu: "8", memory: 16Gi}
       limits: {cpu: "16", memory: 32Gi}
     startup_probe_failure_threshold: 180
-    chat_template_configmap: ""
+
+  # ---------------------------------------------------------------------------
+  Qwen/Qwen3.5-9B:
+    _source: >-
+      https://recipes.vllm.ai/Qwen/Qwen3.5-9B /
+      https://docs.vllm.ai/en/latest/features/quantization/llm_compressor/fp8/ /
+      https://docs.vllm.ai/en/latest/features/speculative_decoding/
+    _notes: >-
+      9B（総パラメータ 10B）/ Vision encoder 付き /
+      hybrid Gated DeltaNet + Gated Attention（32 層中 8 層のみ full attention）。
+      native context 262144、MTP 学習済み。要件は vLLM 0.17.0+。
+      公式レシピは「single 24GB GPU (RTX 4090 / L4 / A10G / H100) に収まる」と明記。
+
+      ただし BF16 の weights は約 18.6GiB あり、L4 24GB（実測 22888MiB）では
+      KV がほぼ残らない。FP8 量子化版の公式配布が無いため、vLLM の
+      オンライン量子化 --quantization=fp8_per_tensor で約 9.3GiB に落とす。
+      要件は compute capability >= 8.9（L4 は Ada SM 8.9 で該当）。
+      lm_head 以外の Linear を FP8 E4M3 per-tensor に、activation は毎回動的スケール。
+
+      weights の見積もりに注意。FP8 に落ちるのは lm_head を除く Linear だけで、
+      embed_tokens と lm_head（vocab 248320 x hidden 4096 = 各 1.02B params）は
+      BF16 のまま残る。合計 2.03B x 2byte = 約4.1GiB が非量子化で、
+      量子化対象の約8B が FP8 で約8.0GiB。weights 合計は約12GiB になる
+      （単純に 10B / 2 = 9.3GiB とすると過小評価）。
+
+      KV は full attention 8 層 x 2 x 4 kv_heads x 256 head_dim で
+      bf16 32KiB/token、fp8 16KiB/token（262144 トークンで fp8 4.0GiB/seq）。
+      L4 の実測 free は 22566MiB(22.04GiB)。util 0.90 の budget 20.24GiB から
+      weights 12 と overhead 2 を引くと KV は約6.2GiB = 約407k トークン。
+      262144 だと 1.6 本しか入らないため、初回は 65536 x 4 本で起動し、
+      起動ログの "GPU KV cache size" と "Maximum concurrency" を見てから上げる。
+
+      【実機実測 2026-10-23 / NVIDIA L4 24GB x1 / g6.8xlarge SNO / vLLM 0.28.0】
+        free memory on device     21.85 / 22.04 GiB
+        weights + non-torch       11.30 GiB   （上の約12GiB の見積もりとほぼ一致）
+        peak activation            1.98 GiB
+        CUDAGraph                  0.02 GiB
+        available KV cache         6.55 GiB
+        GPU KV cache size        328,590 tokens
+        Maximum concurrency        5.01x @ 65,536 tokens/request
+        init engine                139.4 s（うち compilation 61.4 s）
+      65536 x 4 本 = 262,144 トークンで、容量 328,590 に対し約25%の余裕。
+      vLLM は --kv-cache-memory=8.4GiB まで使い切れると報告しており
+      （util 0.90 では 1.85GiB 余る）、伸ばすなら gpu-memory-utilization を
+      上げてから max-num-seqs を増やす。seqs だけ 5 にすると
+      5 x 65536 = 327,680 で余裕がゼロになる。
+
+      MTP は実機で有効を確認済み（playbooks/llm_verify_inference.yml）。
+      受理率は thinking あり 0.855、thinking なし 0.667。
+      num_speculative_tokens=1 なので、受理ぶんがそのまま 1 トークン/step の
+      上乗せになる。
+
+      なお本モデルは reasoning モデルで、既定では思考に数百トークン使う。
+      max_tokens が小さいと content が空のまま finish_reason=length で返る。
+      短い応答が欲しい場合は chat_template_kwargs={"enable_thinking": false}。
+    _verified_on: "2026-10-23 / NVIDIA L4 24GB x1 (g6.8xlarge SNO) / vLLM 0.28.0 / RHOAI 3.5"
+    vllm_args:
+      # BF16 チェックポイントをロード時に FP8 へ落とす（公式 FP8 版が無いため）。
+      # v0.28.0 の quantization 登録名には "fp8"(Fp8Config) と
+      # "fp8_per_tensor"(OnlineQuantizationConfig) の両方がある。
+      # 現行ドキュメントが案内しているオンライン量子化の名前は fp8_per_tensor。
+      # 起動時に invalid quantization method で弾かれたら "fp8" を試す。
+      - "--quantization=fp8_per_tensor"
+      # 初回は保守的に。KV 約6.2GiB に対し 65536 x 4 本 = 262k トークンで収まる。
+      # 起動後に "GPU KV cache size: N tokens" を見て、N/65536 本まで上げられる。
+      # native context は 262144 なので、長文が要るなら seqs を 1 に落として上げる。
+      - "--max-model-len=65536"
+      - "--max-num-seqs=4"
+      - "--gpu-memory-utilization=0.90"
+      - "--kv-cache-dtype=fp8"
+      - "--enable-prefix-caching"
+      - "--reasoning-parser=qwen3"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser=qwen3_coder"
+      # 公式レシピ・vLLM ドキュメントとも method 名は "mtp"
+      # （HF のモデルカードは "qwen3_next_mtp" と記載。蹴られたらそちらを試す）
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":1}'
+      # 実機で下記の警告が出る（エラーではない）:
+      #   max_num_scheduled_tokens is set to 2048 based on the speculative
+      #   decoding settings. ... Consider increasing max_num_batched_tokens
+      # 投機デコードを有効にすると vLLM が 1 step のトークン上限を自動で絞る。
+      # max-model-len 65536 に対し prefill が 2048 ずつ最大32分割されるため、
+      # 長いプロンプトで TTFT が伸びる。生成スループットには影響しない。
+      # 長文入力が主なら下を有効にして実測する（投機の効きは少し落ちる）。
+      # - "--max-num-batched-tokens=8192"
+      # --- 24GB で詰まったときの調整候補 ---
+      # vision encoder を切って KV を増やす（テキスト専用になる）
+      # - "--language-model-only"
+      # CUDA graph キャプチャで OOM する場合
+      # - "--enforce-eager"
+      # 公式レシピの注記: Mamba cache sizing エラー時は既定 512 から下げる
+      # - "--max-cudagraph-capture-size=256"
+    # 推論が無言で止まる場合は VLLM_USE_DEEP_GEMM=0 を入れる（公式ドキュメント記載）
+    vllm_env: {}
+    gpu_count: 1
+    resources:
+      requests: {cpu: "4", memory: 16Gi}
+      limits: {cpu: "8", memory: 32Gi}
+    startup_probe_failure_threshold: 180
+    # vision encoder 付き。モデル同梱の chat template が正しいのでそのまま使う
 
   # ---------------------------------------------------------------------------
   Qwen/Qwen3-0.6B:
@@ -107,6 +205,9 @@ model_recipes:
       - "--reasoning-parser=qwen3"
       - "--enable-auto-tool-choice"
       - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":4}'
+    # モデル同梱の chat template は tool call 周りが期待どおりに動かないため、
+    # 修正版を差し込む。実体は inventory/<env>/chat_templates/qwen3.jinja。
+    custom_chat_template: qwen3
 
   # ---------------------------------------------------------------------------
   Qwen/Qwen3-4B:
@@ -120,6 +221,7 @@ model_recipes:
       - "--tool-call-parser=hermes"
       - "--enable-auto-tool-choice"
       - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":4}'
+    custom_chat_template: qwen3
 
   # ---------------------------------------------------------------------------
   # レシピ未登録のモデル用。最小限の引数だけを渡す。

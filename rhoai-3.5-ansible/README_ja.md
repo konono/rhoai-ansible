@@ -363,7 +363,7 @@ models:
     hf_repo: Qwen/Qwen3-0.6B       # (必須) HuggingFace リポジトリ名
     state: present                   # present=デプロイ, absent=削除
     # vLLM 引数は生のリスト。role が自動付与するのは
-    # --served-model-name と --chat-template だけなので、
+    # --chat-template だけ (custom_chat_template を指定したときのみ) なので、
     # vLLM のバージョンアップで増えたフラグも inventory だけで追従できる。
     vllm_args:
       - "--enable-prefix-caching"
@@ -376,7 +376,9 @@ models:
     # 以下はデフォルト値があるため省略可能
     # vllm_image: vllm/vllm-openai:v0.28.0
     # vllm_env: {}                   # コンテナ環境変数の追加
-    # chat_template_configmap: qwen3-chat-template
+    # custom_chat_template: ""      # 既定は空 = モデル同梱の chat template を使う
+    #                                # 名前を書くと inventory/<env>/chat_templates/<名前>.jinja を適用
+    # chat_template_configmap: ""    # 作成する ConfigMap 名の上書き (既定 <モデル名>-chat-template)
     # replicas: 1
     # gpu_count: 1
     # resources: {requests: {cpu: "500m", memory: 4Gi}, limits: {cpu: "2", memory: 8Gi}}
@@ -392,7 +394,8 @@ models:
 | `vllm_image` | vLLM コンテナイメージ | `vllm/vllm-openai:v0.28.0` |
 | `vllm_args` | vLLM 引数（そのまま args に渡る） | `model_defaults` 参照 |
 | `vllm_env` | コンテナ環境変数の追加（マップ） | `{}` |
-| `chat_template_configmap` | チャットテンプレート ConfigMap 名（空なら `--chat-template` を付けない） | `qwen3-chat-template` |
+| `custom_chat_template` | 差し替える chat template 名。実体は `inventory/<env>/chat_templates/<名前>.jinja`。空ならモデル同梱のものを使い `--chat-template` を付けない | `""` |
+| `chat_template_configmap` | 作成する ConfigMap 名の上書き | `<モデル名>-chat-template` |
 | `replicas` | LLMInferenceService のレプリカ数 | `1` |
 | `gpu_count` | 要求 GPU 数 | `1` |
 | `resources` | CPU/メモリの requests・limits（再帰マージ） | `500m`/`4Gi` → `2`/`8Gi` |
@@ -873,6 +876,8 @@ ansible/
 │   └── observability/            # Monitoring / Dashboards
 ├── docs/
 │   ├── operations.md             # 運用ガイド（モデル追加・ユーザー管理等）
+│   ├── daily-operations.md       # 日常運用（ユーザー・quota・モデルの依頼対応）
+│   ├── offline-environment.md    # オフライン実行環境の構築・移行
 │   └── troubleshooting.md        # トラブルシューティング
 ├── vendor/                       # Disconnected 用資材 (.gitignore 対象)
 │   ├── wheels/                   # Python wheels
@@ -982,4 +987,6 @@ fatal: [localhost]: FAILED! =>
 | ドキュメント | 内容 |
 |---|---|
 | [docs/operations.md](docs/operations.md) | 運用ガイド — モデル追加手順、ユーザー/グループ管理、MaaS アクセス制御、API Key 発行、クォータ設定、削除手順 |
+| [docs/daily-operations.md](docs/daily-operations.md) | 日常運用ガイド — 利用者からの依頼対応（ユーザー追加・無効化、パスワードリセット、quota 変更、モデルの追加/入れ替え/削除、API キー発行、Keycloak 管理者復旧、秘密情報の保管場所） |
+| [docs/offline-environment.md](docs/offline-environment.md) | オフライン実行環境 — 資材の構成、ゼロからの構築、稼働中環境からの移行、venv の絶対パス書き換え、pack/unpack による更新配布 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | トラブルシューティング — 過去のトラブル事例、デプロイ前チェックリスト、監視方法、失敗時の対処フロー、各リソースの正常状態確認コマンド集、Disconnected 環境固有の注意点 |
