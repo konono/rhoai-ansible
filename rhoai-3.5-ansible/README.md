@@ -357,18 +357,32 @@ Example output:
 
 Model management is centralized in the `models` variable. Default values are defined in `roles/llm_serving/defaults/main.yml` under `model_defaults`. Only fields you want to override need to be specified in `models`.
 
+**Key naming convention**: lowercase the model portion of `hf_repo` and replace `.` with `-` (e.g. `Qwen/Qwen3.8-27B-FP8` → `qwen3-8-27b-fp8`). Keys become Kubernetes resource names, so only lowercase alphanumerics and `-` are allowed. The key is used verbatim as the PVC directory name, as vLLM's `--served-model-name`, and in the Keycloak group name `maas-<key>-users` — so **never rename a key once chosen** (renaming misses the PVC cache and forces a re-download). See [docs/operations.md](docs/operations.md) for details.
+
 ```yaml
 models:
   qwen3-06b:
     hf_repo: Qwen/Qwen3-0.6B       # (required) HuggingFace repository name
     state: present                   # present=deploy, absent=remove
+    # vLLM arguments are a raw list — the role only auto-adds
+    # --served-model-name and --chat-template, so new vLLM flags
+    # can be adopted without changing the role.
+    vllm_args:
+      - "--enable-prefix-caching"
+      - "--gpu-memory-utilization=0.90"
+      - "--max-model-len=4096"
+      - "--tool-call-parser=qwen3_coder"
+      - "--reasoning-parser=qwen3"
+      - "--enable-auto-tool-choice"
+      - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":4}'
     # The following have defaults and can be omitted
     # vllm_image: vllm/vllm-openai:v0.28.0
-    # tool_call_parser: qwen3_coder
-    # reasoning_parser: ""
+    # vllm_env: {}                   # extra container env vars
     # chat_template_configmap: qwen3-chat-template
+    # replicas: 1
     # gpu_count: 1
-    # vllm_extra_args: ["--max-model-len=4096", "--enable-auto-tool-choice"]
+    # resources: {requests: {cpu: "500m", memory: 4Gi}, limits: {cpu: "2", memory: 8Gi}}
+    # shm_size: ""                   # e.g. 16Gi when using tensor parallelism
     # purge: false                   # true to also delete model data on PVC
 ```
 
@@ -378,12 +392,17 @@ models:
 | `state` | `present` to deploy, `absent` to remove | `present` |
 | `namespace` | Target namespace for deployment | `llm-serving` |
 | `vllm_image` | vLLM container image | `vllm/vllm-openai:v0.28.0` |
-| `tool_call_parser` | `--tool-call-parser` | `qwen3_coder` |
-| `reasoning_parser` | `--reasoning-parser` (omitted if empty) | `""` |
-| `chat_template_configmap` | Chat template ConfigMap name | `qwen3-chat-template` |
+| `vllm_args` | vLLM arguments, passed through verbatim | see `model_defaults` |
+| `vllm_env` | Extra container environment variables (map) | `{}` |
+| `chat_template_configmap` | Chat template ConfigMap name (empty = no `--chat-template`) | `qwen3-chat-template` |
+| `replicas` | LLMInferenceService replicas | `1` |
 | `gpu_count` | Number of GPUs requested | `1` |
-| `vllm_extra_args` | Additional vLLM arguments (list) | `["--max-model-len=4096", "--enable-auto-tool-choice"]` |
+| `resources` | CPU/memory requests and limits (merged recursively) | `500m`/`4Gi` → `2`/`8Gi` |
+| `shm_size` | `/dev/shm` emptyDir size; empty = not mounted | `""` |
+| `startup_probe_failure_threshold` / `startup_probe_period_seconds` | Startup wait budget | `120` / `10` |
 | `purge` | Whether to delete PVC cache when `state: absent` | `false` |
+
+> **vLLM flags are not modeled as named keys.** Everything in `vllm_args` is passed to the container verbatim, so a vLLM upgrade that adds or renames flags needs an inventory edit only — no role change.
 
 > **The dict key becomes the model name.** It is used as K8s resource names, so it must be RFC 1123 compliant (lowercase alphanumeric, hyphens, and dots only).
 
@@ -815,6 +834,9 @@ ansible/
 │   ├── verify.yml                # Deployment verification + environment summary
 │   ├── manage_maas_access.yml    # MaaS access management (users + policies)
 │   ├── llm_add_model.yml         # Add model (deploy + MaaS + Keycloak)
+│   ├── llm_download.yml         # Download model data only (download_only)
+│   ├── llm_edit_args.yml        # Patch vLLM args in place (oc edit equivalent)
+│   ├── llm_show_manifest.yml    # Preview the rendered manifest without a cluster
 │   └── maas_create_apikey.yml    # API Key issuance
 ├── scripts/
 │   ├── cleanup-all.sh            # Delete all resources

@@ -166,11 +166,13 @@
       tags: [workload, observability]
 
     # ==================== Post-deploy ====================
+    # scripts/ は playbook ディレクトリ内にある（pack-playbook.sh の配布対象）。
+    # 以前は {{ ansible_root }}/../scripts を参照しており、配布先に存在しなかった。
     - name: OpenCode setup (API Key + opencode.json)
       ansible.builtin.command: >-
-        bash {{ ansible_root }}/../scripts/setup-opencode.sh setup
+        bash {{ ansible_root }}/scripts/setup-opencode.sh setup
       args:
-        chdir: "{{ ansible_root }}/.."
+        chdir: "{{ ansible_root }}"
       register: _opencode
       changed_when: "'opencode.json' in _opencode.stdout"
       failed_when: false

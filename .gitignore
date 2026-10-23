@@ -1,1 +1,11 @@
 *_manifests/
+
+# 作業ジャーナル (ローカルのみ)
+.tracecraft/
+
+# ローカル実行用のコピー (docs/offline-environment.md の手順で再生成する)
+rhoai-3.5-ansible_local/
+ansible/
+
+# 別リポジトリ（埋め込み防止）
+rhoai-self-update-release/

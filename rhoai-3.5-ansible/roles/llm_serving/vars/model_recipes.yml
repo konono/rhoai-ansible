@@ -1,0 +1,134 @@
+---
+# =============================================================================
+# モデルごとの vLLM 起動パラメータのナレッジベース
+#
+# vLLM のパラメータはモデルのアーキテクチャ・量子化方式・ハードウェアで
+# 大きく変わり、全モデル共通の既定値（model_defaults.vllm_args）では表現できない。
+# そのため hf_repo をキーに、検証済みのレシピをここへ蓄積する。
+#
+# 解決順（後勝ち）:
+#   1. _fallback の内容
+#   2. この表の hf_repo に一致するエントリ
+#   3. inventory の models.<key> に書いた内容
+#
+# つまり inventory で vllm_args を書けばレシピを完全に上書きでき、
+# 書かなければ検証済みのレシピがそのまま使われる。
+#
+# エントリを追加・更新するときは必ず出典（レシピ URL / 実測ログ）を書くこと。
+# =============================================================================
+
+model_recipes:
+
+  # ---------------------------------------------------------------------------
+  Qwen/Qwen3.8-27B-FP8:
+    _source: https://recipes.vllm.ai/Qwen/Qwen3.8-27B
+    _notes: >-
+      27B / Vision encoder 付き (Qwen3_5ForConditionalGeneration)。
+      fine-grained FP8 (block size 128)、MTP 学習済み、native context 262144。
+      要件: vLLM 0.17.0+ / transformers >= 5.8.0。
+      量子化方式は config.json の quantization_config から自動検出されるため
+      --quantization は指定しない。chat template はモデル同梱のものを使う
+      （role 同梱の Qwen3 テキスト用で上書きするとマルチモーダルが壊れる）。
+    _verified_on: "NVIDIA H200 141GB x1 / vllm-openai:v0.28.0 / 2026-10-22"
+    vllm_args:
+      - "--max-model-len=262144"
+      # H200 141GB x1 での算出:
+      #   KV/token = 16 full-attn層 x 2(K,V) x 4 kv_heads x 256 head_dim x 1B(fp8)
+      #            = 32 KiB → 262144 トークンで 8.0 GiB/シーケンス
+      #   131.3 GiB x 0.90 - 57.1 GiB(FP8 weights) - 約5 GiB(activation) ≈ 56 GiB
+      #   56 / 8.0 ≈ 7 本 → 8 を上限にする
+      # 起動ログの "Maximum concurrency for ... tokens per request" で答え合わせできる
+      - "--max-num-seqs=8"
+      - "--gpu-memory-utilization=0.90"
+      # レシピの全構成が fp8 を指定している（auto ではない）
+      - "--kv-cache-dtype=fp8"
+      # エージェント用途では同一プレフィクスの再利用が効くため明示的に有効化
+      - "--enable-prefix-caching"
+      - "--reasoning-parser=qwen3"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser=qwen3_coder"
+      # MTP。レシピの推奨は num_speculative_tokens=3。
+      # "mtp" が拒否される場合は "qwen3_5_mtp"（Ascend 項の名前）を試す。
+      # 効いているかは spec_decode_num_{accepted,draft}_tokens_total で確認する。
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
+      # 起動時に CUDA graph キャプチャで OOM する場合に追加する。
+      # レシピ注記: capture は gpu-memory-utilization の枠外で確保されるため、
+      # この値を下げても解決しない。
+      # - "--enforce-eager"
+    gpu_count: 1
+    # 重みは GPU 側に載るため、ホスト側のメモリはモデルロード時のバッファが主。
+    # 48Gi/96Gi は過大だったので実態に合わせて縮小した。
+    resources:
+      requests: {cpu: "8", memory: 16Gi}
+      limits: {cpu: "16", memory: 32Gi}
+    # 27B はロードが長い。180 x 10s = 30 分まで待つ
+    startup_probe_failure_threshold: 180
+    # モデル同梱の chat template を使う
+    chat_template_configmap: ""
+
+  # ---------------------------------------------------------------------------
+  Qwen/Qwen3.8-27B:
+    _source: https://recipes.vllm.ai/Qwen/Qwen3.8-27B
+    _notes: >-
+      非量子化版。bf16 の weights は FP8 版の約 2 倍になるため、
+      GPU 1 枚で動かすなら max-model-len を大きく下げる必要がある。未検証。
+    _verified_on: "未検証"
+    vllm_args:
+      - "--max-model-len=65536"
+      - "--max-num-seqs=8"
+      - "--gpu-memory-utilization=0.90"
+      - "--kv-cache-dtype=fp8"
+      - "--enable-prefix-caching"
+      - "--reasoning-parser=qwen3"
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser=qwen3_coder"
+      - '--speculative-config={"method":"mtp","num_speculative_tokens":3}'
+    gpu_count: 1
+    # 重みは GPU 側に載るため、ホスト側のメモリはモデルロード時のバッファが主。
+    # 48Gi/96Gi は過大だったので実態に合わせて縮小した。
+    resources:
+      requests: {cpu: "8", memory: 16Gi}
+      limits: {cpu: "16", memory: 32Gi}
+    startup_probe_failure_threshold: 180
+    chat_template_configmap: ""
+
+  # ---------------------------------------------------------------------------
+  Qwen/Qwen3-0.6B:
+    _source: 本リポジトリでの運用実績
+    _notes: >-
+      テキスト専用の小型モデル。MTP ヘッドを持たないため
+      speculative decoding は ngram を使う。
+    _verified_on: "本番運用実績あり"
+    vllm_args:
+      - "--max-model-len=4096"
+      - "--gpu-memory-utilization=0.90"
+      - "--enable-prefix-caching"
+      - "--tool-call-parser=qwen3_coder"
+      - "--reasoning-parser=qwen3"
+      - "--enable-auto-tool-choice"
+      - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":4}'
+
+  # ---------------------------------------------------------------------------
+  Qwen/Qwen3-4B:
+    _source: 本リポジトリでの運用実績
+    _notes: テキスト専用。tool call は hermes パーサーを使用。
+    _verified_on: "未検証"
+    vllm_args:
+      - "--max-model-len=4096"
+      - "--gpu-memory-utilization=0.90"
+      - "--enable-prefix-caching"
+      - "--tool-call-parser=hermes"
+      - "--enable-auto-tool-choice"
+      - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":4}'
+
+  # ---------------------------------------------------------------------------
+  # レシピ未登録のモデル用。最小限の引数だけを渡す。
+  # 新しいモデルを入れるときは、まずこれで起動を確認してから
+  # 上の表にエントリを追加すること。
+  _fallback:
+    _source: "(なし)"
+    _notes: レシピ未登録モデルの最小構成
+    _verified_on: "-"
+    vllm_args:
+      - "--max-model-len=4096"
+      - "--gpu-memory-utilization=0.90"

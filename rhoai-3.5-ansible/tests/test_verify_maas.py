@@ -14,7 +14,12 @@ class TestMaaSVerification(unittest.TestCase):
     def test_api_key_creation_requires_explicit_opt_in(self):
         tasks = yaml.safe_load(VERIFY.read_text())[0]["tasks"]
         key_task = next(t for t in tasks if t["name"] == "Verify: MaaS API Key issuable")
-        self.assertIn("-X POST", key_task["ansible.builtin.command"])
+        # このタスクは block/always 構造。実際の POST は block 内の子タスクにある。
+        create = next(
+            c for c in key_task["block"]
+            if c["name"] == "Create verification API key"
+        )
+        self.assertIn("-X POST", create["ansible.builtin.command"])
         self.assertIn(
             "verify_maas_api_key_issuance | default(false) | bool",
             key_task["when"],

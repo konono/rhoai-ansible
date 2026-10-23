@@ -227,6 +227,30 @@
     - _group_id_map[item.1] not in (_user_group_ids[item.0.item.username] | default([]))
   failed_when: false
 
+# --- 宣言的な解除 ---
+# inventory の keycloak_users[].groups に無くなったグループは所属を解除する。
+# 対象は keycloak_groups に定義済みのグループだけに限定し、
+# Keycloak 上で手動作成した管理外のグループには触れない。
+- name: Remove users from managed groups no longer listed in inventory
+  ansible.builtin.uri:
+    url: "{{ _kc_api }}/users/{{ item.0.item.json[0].id }}/groups/{{ item.1.id }}"
+    method: DELETE
+    headers:
+      Authorization: "Bearer {{ _kc_token }}"
+    validate_certs: false
+    status_code: [204, 404]
+  loop: >-
+    {{ _user_groups.results | default([])
+       | selectattr('json', 'defined')
+       | subelements('json', skip_missing=true) }}
+  loop_control:
+    label: "{{ item.0.item.item.username }} -x- {{ item.1.name }}"
+  when:
+    - keycloak_prune_group_membership | bool
+    - item.1.name in (keycloak_groups | default({}))
+    - item.1.name not in (item.0.item.item.groups | default([]))
+  failed_when: false
+
 # ==================== MaaS Policies ====================
 - name: Ensure MaasTenantConfig exists
   kubernetes.core.k8s:

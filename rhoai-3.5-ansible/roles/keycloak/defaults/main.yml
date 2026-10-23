@@ -1,3 +1,9 @@
 ---
 keycloak_namespace: keycloak
 keycloak_realm: maas
+
+# true なら keycloak_users の groups を宣言的に扱う。
+# inventory の groups から外したグループは Keycloak 側の所属も解除する。
+# 解除対象は keycloak_groups に定義されているグループのみで、
+# Keycloak 上で手動作成した管理外のグループには触れない。
+keycloak_prune_group_membership: true

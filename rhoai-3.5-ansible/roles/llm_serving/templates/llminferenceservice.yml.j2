@@ -9,7 +9,7 @@ spec:
   model:
     uri: "pvc://hf-model-cache/{{ _model_name }}"
     name: "{{ _model_name }}"
-  replicas: 1
+  replicas: {{ _model_cfg.replicas | default(1) }}
   router:
     route: {}
     gateway:
@@ -21,19 +21,17 @@ spec:
       - name: main
         image: {{ _model_cfg.vllm_image }}
         args:
+{# --served-model-name と --chat-template は playbook 側の都合で決まるため自動付与。
+   それ以外の vLLM 引数は inventory の vllm_args にそのまま書く（vLLM の版差はここで吸収する）。 #}
           - "--served-model-name={{ _model_name }}"
-          - --enable-prefix-caching
-          - --gpu-memory-utilization=0.90
-          - --max-model-len=32768
-          - --enforce-eager
-          - --tool-call-parser={{ _model_cfg.tool_call_parser }}
-{% if _model_cfg.reasoning_parser | default('') | length > 0 %}
-          - --reasoning-parser={{ _model_cfg.reasoning_parser }}
-{% endif %}
-          - --enable-auto-tool-choice
+{% if _model_cfg.chat_template_configmap | default('') | length > 0 %}
           - --chat-template=/chat-templates/chat_template.jinja
-{% for arg in _model_cfg.vllm_extra_args | default([]) %}
-          - "{{ arg }}"
+{% endif %}
+{# 引数値に JSON (ダブルクォート) を含むケースがあるため必ずクォートする。
+   YAML のシングルクォート文字列は '' で単一引用符をエスケープできるので、
+   --speculative-config={"method": ...} のような値もそのまま 1 要素で渡せる。 #}
+{% for arg in _model_cfg.vllm_args | default([]) %}
+          - '{{ arg | replace("'", "''") }}'
 {% endfor %}
         env:
           - name: HOME
@@ -47,35 +45,68 @@ spec:
               secretKeyRef:
                 name: hf-token
                 key: HF_TOKEN
+{% for k, v in (_model_cfg.vllm_env | default({})).items() %}
+          - name: {{ k }}
+            value: "{{ v }}"
+{% endfor %}
+{# inventory が model_defaults を定義すると role defaults を丸ごと置き換えるため、
+   一部のキーだけ書いた場合に未定義になる。replicas や startupProbe と同様に
+   既定値を持たせて部分上書きでも動くようにする。
+   既定値は roles/llm_serving/defaults/main.yml の model_defaults と同じ値。
+   render-manifests/render.py の _TEMPLATE_DEFAULTS とも揃えること。 #}
+{% set _res = _model_cfg.resources | default({}) %}
+{% set _req = _res.requests | default({}) %}
+{% set _lim = _res.limits | default({}) %}
         resources:
           requests:
-            cpu: "500m"
-            memory: 4Gi
-            nvidia.com/gpu: "1"
+            cpu: "{{ _req.cpu | default('500m') }}"
+            memory: {{ _req.memory | default('4Gi') }}
+            nvidia.com/gpu: "{{ _model_cfg.gpu_count | default(1) }}"
           limits:
-            cpu: "2"
-            memory: 8Gi
-            nvidia.com/gpu: "1"
+            cpu: "{{ _lim.cpu | default('2') }}"
+            memory: {{ _lim.memory | default('8Gi') }}
+            nvidia.com/gpu: "{{ _model_cfg.gpu_count | default(1) }}"
         startupProbe:
           httpGet:
             path: /health
             port: 8000
             scheme: HTTPS
-          failureThreshold: 120
-          periodSeconds: 10
+          failureThreshold: {{ _model_cfg.startup_probe_failure_threshold | default(120) }}
+          periodSeconds: {{ _model_cfg.startup_probe_period_seconds | default(10) }}
           timeoutSeconds: 1
+{# chat template も shm も無い場合は volumeMounts キー自体を出さない #}
+{% if (_model_cfg.chat_template_configmap | default('') | length > 0)
+      or (_model_cfg.shm_size | default('') | string | length > 0) %}
         volumeMounts:
+{% endif %}
+{% if _model_cfg.chat_template_configmap | default('') | length > 0 %}
           - name: chat-template
             mountPath: /chat-templates
             readOnly: true
+{% endif %}
+{% if _model_cfg.shm_size | default('') | string | length > 0 %}
+          - name: dshm
+            mountPath: /dev/shm
+{% endif %}
     tolerations:
       - key: nvidia.com/gpu
         operator: Exists
         effect: NoSchedule
+{% if (_model_cfg.chat_template_configmap | default('') | length > 0)
+      or (_model_cfg.shm_size | default('') | string | length > 0) %}
     volumes:
+{% endif %}
+{% if _model_cfg.chat_template_configmap | default('') | length > 0 %}
       - name: chat-template
         configMap:
           name: {{ _model_cfg.chat_template_configmap }}
           items:
             - key: chat_template.jinja
               path: chat_template.jinja
+{% endif %}
+{% if _model_cfg.shm_size | default('') | string | length > 0 %}
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: {{ _model_cfg.shm_size }}
+{% endif %}

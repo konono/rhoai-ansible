@@ -287,6 +287,32 @@ ansible-playbook playbooks/llm_add_model.yml -i inventory/myenv
 2. **llm_serving** — absent モデル削除（GPU 解放）→ present モデルのダウンロード・デプロイ・MaaSModelRef 作成 → **Ready 待ち（最大20分）**
 3. **manage_maas_access** — Keycloak グループ同期 → AuthPolicy/Subscription 生成・適用
 
+##### ダウンロードだけ先に実行する (`download_only`)
+
+大きいモデルを GPU が空く前に PVC へ落としておきたい場合や、disconnected 環境で
+ダウンロードだけ先に通したい場合は `download_only` を使う。
+LLMInferenceService の作成・GPU 容量チェック・absent モデルの削除はすべてスキップされ、
+`hf-model-cache` PVC へのダウンロードだけが実行される。
+
+```bash
+# 専用 playbook
+ansible-playbook playbooks/llm_download.yml -i inventory/myenv
+
+# site.yml 経由（同じ動作）
+ansible-playbook site.yml -i inventory/myenv --tags llm -e download_only=true
+
+# 特定のモデルだけ
+ansible-playbook playbooks/llm_download.yml -i inventory/myenv \
+  -e '{"models": {"qwen3-8-27b": {"hf_repo": "Qwen/Qwen3.8-27B", "state": "present"}}}'
+```
+
+ダウンロード済みのデータは PVC 上に残るため、後から `download_only` なしで実行すると
+ダウンロードはスキップされ、配信のデプロイだけが走る。
+
+> **重要**: ここで使うモデルキーは、あとで `components.yml` の `models` に書くキーと
+> **完全に一致させる**こと。キャッシュ判定は `/models/<キー>/config.json` の存在確認で行うため、
+> キーが違うと再ダウンロードになる。命名規約は下記「モデルキーの命名規約」を参照。
+
 #### Step 3: 動作確認
 
 ```bash
@@ -301,6 +327,33 @@ curl -sk "https://maas.<cluster_domain>/llm-serving/qwen3-8b/v1/chat/completions
   -d '{"model":"qwen3-8b","messages":[{"role":"user","content":"Hello"}],"max_tokens":20}'
 ```
 
+### モデルキーの命名規約
+
+`models` のキーは変換なしで以下すべてに使われます。あとから変更するとキャッシュが無効になり、
+API のモデル名と Keycloak グループ名も変わるため、**最初に決めて以後変更しない**でください。
+
+| 用途 | 値 |
+|---|---|
+| PVC 上のダウンロード先 | `/models/<キー>` |
+| キャッシュ判定 | `/models/<キー>/config.json` |
+| LLMInferenceService 名 / `spec.model.uri` | `<キー>` / `pvc://hf-model-cache/<キー>` |
+| vLLM `--served-model-name` (API のモデル名) | `<キー>` |
+| Keycloak グループ名 | `maas-<キー>-users` |
+
+ルール:
+
+1. `hf_repo` のモデル名部分を小文字化し、**`.` は `-` に置き換える**（組織名と `/` は落とす）
+2. k8s リソース名になるため RFC1123 準拠（小文字英数と `-` のみ、`.` と大文字は使えない）
+
+| `hf_repo` | キー |
+|---|---|
+| `Qwen/Qwen3.8-27B-FP8` | `qwen3-8-27b-fp8` |
+| `Qwen/Qwen3-8B` | `qwen3-8b` |
+| `deepseek-ai/DeepSeek-R1-0528` | `deepseek-r1-0528` |
+
+> 既存の `qwen3-06b`（`Qwen/Qwen3-0.6B`）はこの規約の制定前に付けた名前です。改名すると
+> 再ダウンロードが発生するため維持しています。新規モデルのみ上記ルールに従ってください。
+
 ### 非 Qwen モデルの追加
 
 vLLM のパーサーとチャットテンプレートはモデルファミリーごとに異なります。
@@ -314,9 +367,15 @@ models:
   deepseek-r1:
     hf_repo: deepseek-ai/DeepSeek-R1-0528
     state: present
-    tool_call_parser: hermes
-    reasoning_parser: deepseek_r1
+    vllm_args:
+      - "--max-model-len=4096"
+      - "--gpu-memory-utilization=0.90"
+      - "--tool-call-parser=hermes"
+      - "--reasoning-parser=deepseek_r1"
+      - "--enable-auto-tool-choice"
 ```
+
+`vllm_args` はそのまま vLLM に渡るため、モデル固有のフラグもここに追加するだけで済みます。
 
 #### チャットテンプレートの変更が必要な場合
 

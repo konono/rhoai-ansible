@@ -1,0 +1,180 @@
+---
+# vLLM 引数だけを素早く差し替える。
+#
+# ダウンロード・GPU 調整・MaaS ポリシー適用を伴わず、稼働中の LLMInferenceService の
+# args だけを置き換えるため、oc edit と同じ感覚でチューニングを試せる。
+#
+# 現在の引数を表示する:
+#   uv run ansible-playbook playbooks/llm_edit_args.yml -i inventory/<env> \
+#     -e model=qwen3-8-27b
+#
+# 引数を差し替える:
+#   uv run ansible-playbook playbooks/llm_edit_args.yml -i inventory/<env> \
+#     -e model=qwen3-8-27b \
+#     -e '{"vllm_args": ["--max-model-len=32768", "--gpu-memory-utilization=0.85", "--enforce-eager"]}'
+#
+# 対話的に編集する (scripts/vllm-args.sh が $EDITOR を開いてこの playbook を呼ぶ):
+#   bash scripts/vllm-args.sh qwen3-8-27b -i inventory/<env>
+#
+# 注意:
+#   ここでの変更はクラスタ上のリソースにのみ適用される。
+#   inventory を更新しないと、次に llm_add_model.yml / site.yml を流したときに戻る。
+#   実行後に表示される inventory スニペットを components.yml に貼ること。
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  tasks:
+    - name: Verify oc login
+      ansible.builtin.command: oc whoami
+      changed_when: false
+
+    - name: Require model variable
+      ansible.builtin.assert:
+        that:
+          - model is defined
+          - model | length > 0
+        fail_msg: >-
+          -e model=<モデルキー> を指定してください。
+          例: -e model=qwen3-8-27b
+        quiet: true
+
+    - name: Require model to exist in inventory
+      ansible.builtin.assert:
+        that:
+          - model in (models | default({}))
+        fail_msg: >-
+          models に '{{ model }}' がありません。
+          定義済み: {{ models | default({}) | list | join(', ') }}
+        quiet: true
+
+    # model_defaults は llm_serving の role defaults にあり、role を適用しない
+    # この playbook からは見えないため明示的に読み込む。
+    # inventory 側で model_defaults を上書きしている場合はそちらを優先する。
+    - name: Load llm_serving role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/defaults/main.yml"
+        name: _llm_role_defaults
+
+    - name: Load per-model vLLM recipes
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/vars/model_recipes.yml"
+
+    - name: Resolve merged model config
+      ansible.builtin.set_fact:
+        _cfg: >-
+          {{ model_defaults | default(_llm_role_defaults.model_defaults)
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(models[model].hf_repo | default(''), {}), recursive=True)
+             | combine(models[model], recursive=True) }}
+
+    - name: Read current args from the cluster
+      ansible.builtin.command: >-
+        oc get llminferenceservice {{ model }} -n {{ _cfg.namespace }}
+        -o jsonpath={.spec.template.containers[0].args}
+      register: _live_args
+      changed_when: false
+      failed_when: false
+
+    - name: Decide the argument list to apply
+      ansible.builtin.set_fact:
+        # role が自動付与する 2 つは常に先頭に置く
+        _auto_args: >-
+          {{ ['--served-model-name=' ~ model]
+             + (['--chat-template=/chat-templates/chat_template.jinja']
+                if (_cfg.chat_template_configmap | default('') | length > 0) else []) }}
+        _target_args: "{{ vllm_args | default(_cfg.vllm_args, true) }}"
+
+    # ---------------- 表示のみ ----------------
+    - name: Show current state
+      ansible.builtin.debug:
+        msg: |
+          ===== {{ model }} ({{ _cfg.namespace }}) =====
+
+          -- クラスタ上の現在の args --
+          {{ _live_args.stdout | default('(LLMInferenceService が見つかりません)') }}
+
+          -- inventory の vllm_args --
+          {% for a in _cfg.vllm_args | default([]) %}
+            {{ a }}
+          {% endfor %}
+
+          引数を差し替えるには -e '{"vllm_args": [...]}' を付けて再実行してください。
+          対話的に編集する場合: bash scripts/vllm-args.sh {{ model }} -i <inventory>
+      when: vllm_args is not defined
+
+    - name: Stop here when no new arguments were given
+      ansible.builtin.meta: end_play
+      when: vllm_args is not defined
+
+    # ---------------- 適用 ----------------
+    - name: Fail when the LLMInferenceService does not exist
+      ansible.builtin.fail:
+        msg: >-
+          LLMInferenceService '{{ model }}' が {{ _cfg.namespace }} にありません。
+          まず playbooks/llm_add_model.yml でデプロイしてください。
+      when: _live_args.rc != 0
+
+    - name: Patch container args
+      ansible.builtin.command:
+        argv:
+          - oc
+          - patch
+          - llminferenceservice
+          - "{{ model }}"
+          - -n
+          - "{{ _cfg.namespace }}"
+          - --type=json
+          - -p
+          - >-
+            [{"op": "replace", "path": "/spec/template/containers/0/args",
+              "value": {{ (_auto_args + _target_args) | to_json }}}]
+      register: _patch
+      changed_when: "'patched' in _patch.stdout"
+
+    - name: Show applied arguments and the inventory snippet
+      ansible.builtin.debug:
+        msg: |
+          ===== 適用しました: {{ model }} =====
+
+          {% for a in _auto_args %}
+            {{ a }}   (role が自動付与)
+          {% endfor %}
+          {% for a in _target_args %}
+            {{ a }}
+          {% endfor %}
+
+          Pod が再作成されます。状態確認:
+            oc get pods -n {{ _cfg.namespace }} -l app.kubernetes.io/name={{ model }} -w
+            oc logs -n {{ _cfg.namespace }} -l app.kubernetes.io/name={{ model }} -c main --tail=50 -f
+
+          ---------------------------------------------------------------
+          この変更は inventory には保存されていません。
+          確定する場合は components.yml の models.{{ model }} を次のように更新してください:
+
+            {{ model }}:
+              vllm_args:
+          {% for a in _target_args %}
+                - {{ a | to_json }}
+          {% endfor %}
+          ---------------------------------------------------------------
+
+    - name: Wait for rollout
+      ansible.builtin.command: >-
+        oc wait --for=condition=Ready llminferenceservice/{{ model }}
+        -n {{ _cfg.namespace }} --timeout={{ edit_args_wait | default('600') }}s
+      register: _wait
+      changed_when: false
+      failed_when: false
+      when: edit_args_wait | default('600') != '0'
+
+    - name: Report rollout result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Ready になりました' if _wait.rc | default(1) == 0
+             else 'Ready になりませんでした。上記の oc logs で起動ログを確認してください。
+                   待機を省略するには -e edit_args_wait=0 を付けます。' }}
+      when: edit_args_wait | default('600') != '0'

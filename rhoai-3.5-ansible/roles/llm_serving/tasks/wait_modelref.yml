@@ -1,0 +1,33 @@
+---
+# =============================================================================
+# Reusable task: wait_modelref — MaaSModelRef が Ready になるまで待つ
+#
+# MaaSAuthPolicy / MaaSSubscription の適用後に呼ぶこと。
+# ポリシーより先に呼ぶと Ready にならず待ち続ける。
+# Required vars: models, model_defaults, model_recipes
+# =============================================================================
+
+- name: "Wait for MaaSModelRef Ready"
+  kubernetes.core.k8s_info:
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: MaaSModelRef
+    name: "{{ item.key }}"
+    # 解決順は roles/llm_serving/tasks/main.yml と同じにすること。
+    # レシピ層を飛ばすと、レシピが namespace を指定したときに
+    # 存在しない namespace を見に行って待ち続ける。
+    namespace: >-
+      {{ (model_defaults
+          | combine(model_recipes['_fallback'], recursive=True)
+          | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
+          | combine(item.value, recursive=True)).namespace }}
+  register: _modelref_wait
+  until: >-
+    _modelref_wait is not failed and
+    (_modelref_wait.resources | default([])) | length > 0 and
+    (_modelref_wait.resources[0].status.phase | default('')) == 'Ready'
+  retries: 60
+  delay: 10
+  loop: "{{ models | dict2items }}"
+  loop_control:
+    label: "{{ item.key }}"
+  when: (item.value.state | default(model_defaults.state)) == 'present'

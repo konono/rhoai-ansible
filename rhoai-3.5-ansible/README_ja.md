@@ -355,18 +355,32 @@ oc debug node/<node-name> -- chroot /host bash -c \
 
 モデル管理は `models` 変数で一元化されています。デフォルト値は `roles/llm_serving/defaults/main.yml` の `model_defaults` で定義され、モデルごとに上書きしたいフィールドだけ `models` に記述します。
 
+**キーの命名規約**: `hf_repo` のモデル名部分を小文字化し、`.` は `-` に置き換えます（例: `Qwen/Qwen3.8-27B-FP8` → `qwen3-8-27b-fp8`）。k8s リソース名になるため小文字英数と `-` のみ使えます。キーは PVC 上のディレクトリ名、vLLM の `--served-model-name`、Keycloak グループ名 `maas-<キー>-users` に変換なしで使われるため、**一度決めたら変更しないでください**（改名すると PVC キャッシュがヒットせず再ダウンロードになります）。詳細は [docs/operations.md](docs/operations.md) を参照。
+
 ```yaml
 models:
   qwen3-06b:
     hf_repo: Qwen/Qwen3-0.6B       # (必須) HuggingFace リポジトリ名
     state: present                   # present=デプロイ, absent=削除
+    # vLLM 引数は生のリスト。role が自動付与するのは
+    # --served-model-name と --chat-template だけなので、
+    # vLLM のバージョンアップで増えたフラグも inventory だけで追従できる。
+    vllm_args:
+      - "--enable-prefix-caching"
+      - "--gpu-memory-utilization=0.90"
+      - "--max-model-len=4096"
+      - "--tool-call-parser=qwen3_coder"
+      - "--reasoning-parser=qwen3"
+      - "--enable-auto-tool-choice"
+      - '--speculative-config={"method":"ngram","num_speculative_tokens":3,"prompt_lookup_min":2,"prompt_lookup_max":4}'
     # 以下はデフォルト値があるため省略可能
     # vllm_image: vllm/vllm-openai:v0.28.0
-    # tool_call_parser: qwen3_coder
-    # reasoning_parser: ""
+    # vllm_env: {}                   # コンテナ環境変数の追加
     # chat_template_configmap: qwen3-chat-template
+    # replicas: 1
     # gpu_count: 1
-    # vllm_extra_args: ["--max-model-len=4096", "--enable-auto-tool-choice"]
+    # resources: {requests: {cpu: "500m", memory: 4Gi}, limits: {cpu: "2", memory: 8Gi}}
+    # shm_size: ""                   # tensor parallel 時は 16Gi 等
     # purge: false                   # true なら PVC 上のモデルデータも削除
 ```
 
@@ -376,12 +390,17 @@ models:
 | `state` | `present` でデプロイ、`absent` で削除 | `present` |
 | `namespace` | デプロイ先 namespace | `llm-serving` |
 | `vllm_image` | vLLM コンテナイメージ | `vllm/vllm-openai:v0.28.0` |
-| `tool_call_parser` | `--tool-call-parser` | `qwen3_coder` |
-| `reasoning_parser` | `--reasoning-parser`（空なら省略） | `""` |
-| `chat_template_configmap` | チャットテンプレート ConfigMap 名 | `qwen3-chat-template` |
+| `vllm_args` | vLLM 引数（そのまま args に渡る） | `model_defaults` 参照 |
+| `vllm_env` | コンテナ環境変数の追加（マップ） | `{}` |
+| `chat_template_configmap` | チャットテンプレート ConfigMap 名（空なら `--chat-template` を付けない） | `qwen3-chat-template` |
+| `replicas` | LLMInferenceService のレプリカ数 | `1` |
 | `gpu_count` | 要求 GPU 数 | `1` |
-| `vllm_extra_args` | vLLM 追加引数（リスト） | `["--max-model-len=4096", "--enable-auto-tool-choice"]` |
+| `resources` | CPU/メモリの requests・limits（再帰マージ） | `500m`/`4Gi` → `2`/`8Gi` |
+| `shm_size` | `/dev/shm` の emptyDir サイズ。空ならマウントしない | `""` |
+| `startup_probe_failure_threshold` / `startup_probe_period_seconds` | 起動待ちの上限 | `120` / `10` |
 | `purge` | `state: absent` 時に PVC キャッシュも削除するか | `false` |
+
+> **vLLM のフラグは名前付きキーにしていません。** `vllm_args` の内容はそのままコンテナへ渡るため、vLLM のアップグレードでフラグが増減しても inventory の編集だけで済み、role の変更は不要です。
 
 > **dict キーがモデル名になります。** K8s リソース名に使われるため RFC 1123 準拠（小文字英数字・ハイフン・ドットのみ）が必要です。
 
@@ -805,6 +824,9 @@ ansible/
 │   ├── verify.yml                # デプロイ検証 + 環境サマリー
 │   ├── manage_maas_access.yml    # MaaS アクセス管理 (ユーザー + ポリシー)
 │   ├── llm_add_model.yml         # モデル追加 (deploy + MaaS + Keycloak)
+│   ├── llm_download.yml         # モデルデータのダウンロードのみ (download_only)
+│   ├── llm_edit_args.yml        # vLLM 引数だけを即時差し替え (oc edit 相当)
+│   ├── llm_show_manifest.yml    # 適用される manifest をクラスタ無しで確認
 │   └── maas_create_apikey.yml    # API Key 発行
 ├── scripts/
 │   ├── cleanup-all.sh            # 全リソース削除

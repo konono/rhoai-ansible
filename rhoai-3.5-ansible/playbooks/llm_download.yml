@@ -1,0 +1,37 @@
+---
+# Download model data to the hf-model-cache PVC without serving it.
+#
+# GPU が空くのを待たずに大きいモデルを先に落としておきたい場合や、
+# disconnected 環境でダウンロードだけ先に通したい場合に使う。
+#
+#   uv run ansible-playbook playbooks/llm_download.yml -i inventory/<env>
+#
+# 特定のモデルだけ落とす:
+#   uv run ansible-playbook playbooks/llm_download.yml -i inventory/<env> \
+#     -e '{"models": {"qwen3-8-27b": {"hf_repo": "Qwen/Qwen3.8-27B", "state": "present"}}}'
+#
+# ここで指定するキーは、あとで components.yml の models に書くキーと完全に一致させること。
+# キャッシュ判定は /models/<キー>/config.json の存在確認で行うため、違うと再ダウンロードになる。
+# 命名規約は docs/operations.md「モデルキーの命名規約」を参照。
+#
+# site.yml 経由でも同じことができる:
+#   uv run ansible-playbook site.yml -i inventory/<env> --tags llm -e download_only=true
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  vars:
+    download_only: true
+  tasks:
+    - name: Preflight (light)
+      ansible.builtin.include_role:
+        name: preflight
+        tasks_from: light
+
+    - name: Download LLM model data only
+      ansible.builtin.include_role:
+        name: llm_serving
+      tags: [workload, llm, llm_download]
