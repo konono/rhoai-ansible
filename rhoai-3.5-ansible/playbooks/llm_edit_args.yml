@@ -81,15 +81,39 @@
 
     - name: Decide the argument list to apply
       ansible.builtin.set_fact:
-        # role が自動付与するのは --chat-template だけ（先頭に置く）。
-        # --served-model-name は KServe/llm-d の起動スクリプトが付与するため
-        # こちらでは出さない。llminferenceservice.yml.j2 と同じ条件で判定する。
-        _auto_args: >-
-          {{ ['--chat-template=/chat-templates/chat_template.jinja']
-             if ((_cfg.custom_chat_template | default('') | length > 0)
-                 or (_cfg.chat_template_configmap | default('') | length > 0))
-             else [] }}
         _target_args: "{{ vllm_args | default(_cfg.vllm_args, true) }}"
+
+    # 通常デプロイと同じテンプレートに通して args を組み立てる。
+    #
+    # ここで vllm_args をそのままパッチすると、KServe の起動スクリプトが
+    #   eval "exec vllm serve ... $@"
+    # で評価する際に bash のブレース展開を受け、
+    #   --speculative-config={"method":"mtp","num_speculative_tokens":1}
+    # が 2 つの引数に分割されて MTP が壊れる。テンプレート側はこれを避けるため
+    # 値をシングルクォートで保護している。
+    #
+    # 同じ変換をここに書き写すと二重管理になり、片方だけ直して壊れる。
+    # テンプレート自体を使えば、クォート規則も --chat-template の付与条件も
+    # 常に通常デプロイと一致する。
+    - name: Build the args with the same template as a normal deploy
+      ansible.builtin.set_fact:
+        _apply_args: >-
+          {{ (lookup('template',
+                playbook_dir ~ '/../roles/llm_serving/templates/llminferenceservice.yml.j2')
+              | from_yaml).spec.template.containers[0].args | default([]) }}
+      vars:
+        _model_name: "{{ model }}"
+        _model_cfg: "{{ _cfg | combine({'vllm_args': _target_args}) }}"
+
+    # テンプレートは「自動付与ぶん → vllm_args」の順に出すので、
+    # 末尾 _target_args 件を除いた先頭が自動付与ぶん。
+    # クォート保護で文字列が変わるため、値の一致では切り分けられない。
+    - name: Separate the auto-added arguments for display
+      ansible.builtin.set_fact:
+        _auto_args: >-
+          {{ _apply_args[:(_apply_args | length) - (_target_args | length)] }}
+        _applied_target_args: >-
+          {{ _apply_args[(_apply_args | length) - (_target_args | length):] }}
 
     # ---------------- 表示のみ ----------------
     - name: Show current state
@@ -134,7 +158,7 @@
           - -p
           - >-
             [{"op": "replace", "path": "/spec/template/containers/0/args",
-              "value": {{ (_auto_args + _target_args) | to_json }}}]
+              "value": {{ _apply_args | to_json }}}]
       register: _patch
       # oc は変更が無くても "... patched (no change)" を返すため除外する
       changed_when: "'patched' in _patch.stdout and '(no change)' not in _patch.stdout"
@@ -147,7 +171,7 @@
           {% for a in _auto_args %}
             {{ a }}   (role が自動付与)
           {% endfor %}
-          {% for a in _target_args %}
+          {% for a in _applied_target_args %}
             {{ a }}
           {% endfor %}
 
