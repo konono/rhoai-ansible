@@ -7,6 +7,10 @@
 #   ansible-playbook playbooks/verify.yml -i inventory/myenv --tags platform
 #   ansible-playbook playbooks/verify.yml -i inventory/myenv -e install_ogx=false  # OGX スキップ
 #
+# download_only=true でデプロイした場合は LLMInferenceService を作っていないため、
+# LIS / MaaSModelRef / Subscription の検証はスキップされる。
+#   ansible-playbook playbooks/verify.yml -i inventory/myenv -e download_only=true
+#
 - hosts: localhost
   connection: local
   gather_facts: false
@@ -272,6 +276,7 @@
         label: "{{ item.key }}"
       when:
         - install_llm_serving | default(true)
+        - not (download_only | default(false) | bool)
         - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
       tags: [workload, llm]
 
@@ -304,6 +309,7 @@
         label: "{{ item.key }}"
       when:
         - install_maas_resources | default(true)
+        - not (download_only | default(false) | bool)
         - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
       tags: [workload, maas]
 
@@ -342,6 +348,9 @@
       when:
         - install_maas_resources | default(true)
         - install_keycloak | default(true)
+        # download_only では MaaSModelRef が無く Subscription は Failed のまま。
+        # LLMInferenceService を作れば解消するので、ここでは検証しない。
+        - not (download_only | default(false) | bool)
         - _expected_models | length > 0
       tags: [workload, maas]
 

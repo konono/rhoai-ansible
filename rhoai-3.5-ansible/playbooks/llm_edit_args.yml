@@ -81,12 +81,39 @@
 
     - name: Decide the argument list to apply
       ansible.builtin.set_fact:
-        # role が自動付与する 2 つは常に先頭に置く
-        _auto_args: >-
-          {{ ['--served-model-name=' ~ model]
-             + (['--chat-template=/chat-templates/chat_template.jinja']
-                if (_cfg.chat_template_configmap | default('') | length > 0) else []) }}
         _target_args: "{{ vllm_args | default(_cfg.vllm_args, true) }}"
+
+    # 通常デプロイと同じテンプレートに通して args を組み立てる。
+    #
+    # ここで vllm_args をそのままパッチすると、KServe の起動スクリプトが
+    #   eval "exec vllm serve ... $@"
+    # で評価する際に bash のブレース展開を受け、
+    #   --speculative-config={"method":"mtp","num_speculative_tokens":1}
+    # が 2 つの引数に分割されて MTP が壊れる。テンプレート側はこれを避けるため
+    # 値をシングルクォートで保護している。
+    #
+    # 同じ変換をここに書き写すと二重管理になり、片方だけ直して壊れる。
+    # テンプレート自体を使えば、クォート規則も --chat-template の付与条件も
+    # 常に通常デプロイと一致する。
+    - name: Build the args with the same template as a normal deploy
+      ansible.builtin.set_fact:
+        _apply_args: >-
+          {{ (lookup('template',
+                playbook_dir ~ '/../roles/llm_serving/templates/llminferenceservice.yml.j2')
+              | from_yaml).spec.template.containers[0].args | default([]) }}
+      vars:
+        _model_name: "{{ model }}"
+        _model_cfg: "{{ _cfg | combine({'vllm_args': _target_args}) }}"
+
+    # テンプレートは「自動付与ぶん → vllm_args」の順に出すので、
+    # 末尾 _target_args 件を除いた先頭が自動付与ぶん。
+    # クォート保護で文字列が変わるため、値の一致では切り分けられない。
+    - name: Separate the auto-added arguments for display
+      ansible.builtin.set_fact:
+        _auto_args: >-
+          {{ _apply_args[:(_apply_args | length) - (_target_args | length)] }}
+        _applied_target_args: >-
+          {{ _apply_args[(_apply_args | length) - (_target_args | length):] }}
 
     # ---------------- 表示のみ ----------------
     - name: Show current state
@@ -131,9 +158,10 @@
           - -p
           - >-
             [{"op": "replace", "path": "/spec/template/containers/0/args",
-              "value": {{ (_auto_args + _target_args) | to_json }}}]
+              "value": {{ _apply_args | to_json }}}]
       register: _patch
-      changed_when: "'patched' in _patch.stdout"
+      # oc は変更が無くても "... patched (no change)" を返すため除外する
+      changed_when: "'patched' in _patch.stdout and '(no change)' not in _patch.stdout"
 
     - name: Show applied arguments and the inventory snippet
       ansible.builtin.debug:
@@ -143,7 +171,7 @@
           {% for a in _auto_args %}
             {{ a }}   (role が自動付与)
           {% endfor %}
-          {% for a in _target_args %}
+          {% for a in _applied_target_args %}
             {{ a }}
           {% endfor %}
 
@@ -165,11 +193,11 @@
     - name: Wait for rollout
       ansible.builtin.command: >-
         oc wait --for=condition=Ready llminferenceservice/{{ model }}
-        -n {{ _cfg.namespace }} --timeout={{ edit_args_wait | default('600') }}s
+        -n {{ _cfg.namespace }} --timeout={{ edit_args_wait | default(600) | int }}s
       register: _wait
       changed_when: false
       failed_when: false
-      when: edit_args_wait | default('600') != '0'
+      when: (edit_args_wait | default(600) | int) != 0
 
     - name: Report rollout result
       ansible.builtin.debug:
@@ -177,4 +205,4 @@
           {{ 'Ready になりました' if _wait.rc | default(1) == 0
              else 'Ready になりませんでした。上記の oc logs で起動ログを確認してください。
                    待機を省略するには -e edit_args_wait=0 を付けます。' }}
-      when: edit_args_wait | default('600') != '0'
+      when: (edit_args_wait | default(600) | int) != 0

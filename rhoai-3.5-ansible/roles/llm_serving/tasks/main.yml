@@ -160,37 +160,98 @@
               - prefix: "hf://"
       when: _csc_existing.resources | length == 0
     
-    - name: Read chat template file
-      ansible.builtin.slurp:
-        src: "{{ role_path }}/files/chat_template.jinja"
-      register: _chat_template
-    
-    # chat_template_configmap は model_recipes でも指定できるため、
-    # LLMInferenceService と同じ解決順で求める。
-    # models の値だけを見ていると、レシピが独自名を指定した場合に
-    # ConfigMap が作られず Pod が起動できない。
-    # 逆にレシピが "" を指定していても不要な ConfigMap を作ってしまう。
-    - name: Resolve chat template ConfigMap name per model
+    # chat template の ConfigMap は custom_chat_template を指定したモデルにだけ作る。
+    # 以前は role 同梱の qwen3 用テンプレートを全モデルへ無条件に差し込んでいたが、
+    # それは特定モデルのテンプレート不具合に対する回避策であり、既定で全モデルに
+    # 適用すると本来正しいテンプレートを持つモデルまで上書きしてしまう。
+    #
+    # custom_chat_template / chat_template_configmap は model_recipes でも
+    # 指定できるため、LLMInferenceService と同じ解決順で求める。
+    - name: Resolve chat template sources per model
       ansible.builtin.set_fact:
-        _chat_template_configmaps: >-
-          {{ (_chat_template_configmaps | default([]))
-             + [ (model_defaults
-                  | combine(model_recipes['_fallback'], recursive=True)
-                  | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
-                  | combine(item.value, recursive=True)).chat_template_configmap
-                 | default('') ] }}
+        _chat_template_specs: >-
+          {{ (_chat_template_specs | default([]))
+             + [ {'name': (_cfg.chat_template_configmap | default(''))
+                          if (_cfg.chat_template_configmap | default('')) | length > 0
+                          else (item.key ~ '-chat-template'),
+                  'src': _cfg.custom_chat_template | default('')} ] }}
+      vars:
+        _cfg: >-
+          {{ model_defaults
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
+             | combine(item.value, recursive=True) }}
       loop: "{{ models | dict2items }}"
       loop_control:
         label: "{{ item.key }}"
       # absent のモデルの ConfigMap は不要（render.py も present のみ生成する）
-      when: (item.value.state | default(model_defaults.state)) == 'present'
+      when:
+        - (item.value.state | default(model_defaults.state)) == 'present'
+        # custom_chat_template を指定したモデルだけが ConfigMap の作成対象。
+        # chat_template_configmap だけ指定された場合は、利用者が自分で
+        # 作成済みの ConfigMap をマウントするだけなので作らない。
+        - (_cfg.custom_chat_template | default('')) | length > 0
 
-    - name: Collect unique chat template ConfigMap names
+    # 「作成対象」(_chat_template_specs) とは別に、「present なモデルが参照して
+    # いる ConfigMap 名」を集める。chat_template_configmap だけを指定して
+    # 利用者が自分で作った ConfigMap をマウントする使い方があり、これを
+    # prune で消してはいけない。
+    - name: Collect chat template ConfigMap names referenced by present models
       ansible.builtin.set_fact:
-        _chat_template_configmaps: >-
-          {{ _chat_template_configmaps | default([])
-             | select('ne', '') | unique | list }}
-    
+        _chat_template_refs: >-
+          {{ (_chat_template_refs | default([]))
+             + [ (_cfg.chat_template_configmap | default(''))
+                 if (_cfg.chat_template_configmap | default('')) | length > 0
+                 else (item.key ~ '-chat-template') ] }}
+      vars:
+        _cfg: >-
+          {{ model_defaults
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
+             | combine(item.value, recursive=True) }}
+      loop: "{{ models | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - (item.value.state | default(model_defaults.state)) == 'present'
+        - ((_cfg.custom_chat_template | default('')) | length > 0)
+          or ((_cfg.chat_template_configmap | default('')) | length > 0)
+
+    - name: Check that the referenced chat templates exist
+      ansible.builtin.stat:
+        path: "{{ inventory_dir }}/chat_templates/{{ item.src }}.jinja"
+      register: _ct_stat
+      delegate_to: localhost
+      loop: "{{ _chat_template_specs | default([]) | unique }}"
+      loop_control:
+        label: "{{ item.src }}"
+
+    - name: Fail on an unknown chat template name
+      ansible.builtin.fail:
+        msg: >-
+          custom_chat_template: {{ item.item.src }} に対応するファイルが
+          {{ inventory_dir }}/chat_templates/{{ item.item.src }}.jinja にありません。
+          inventory/sample/chat_templates/ からコピーするか、自前のものを置いてください。
+          現在利用可能:
+          {{ lookup('fileglob', inventory_dir ~ '/chat_templates/*.jinja', wantlist=True)
+             | map('basename') | map('regex_replace', '\.jinja$', '') | join(', ') | default('(なし)', true) }}
+      loop: "{{ _ct_stat.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.src }}"
+      when: not item.stat.exists
+
+    # lookup('file') は末尾の改行を落とすため、render.py が出力する
+    # ConfigMap と内容が 1 バイトずれる。slurp + b64decode ならファイルを
+    # そのまま読めるので、両経路の生成物を一致させられる。
+    - name: Read the chat template files
+      ansible.builtin.slurp:
+        src: "{{ inventory_dir }}/chat_templates/{{ item.src }}.jinja"
+      register: _chat_template_contents
+      delegate_to: localhost
+      loop: "{{ _chat_template_specs | default([]) | unique }}"
+      loop_control:
+        label: "{{ item.src }}.jinja"
+
     - name: Apply chat template ConfigMaps
       kubernetes.core.k8s:
         state: present
@@ -198,12 +259,36 @@
           apiVersion: v1
           kind: ConfigMap
           metadata:
-            name: "{{ item }}"
+            name: "{{ item.item.name }}"
             namespace: "{{ llm_namespace }}"
           data:
-            chat_template.jinja: "{{ _chat_template.content | b64decode }}"
-      loop: "{{ _chat_template_configmaps }}"
-    
+            chat_template.jinja: "{{ item.content | b64decode }}"
+      loop: "{{ _chat_template_contents.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.name }} <- {{ item.item.src }}.jinja"
+
+    # モデルを absent にしたり custom_chat_template を外すと、作成済みの
+    # ConfigMap がクラスタに残り続ける（作るだけで消していなかった。実機で確認）。
+    # 対象は inventory の models から導ける名前だけに限定するので、
+    # 無関係な ConfigMap を巻き込むことはない。
+    - name: Collect chat template ConfigMap names that are no longer needed
+      ansible.builtin.set_fact:
+        _stale_chat_template_cms: >-
+          {{ (models | default({}) | dict2items
+              | map(attribute='key') | map('regex_replace', '$', '-chat-template')
+              | list)
+             | difference(_chat_template_refs | default([]))
+             | difference(_chat_template_specs | default([]) | map(attribute='name') | list) }}
+
+    - name: Remove chat template ConfigMaps that are no longer needed
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ item }}"
+        namespace: "{{ llm_namespace }}"
+      loop: "{{ _stale_chat_template_cms | default([]) }}"
+
     - name: Create llm-serving-sa ServiceAccount
       kubernetes.core.k8s:
         state: present

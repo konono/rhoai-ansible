@@ -6,6 +6,7 @@ RHOAI / MaaS 環境の管理者が日々行う作業の手順。
 
 - デプロイ後の一般的な運用操作: [operations.md](operations.md)
 - 障害時の切り分け: [troubleshooting.md](troubleshooting.md)
+- オフライン実行環境の構築・移行: [offline-environment.md](offline-environment.md)
 
 ---
 
@@ -102,6 +103,9 @@ cat .credentials/ta-suzuki.password
 > Keycloak 側の所属も解除される。解除対象は `keycloak_groups` に定義済みのグループだけで、
 > Keycloak 上で手動作成した管理外のグループには触れない。
 > 解除を止めたい場合は `-e keycloak_prune_group_membership=false` を付ける。
+>
+> **`groups` を書いていないユーザーは解除対象外**（「所属ゼロ」ではなく「管理対象外」の扱い）。
+> 所属を全部外したい場合は `groups: []` と明示する。書き忘れで全解除されるのを避けるため。
 >
 > **ユーザー自体は inventory から削除しても消えない。** 削除は [2.4](#24-ユーザーを無効化削除する) を参照。
 
@@ -387,7 +391,8 @@ models:
     state: present
 
     # vLLM 引数はここに生の文字列で書く。
-    # role が自動付与するのは --served-model-name と --chat-template だけなので、
+    # role が自動付与するのは --chat-template だけ
+    # (custom_chat_template を指定したモデルのみ) なので、
     # vLLM のバージョンアップでフラグが増減してもここを直すだけでよい。
     # 使えるフラグの確認:
     #   oc run -it --rm vllm-help --image=vllm/vllm-openai:v0.28.0 -- vllm serve --help
@@ -561,7 +566,7 @@ bash scripts/vllm-args.sh qwen3-8-27b -i inventory/<env>
 ```
 
 1. 稼働中の LLMInferenceService から現在の引数を取得する
-2. `--served-model-name` と `--chat-template`（role が自動付与する2つ）を除いた一覧を `$EDITOR` で開く
+2. `--chat-template`（role が自動付与する唯一の引数）を除いた一覧を `$EDITOR` で開く
 3. 保存して閉じると適用され、Pod が再作成される
 4. Ready を待ち、**inventory に貼るスニペット**を表示する
 
@@ -864,27 +869,63 @@ for p in d['items']:
 | MaaSModelRef が Pending のまま | MaaSAuthPolicy / MaaSSubscription が未適用 | `playbooks/manage_maas_access.yml` を実行する |
 | transformers の `... is part of ...InitKwargs, but not documented` | 単なる警告（stderr に出るだけ） | 無視してよい |
 
-### Qwen3.8-27B-FP8 の MTP 診断 (B1、読み取り専用)
+### 7.x 推論の疎通と MTP の動作確認
 
-クラスタにログインした端末で実行します。デフォルトは `llm-serving/qwen3-8-27b-fp8` です。
+`playbooks/verify.yml` は「リソースが Ready か」しか見ないため、
+**Ready なのに推論が返らない**、**speculative decoding を設定したのに効いていない**
+は検出できません。実際にリクエストを流して確認する専用 playbook を使います。
 
 ```bash
-python3 scripts/diagnose-mtp.py
-# 名前や namespace が異なる場合:
-python3 scripts/diagnose-mtp.py <model-key> --namespace <namespace>
+# present な全モデルに推論を投げ、MTP の受理率まで出す
+uv run ansible-playbook playbooks/llm_verify_inference.yml -i inventory/<env>
+
+# モデルを指定
+... -e model=qwen3-5-9b
+
+# MaaS Gateway 経由で認証込みの end-to-end を確認する
+... -e inference_via=maas -e maas_api_user=admin1
+
+# 受理率の測定精度を上げる
+... -e inference_requests=10 -e inference_max_tokens=1024
 ```
 
-全 Pod を個別に調べ、① `speculative-config` が Pod の `args` に JSON として
-渡ったか、②末尾 500 行の起動ログに関連エラーがあるか、③ Pod 内の
-`localhost:8000/metrics` に HTTPS (失敗時は HTTP) で到達でき、
-`spec_decode` の draft/accepted token 累積カウンタが正の値かを表示します。
-ログ本文、環境変数、Secret、metrics のラベルは表示しません。
+出力例:
 
-①が正常でも vLLM が受理したとは限りません。②の関連行が 0 件でも
-起動ログが末尾 500 行から外れた可能性があります。③のカウンタが 0 なら
-リクエストを送った後に再実行し、前後の値を比較します。このスクリプトは
-1 回の測定値を表示し、増加自体は判定しません。HTTP/HTTPS の取得失敗や Pod が 0 件の場合は
-「MTP 無効」と判断せず、接続・Pod 状態を先に確認してください。
+```
+model            : qwen3-5-9b (llm-serving)
+requests         : 3 x 512 tokens (via direct)
+generated tokens : 1536
+draft tokens     : 828
+accepted tokens  : 708
+acceptance rate  : 0.855
+MTP: 有効 (ドラフトが生成され検証されています)
+```
+
+判定のしかた:
+
+| 結果 | 意味 |
+|---|---|
+| `draft tokens` が 0 | MTP が効いていない。`--speculative-config` が vLLM に届いていない |
+| `acceptance rate` が極端に低い | ドラフトがほぼ棄却されている。`num_speculative_tokens` を見直す |
+| `generated tokens` が 0 | 推論自体が返っていない。Pod のログを見る |
+
+CI や定期確認で閾値を割ったら落としたい場合は `-e inference_min_acceptance_rate=0.3`
+のように指定します（既定 0 = 判定しない）。
+
+**経路の違い**
+
+- `inference_via=direct` (既定): Pod 内から `localhost:8000` を叩く。外部 DNS も
+  API キーも不要なので、Route53 未設定の検証クラスタでも動く。MaaS の認可は通らない
+- `inference_via=maas`: API キー発行 → Gateway 経由で推論 → キー失効まで実施する。
+  Gateway Service の ClusterIP に `curl --resolve` で当てるため、外部 DNS 不要で
+  本番と同じ TLS SNI / ルーティングを通る
+
+**reasoning モデルでの注意**
+
+Qwen3 系は既定で思考に数百トークン使うため、`max_tokens` が小さいと
+`finish_reason=length` のまま `content` が空で返ります。この playbook は既定で
+`chat_template_kwargs={"enable_thinking": false}` を送って短く確定的に応答させます。
+thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を指定します。
 
 ---
 

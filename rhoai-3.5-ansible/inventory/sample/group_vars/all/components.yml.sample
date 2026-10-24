@@ -110,7 +110,12 @@ models:
   #     requests: {cpu: "500m", memory: 4Gi}
   #     limits:   {cpu: "2",    memory: 8Gi}
   #   shm_size: ""                     # tensor parallel 時は 16Gi 等 (NCCL 共有メモリ)
-  #   chat_template_configmap: ""      # 空ならモデル同梱の chat template を使う
+  #   custom_chat_template: ""         # 既定は空 = モデル同梱の chat template を使う。
+  #                                    # 差し替えたい場合だけ名前を書く。実体は
+  #                                    #   inventory/<env>/chat_templates/<名前>.jinja
+  #                                    # 例) custom_chat_template: qwen3
+  #   chat_template_configmap: ""      # 作成する ConfigMap 名の上書き
+  #                                    # (既定: <モデル名>-chat-template)
   #   startup_probe_failure_threshold: 120   # x periodSeconds 秒まで起動を待つ
   #   purge: false                     # state: absent 時に PVC のデータも消すか
 
@@ -126,6 +131,8 @@ keycloak_realm: maas
 # groups からグループ名を外すと Keycloak 側の所属も解除される
 # (解除対象は keycloak_groups に定義済みのグループのみ。
 #  止めたい場合は -e keycloak_prune_group_membership=false)。
+# groups 自体を書かないユーザーは解除対象外（管理対象外の扱い）。
+# 所属を全部外すときは groups: [] と明示する。
 keycloak_users:
   - username: admin1
     email: admin1@example.com

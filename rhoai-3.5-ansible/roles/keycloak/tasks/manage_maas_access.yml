@@ -247,8 +247,12 @@
     label: "{{ item.0.item.item.username }} -x- {{ item.1.name }}"
   when:
     - keycloak_prune_group_membership | bool
+    # groups を書いていないユーザーは「所属ゼロ」ではなく「管理対象外」とみなす。
+    # default([]) で空リスト扱いにすると、groups の書き忘れだけで
+    # そのユーザーの所属が全部消える。
+    - item.0.item.item.groups is defined
     - item.1.name in (keycloak_groups | default({}))
-    - item.1.name not in (item.0.item.item.groups | default([]))
+    - item.1.name not in item.0.item.item.groups
   failed_when: false
 
 # ==================== MaaS Policies ====================
@@ -276,6 +280,53 @@
     oc apply --server-side --force-conflicts -f {{ ansible_root }}/.maas-policies-generated.yaml
   register: _maas_policy_apply
   changed_when: "'configured' in _maas_policy_apply.stdout or 'created' in _maas_policy_apply.stdout"
+
+# absent にしたモデルを参照する AuthPolicy / Subscription はテンプレートから
+# 消えるが、oc apply は manifest に無いリソースを削除しないので、
+# 古い modelRefs を持ったまま Failed 状態で残り続ける（実機で発生）。
+# 生成物に含まれないものを削除して追従させる。
+- name: Collect names of generated MaaS policies
+  ansible.builtin.set_fact:
+    _generated_maas_policies: >-
+      {{ (lookup('file', ansible_root ~ '/.maas-policies-generated.yaml')
+          | from_yaml_all | list)
+         | selectattr('kind', 'defined')
+         | selectattr('kind', 'in', ['MaaSAuthPolicy', 'MaaSSubscription'])
+         | map(attribute='metadata.name') | list }}
+
+# 削除対象は「この role が作ったもの」だけに限定する。
+# ラベルで絞らないと、operator が作ったものや運用者が手で作ったものまで
+# 毎回消してしまう。ラベルは maas-policies.yml.j2 が付与している。
+#
+# 注: このラベル導入より前に作られたポリシーにはラベルが無いため、
+# ここでは拾えない。その世代の残骸は一度だけ手で削除する:
+#   oc get maasauthpolicy,maassubscription -n models-as-a-service
+#   oc delete <kind>/<name> -n models-as-a-service
+- name: Find existing MaaS policies managed by this role
+  kubernetes.core.k8s_info:
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: "{{ item }}"
+    namespace: models-as-a-service
+    label_selectors:
+      - "app.kubernetes.io/managed-by=ansible-maas-access"
+  loop:
+    - MaaSAuthPolicy
+    - MaaSSubscription
+  register: _existing_maas_policies
+
+- name: Delete MaaS policies that are no longer generated
+  kubernetes.core.k8s:
+    state: absent
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: "{{ item.0.item }}"
+    name: "{{ item.1.metadata.name }}"
+    namespace: models-as-a-service
+  loop: >-
+    {{ _existing_maas_policies.results | default([])
+       | subelements('resources', skip_missing=true) }}
+  loop_control:
+    label: "{{ item.0.item }}/{{ item.1.metadata.name }}"
+  when: item.1.metadata.name not in _generated_maas_policies
 
 - name: Sync complete
   ansible.builtin.debug:

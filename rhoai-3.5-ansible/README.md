@@ -376,7 +376,7 @@ models:
     hf_repo: Qwen/Qwen3-0.6B       # (required) HuggingFace repository name
     state: present                   # present=deploy, absent=remove
     # vLLM arguments are a raw list — the role only auto-adds
-    # --served-model-name and --chat-template, so new vLLM flags
+    # --chat-template (only when custom_chat_template is set), so new vLLM flags
     # can be adopted without changing the role.
     vllm_args:
       - "--enable-prefix-caching"
@@ -389,7 +389,9 @@ models:
     # The following have defaults and can be omitted
     # vllm_image: vllm/vllm-openai:v0.28.0
     # vllm_env: {}                   # extra container env vars
-    # chat_template_configmap: qwen3-chat-template
+    # custom_chat_template: ""      # empty = use the model's bundled chat template
+    #                                # a name loads inventory/<env>/chat_templates/<name>.jinja
+    # chat_template_configmap: ""    # override the generated ConfigMap name
     # replicas: 1
     # gpu_count: 1
     # resources: {requests: {cpu: "500m", memory: 4Gi}, limits: {cpu: "2", memory: 8Gi}}
@@ -405,7 +407,8 @@ models:
 | `vllm_image` | vLLM container image | `vllm/vllm-openai:v0.28.0` |
 | `vllm_args` | vLLM arguments, passed through verbatim | see `model_defaults` |
 | `vllm_env` | Extra container environment variables (map) | `{}` |
-| `chat_template_configmap` | Chat template ConfigMap name (empty = no `--chat-template`) | `qwen3-chat-template` |
+| `custom_chat_template` | Chat template to inject, loaded from `inventory/<env>/chat_templates/<name>.jinja`. Empty keeps the model's bundled template and omits `--chat-template` | `""` |
+| `chat_template_configmap` | Override the generated ConfigMap name | `<model>-chat-template` |
 | `replicas` | LLMInferenceService replicas | `1` |
 | `gpu_count` | Number of GPUs requested | `1` |
 | `resources` | CPU/memory requests and limits (merged recursively) | `500m`/`4Gi` → `2`/`8Gi` |
@@ -894,6 +897,8 @@ ansible/
 │   └── observability/            # Monitoring / Dashboards
 ├── docs/
 │   ├── operations.md             # Operations guide (add models, user management, etc.)
+│   ├── daily-operations.md       # Day-to-day request handling (users, quota, models)
+│   ├── offline-environment.md    # Building / migrating the offline execution environment
 │   └── troubleshooting.md        # Troubleshooting
 ├── vendor/                       # Disconnected dependencies (gitignored)
 │   ├── wheels/                   # Python wheels
@@ -1003,4 +1008,6 @@ The roles use these removal steps:
 | Document | Contents |
 |---|---|
 | [docs/operations.md](docs/operations.md) | Operations guide — model addition procedures, user/group management, MaaS access control, API Key issuance, quota configuration, deletion procedures |
+| [docs/daily-operations.md](docs/daily-operations.md) | Day-to-day operations — handling user requests: add/disable users, password reset, quota changes, model add/swap/remove, API key issuance, Keycloak admin recovery, where secrets live |
+| [docs/offline-environment.md](docs/offline-environment.md) | Offline execution environment — asset layout, building from scratch, migrating from a running deployment, venv path rewriting, distributing updates with pack/unpack |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Troubleshooting — past incident examples, pre-deployment checklist, monitoring methods, failure recovery flows, resource health check commands, disconnected environment considerations |

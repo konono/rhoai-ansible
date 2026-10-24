@@ -1,0 +1,140 @@
+---
+# roles/llm_serving/tasks/verify_inference.yml
+# 1 モデルに対して実際に推論を投げ、vLLM の /metrics 差分から
+# speculative decoding (MTP) の受理率を算出する。
+#
+# playbooks/llm_verify_inference.yml から呼ばれる。
+# 必要な変数: _model_name, _namespace
+#
+# verify.yml は「リソースが Ready か」しか見ないため、
+#   - Ready なのに推論が返らない
+#   - --speculative-config を書いたのに vLLM に届いておらず MTP が効いていない
+# を検出できない。ここでは実トラフィックを流して両方を確認する。
+
+- name: "Reset per-model facts ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _vi_ready_pods: []
+    _vi_pod: ""
+
+- name: "Find Running serving pods ({{ _model_name }})"
+  kubernetes.core.k8s_info:
+    kind: Pod
+    namespace: "{{ _namespace }}"
+    label_selectors:
+      - "app.kubernetes.io/name={{ _model_name }}"
+      - "app.kubernetes.io/part-of=llminferenceservice"
+    field_selectors:
+      - status.phase=Running
+  register: _vi_pods
+
+- name: "Keep only Ready pods ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _vi_ready_pods: "{{ _vi_ready_pods + [item.metadata.name] }}"
+  loop: "{{ _vi_pods.resources | default([]) }}"
+  loop_control:
+    label: "{{ item.metadata.name }}"
+  when: >-
+    item.status.conditions | default([])
+    | selectattr('type', 'equalto', 'Ready')
+    | selectattr('status', 'equalto', 'True')
+    | list | length > 0
+
+- name: "Fail when no Ready pod serves the model ({{ _model_name }})"
+  ansible.builtin.fail:
+    msg: >-
+      {{ _model_name }} の Ready な Pod が namespace {{ _namespace }} に
+      見つかりません。先に
+      `ansible-playbook playbooks/verify.yml -i <inv> --tags llm`
+      で状態を確認してください。
+  when: _vi_ready_pods | length == 0
+
+- name: "Pick a serving pod ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _vi_pod: "{{ _vi_ready_pods | first }}"
+
+- name: "Scrape vLLM metrics before inference ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc exec -n {{ _namespace }} {{ _vi_pod }} -c main --
+    curl -skfS https://localhost:8000/metrics
+  register: _vi_before
+  changed_when: false
+
+- name: "Send inference requests directly to vLLM ({{ _model_name }})"
+  ansible.builtin.include_tasks: verify_inference_direct.yml
+  when: inference_via == 'direct'
+
+- name: "Send inference requests through the MaaS Gateway ({{ _model_name }})"
+  ansible.builtin.include_tasks: verify_inference_maas.yml
+  when: inference_via == 'maas'
+
+- name: "Fail on an unknown inference_via value"
+  ansible.builtin.fail:
+    msg: "inference_via は direct か maas です (指定値: {{ inference_via }})"
+  when: inference_via not in ['direct', 'maas']
+
+- name: "Scrape vLLM metrics after inference ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc exec -n {{ _namespace }} {{ _vi_pod }} -c main --
+    curl -skfS https://localhost:8000/metrics
+  register: _vi_after
+  changed_when: false
+
+# Prometheus テキスト形式から counter を 1 つ取り出す。
+# HELP/TYPE 行には `{` が無いので、`{` を要求するだけでサンプル行に絞れる。
+- name: "Compute metric deltas ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _vi_d_drafts: "{{ (_vi_after.stdout | regex_findall(_re_drafts) | first | default('0') | float)
+                      - (_vi_before.stdout | regex_findall(_re_drafts) | first | default('0') | float) }}"
+    _vi_d_draft_tokens: "{{ (_vi_after.stdout | regex_findall(_re_draft_tokens) | first | default('0') | float)
+                            - (_vi_before.stdout | regex_findall(_re_draft_tokens) | first | default('0') | float) }}"
+    _vi_d_accepted: "{{ (_vi_after.stdout | regex_findall(_re_accepted) | first | default('0') | float)
+                        - (_vi_before.stdout | regex_findall(_re_accepted) | first | default('0') | float) }}"
+    _vi_d_generated: "{{ (_vi_after.stdout | regex_findall(_re_generated) | first | default('0') | float)
+                         - (_vi_before.stdout | regex_findall(_re_generated) | first | default('0') | float) }}"
+  vars:
+    _re_drafts: 'vllm:spec_decode_num_drafts_total\{[^}]*\}\s+([0-9.eE+-]+)'
+    _re_draft_tokens: 'vllm:spec_decode_num_draft_tokens_total\{[^}]*\}\s+([0-9.eE+-]+)'
+    _re_accepted: 'vllm:spec_decode_num_accepted_tokens_total\{[^}]*\}\s+([0-9.eE+-]+)'
+    _re_generated: 'vllm:generation_tokens_total\{[^}]*\}\s+([0-9.eE+-]+)'
+
+# 受理率 = 受理されたドラフトトークン / 生成されたドラフトトークン。
+# MTP が効いていなければ draft tokens が 0 のままなのでゼロ除算を避ける。
+- name: "Compute MTP acceptance rate ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _vi_acceptance: >-
+      {{ 0.0 if (_vi_d_draft_tokens | float) <= 0
+         else ((_vi_d_accepted | float) / (_vi_d_draft_tokens | float)) | round(3) }}
+
+- name: "Inference verification result ({{ _model_name }})"
+  ansible.builtin.debug:
+    msg:
+      - "model            : {{ _model_name }} ({{ _namespace }})"
+      - "pod              : {{ _vi_pod }}"
+      - "requests         : {{ inference_requests }} x {{ inference_max_tokens }} tokens (via {{ inference_via }})"
+      - "generated tokens : {{ _vi_d_generated | float | int }}"
+      - "spec drafts      : {{ _vi_d_drafts | float | int }}"
+      - "draft tokens     : {{ _vi_d_draft_tokens | float | int }}"
+      - "accepted tokens  : {{ _vi_d_accepted | float | int }}"
+      - "acceptance rate  : {{ _vi_acceptance }}"
+      - "{{ 'MTP: 有効 (ドラフトが生成され検証されています)'
+           if (_vi_d_draft_tokens | float) > 0
+           else 'MTP: 無効 — draft tokens が 0。--speculative-config が vLLM に届いていません' }}"
+
+- name: "Assert the model actually generated tokens ({{ _model_name }})"
+  ansible.builtin.assert:
+    that:
+      - (_vi_d_generated | float) > 0
+    fail_msg: >-
+      {{ _model_name }} はリクエストを受けたのにトークンを生成していません。
+      `oc logs -n {{ _namespace }} {{ _vi_pod }}` を確認してください。
+    quiet: true
+
+- name: "Assert MTP acceptance rate ({{ _model_name }})"
+  ansible.builtin.assert:
+    that:
+      - (_vi_acceptance | float) >= (inference_min_acceptance_rate | float)
+    fail_msg: >-
+      MTP の受理率 {{ _vi_acceptance }} が閾値
+      {{ inference_min_acceptance_rate }} を下回りました。
+    quiet: true
+  when: inference_min_acceptance_rate | float > 0

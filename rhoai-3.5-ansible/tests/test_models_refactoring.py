@@ -48,7 +48,8 @@ MODEL_DEFAULTS = {
     "namespace": "llm-serving",
     "state": "present",
     "vllm_image": "vllm/vllm-openai:v0.28.0",
-    "chat_template_configmap": "qwen3-chat-template",
+    "custom_chat_template": "",
+    "chat_template_configmap": "",
     "replicas": 1,
     "gpu_count": 1,
     "vllm_args": [
@@ -88,6 +89,9 @@ def make_jinja_env(template_dir):
     env.filters["combine"] = combine_recursive
     env.filters["to_json"] = json.dumps
     env.filters["default"] = lambda val, d="": val if val else d
+    # Ansible が提供する `search` テスト（re.search 相当）。
+    # llminferenceservice.yml.j2 が vllm_args のクォート要否判定に使う。
+    env.tests["search"] = lambda val, pattern: re.search(pattern, str(val)) is not None
     return env
 
 
@@ -105,6 +109,7 @@ class TestDefaultsFile(unittest.TestCase):
             "namespace",
             "state",
             "vllm_image",
+            "custom_chat_template",
             "chat_template_configmap",
             "gpu_count",
             "vllm_env",
@@ -311,16 +316,21 @@ class TestMaasPoliciesTemplate(unittest.TestCase):
         self.assertIn("ClusterRoleBinding", kinds)
 
     def test_all_absent(self):
-        """全モデル absent の場合、admin-auth-policy + RBAC のみ"""
+        """全モデル absent の場合、admin-auth-policy は生成しない
+
+        以前は modelRefs が空の admin-auth-policy を出していたが、実機で
+        `spec.modelRefs: Invalid value: "null"` となり apply が落ちた。
+        参照先が 1 つも無いポリシーには意味が無いので出力しない。
+        """
         models = {
             "qwen3-06b": {"hf_repo": "Qwen/Qwen3-0.6B", "state": "absent"},
             "qwen3-4b": {"hf_repo": "Qwen/Qwen3-4B", "state": "absent"},
         }
         docs = self._render(models)
-        # admin-auth-policy (1) + ClusterRole (1) + ClusterRoleBinding all-groups (1) = 3
-        self.assertEqual(len(docs), 3)
+        # ClusterRole (1) + ClusterRoleBinding all-groups (1) = 2
+        self.assertEqual(len(docs), 2)
         names = [d["metadata"]["name"] for d in docs]
-        self.assertIn("admin-auth-policy", names)
+        self.assertNotIn("admin-auth-policy", names)
         self.assertIn("maas-model-access", names)
         self.assertIn("maas-model-access-all-groups", names)
 
@@ -466,10 +476,19 @@ class TestLLMInferenceServiceTemplate(unittest.TestCase):
         doc = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B"})
         self.assertEqual(doc["spec"]["model"]["uri"], "pvc://hf-model-cache/qwen3-4b")
 
-    def test_served_model_name(self):
+    def test_served_model_name_is_not_set_by_us(self):
+        """--served-model-name は KServe が付けるので template では出さない
+
+        KServe の wrapper が `--served-model-name <name>
+        publishers/<ns>/models/<name>` を自動で付与する。こちらでも付けると
+        重複指定になり、実機で vLLM の起動引数が二重になっていた。
+        """
         doc = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B"})
         args = doc["spec"]["template"]["containers"][0]["args"]
-        self.assertIn("--served-model-name=qwen3-4b", args)
+        self.assertFalse(
+            [a for a in args if a.startswith("--served-model-name")],
+            f"--served-model-name が重複指定されています: {args}",
+        )
 
     def test_vllm_args_passed_through_verbatim(self):
         doc = self._render(
@@ -493,26 +512,50 @@ class TestLLMInferenceServiceTemplate(unittest.TestCase):
         self.assertNotIn("--enable-prefix-caching", args)
         self.assertNotIn("--max-model-len=4096", args)
 
-    def test_only_served_model_name_and_chat_template_are_auto_added(self):
+    def test_no_args_are_auto_added_by_default(self):
+        """既定では role が足す引数は無い
+
+        以前は qwen3 用 chat template を全モデルへ無条件に差し込んでいたが、
+        これは特定モデルのテンプレート不具合に対する回避策だった。既定で
+        全モデルに当てると、正しいテンプレートを持つモデルまで上書きする。
+        """
         doc = self._render(
             "qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B", "vllm_args": []}
         )
+        # 引数が 1 つも無いと args: は空 (YAML 上は null) になる
         args = doc["spec"]["template"]["containers"][0]["args"]
-        self.assertEqual(
-            args,
-            [
-                "--served-model-name=qwen3-4b",
-                "--chat-template=/chat-templates/chat_template.jinja",
-            ],
-        )
+        self.assertFalse(args, f"自動付与された引数があります: {args}")
 
-    def test_chat_template_arg_omitted_when_configmap_empty(self):
+    def test_chat_template_arg_added_for_custom_chat_template(self):
+        """custom_chat_template を指定したときだけ --chat-template が付く"""
         doc = self._render(
             "qwen3-4b",
-            {"hf_repo": "Qwen/Qwen3-4B", "chat_template_configmap": ""},
+            {"hf_repo": "Qwen/Qwen3-4B", "vllm_args": [],
+             "custom_chat_template": "qwen3"},
         )
         args = doc["spec"]["template"]["containers"][0]["args"]
-        self.assertFalse([a for a in args if "--chat-template" in a])
+        self.assertEqual(
+            args, ["--chat-template=/chat-templates/chat_template.jinja"]
+        )
+
+    def test_custom_chat_template_uses_per_model_configmap_name(self):
+        """ConfigMap 名の既定は <モデル名>-chat-template"""
+        doc = self._render(
+            "qwen3-4b",
+            {"hf_repo": "Qwen/Qwen3-4B", "custom_chat_template": "qwen3"},
+        )
+        vol = doc["spec"]["template"]["volumes"][0]
+        self.assertEqual(vol["configMap"]["name"], "qwen3-4b-chat-template")
+
+    def test_no_chat_template_volumes_by_default(self):
+        """既定では chat template 用の volume / volumeMount を出さない"""
+        doc = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B"})
+        container = doc["spec"]["template"]["containers"][0]
+        self.assertNotIn("volumeMounts", container)
+        self.assertNotIn("volumes", doc["spec"]["template"])
+        self.assertFalse(
+            [a for a in container["args"] if "--chat-template" in a]
+        )
 
     def test_gpu_count_applied_to_resources(self):
         doc = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B", "gpu_count": 4})
@@ -540,8 +583,10 @@ class TestLLMInferenceServiceTemplate(unittest.TestCase):
 
     def test_shm_volume_only_when_shm_size_set(self):
         without = self._render("qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B"})
+        # chat template も shm も無ければ volumes キー自体を出さない
         self.assertFalse(
-            [v for v in without["spec"]["template"]["volumes"] if v["name"] == "dshm"]
+            [v for v in without["spec"]["template"].get("volumes", [])
+             if v["name"] == "dshm"]
         )
         with_shm = self._render(
             "qwen3-4b", {"hf_repo": "Qwen/Qwen3-4B", "shm_size": "16Gi"}
@@ -558,7 +603,12 @@ class TestLLMInferenceServiceTemplate(unittest.TestCase):
         image = doc["spec"]["template"]["containers"][0]["image"]
         self.assertEqual(image, "custom/vllm:v1.0")
 
-    def test_chat_template_configmap(self):
+    def test_chat_template_configmap_overrides_the_name(self):
+        """chat_template_configmap は ConfigMap 名の上書きとして効く
+
+        custom_chat_template なしで単体指定した場合は、利用者が自分で
+        作成済みの ConfigMap をマウントする用途になる。
+        """
         doc = self._render(
             "qwen3-4b",
             {

@@ -36,6 +36,7 @@ recursive 有無で実際にずれた）。ansible-core が無い環境ではス
 
 import fcntl
 import json
+import re
 import os
 import subprocess
 import sys
@@ -98,6 +99,9 @@ def make_jinja_env():
     env.filters["combine"] = combine_recursive
     env.filters["to_json"] = json.dumps
     env.filters["default"] = lambda val, d="": val if val else d
+    # Ansible が提供する `search` テスト（re.search 相当）。
+    # llminferenceservice.yml.j2 が vllm_args のクォート要否判定に使う。
+    env.tests["search"] = lambda val, pattern: re.search(pattern, str(val)) is not None
     return env
 
 
