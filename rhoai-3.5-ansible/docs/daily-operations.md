@@ -907,10 +907,24 @@ Guardrails が LLM 呼び出しをループしており、`--max-num-seqs` の�
 install_guardrails: false
 ```
 
-既に動いてしまっている場合の緊急停止:
+既に動いてしまっている場合の止め方:
+
+`oc scale deploy/nemo-guardrails --replicas=0` は**効かない**。operator が
+CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を 0 にするのも
+`spec.replicas in body should be greater than or equal to 1` で拒否される。
+
+恒久対処は inventory で無効化する。
 
 ```bash
-oc scale deploy/nemo-guardrails -n redhat-ods-applications --replicas=0
+# components.yml で install_guardrails: false にしてから
+uv run ansible-playbook site.yml -i inventory/<env> --tags platform,rhoai,guardrails
+```
+
+今すぐ止めたい場合は CR を削除する（次回 playbook 実行で作り直される）。
+
+```bash
+oc delete nemoguardrails nemo-guardrails -n redhat-ods-applications
+
 # vLLM 側で Running: 0 reqs に戻ることを確認する
 oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running
 ```

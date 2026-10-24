@@ -166,7 +166,8 @@ elif [[ "${NORMAL_RC}" -eq 28 ]]; then
     echo "    ループすることがあります。vLLM 側で Running が減らない場合は"
     echo "    GPU を占有し続けるため停止してください:"
     echo "      oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running"
-    echo "      oc scale deploy/nemo-guardrails -n ${NS} --replicas=0"
+    echo "      oc delete nemoguardrails nemo-guardrails -n ${NS}"
+    echo "    (oc scale deploy は operator に戻されるため効きません)"
     echo "    単に遅いだけなら TIMEOUT=600 で伸ばせます"
 else
     ng "通常推論に失敗 (curl rc=${NORMAL_RC}): $(printf '%s' "${NORMAL}" | head -c 200)"
