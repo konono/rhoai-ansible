@@ -37,8 +37,9 @@ echo "=== OGX Server 動作確認 ==="
 echo "  Namespace: ${NS}"
 echo ""
 
+# grep が一致しないと pipefail で代入が失敗し、set -e で下の案内に辿り着かない
 POD=$(oc get pods -n "${NS}" --no-headers 2>/dev/null \
-    | grep ogx-server | grep -v operator | grep Running | awk '{print $1}' | head -1)
+    | grep ogx-server | grep -v operator | grep Running | awk '{print $1}' | head -1) || true
 if [[ -z "${POD}" ]]; then
     echo "  OGX Server Pod が Running ではありません (namespace: ${NS})" >&2
     oc get pods -n "${NS}" --no-headers 2>/dev/null | grep -i ogx || true
@@ -87,7 +88,8 @@ for m in json.load(sys.stdin).get("data", []):
     print("    - %s" % (m.get("identifier") or m.get("id")))
 ' 2>/dev/null || true
 else
-    warn "Models: 0 件 — vLLM 接続を疑ってください"
+    # モデルが 1 件も無ければ推論できない。OGX の中心機能が死んでいるので失敗にする
+    ng "Models: 0 件 — vLLM 接続を疑ってください"
     echo "    oc get secret ogx-vllm-connection -n ${NS}"
     echo "    oc logs -n ${NS} ${POD} --tail=50"
 fi
@@ -135,7 +137,8 @@ print(msg[:160])
         ng "Chat Completion 失敗: $(printf '%s' "${CHAT}" | head -c 200)"
     fi
 else
-    warn "Models が 0 件のためスキップ"
+    # Models 0 件は上で NG 済み。ここでスキップしても成功にはしない
+    ng "Models が 0 件のため Chat Completion を実行できません"
 fi
 echo ""
 
@@ -146,7 +149,14 @@ CONV_ID=$(ogx_curl -X POST "${OGX_URL}/v1/conversations" \
 if [[ -n "${CONV_ID}" ]]; then
     ok "Conversation 作成: ${CONV_ID}"
     ogx_curl -X DELETE "${OGX_URL}/v1/conversations/${CONV_ID}" >/dev/null
-    ok "Conversation 削除"
+    # 削除できたかは「もう引けないこと」で確かめる。応答を見ずに OK とすると
+    # テストデータが残り続ける
+    if ogx_curl -o /dev/null -w '%{http_code}' "${OGX_URL}/v1/conversations/${CONV_ID}" \
+         | grep -qE '^(404|400)$'; then
+        ok "Conversation 削除"
+    else
+        ng "Conversation が削除されていません: ${CONV_ID}"
+    fi
 else
     ng "Conversation 作成失敗"
 fi
@@ -163,7 +173,12 @@ FILE_ID=$(oc exec "${POD}" -n "${NS}" -- bash -c '
 if [[ -n "${FILE_ID}" ]]; then
     ok "File アップロード: ${FILE_ID}"
     ogx_curl -X DELETE "${OGX_URL}/v1/files/${FILE_ID}" >/dev/null
-    ok "File 削除"
+    if ogx_curl -o /dev/null -w '%{http_code}' "${OGX_URL}/v1/files/${FILE_ID}" \
+         | grep -qE '^(404|400)$'; then
+        ok "File 削除"
+    else
+        ng "File が削除されていません: ${FILE_ID}"
+    fi
 else
     ng "File アップロード失敗"
 fi

@@ -51,8 +51,8 @@ TIMEOUT=600 ./tools/test-guardrails.sh
 BLOCK_PATTERN='cannot help|declined' ./tools/test-guardrails.sh
 ```
 
-ブロックされなかった場合は WARN として報告します（rail の設定内容に依存するため、
-テストの失敗とは区別しています）。
+ブロックされなかった場合は**失敗**として報告します（rail が効いているかを確認する
+テストのため）。判定文言が環境と違うだけの場合は `BLOCK_PATTERN` で調整してください。
 
 ### test-maas-routing.sh
 

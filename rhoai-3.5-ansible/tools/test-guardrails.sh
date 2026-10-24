@@ -17,8 +17,9 @@
 #   ./tools/test-guardrails.sh                 # モデルは自動検出
 #   ./tools/test-guardrails.sh qwen3-5-9b
 #
-# 注: rail がブロックしなかった場合は WARN で報告する。ブロック文言は
-#     設定した rail の内容に依存するため、テストの失敗とは区別する。
+# 注: rail がブロックしなかった場合は失敗として扱う（rail が効いているかを
+#     確認するテストのため）。判定文言が環境と違うだけなら BLOCK_PATTERN で
+#     上書きできる。
 set -euo pipefail
 
 MODEL="${1:-}"
@@ -47,8 +48,9 @@ if [[ "${PHASE}" != "Ready" ]]; then
 fi
 echo "  CR: Ready"
 
+# grep が一致しないと pipefail で代入が失敗し、set -e で下の案内に辿り着かない
 POD=$(oc get pods -n "${NS}" --no-headers 2>/dev/null \
-    | grep nemo-guardrails | grep -v operator | grep Running | awk '{print $1}' | head -1)
+    | grep nemo-guardrails | grep -v operator | grep Running | awk '{print $1}' | head -1) || true
 if [[ -z "${POD}" ]]; then
     echo "  NeMo Guardrails Pod が Running ではありません" >&2
     exit 1
@@ -140,7 +142,9 @@ elif [[ -z "${BLOCKED_MSG}" ]]; then
 elif printf '%s' "${BLOCKED_MSG}" | grep -qiE "${BLOCK_PATTERN}"; then
     ok "有害プロンプトをブロック: ${BLOCKED_MSG:0:100}"
 else
-    warn "ブロックされませんでした: ${BLOCKED_MSG:0:150}"
+    # rail が効いているかを見るテストなので、素通りは失敗として数える。
+    # 判定文言が環境と違うだけの場合は BLOCK_PATTERN で調整する。
+    ng "ブロックされませんでした: ${BLOCKED_MSG:0:150}"
     echo "    rail の設定を確認してください:"
     echo "      oc get nemoguardrails nemo-guardrails -n ${NS} -o yaml"
     echo "    判定文言が環境と違う場合は BLOCK_PATTERN で上書きできます"

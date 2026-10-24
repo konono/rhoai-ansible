@@ -63,8 +63,10 @@
 # 同じユーザー名を持つ別環境（例: testuser1）でファイルが共有され、
 # 片方の環境のパスワードがもう片方に設定されてしまっていた。
 #
-# 既存のフラット配置は読み取り時のフォールバックとして残すので、
-# これまでの台帳を失わない。新規に発行したものは環境別ディレクトリへ書く。
+# 分離前のフラット配置を引き継ぐかは inventory ごとの明示的な opt-in にする。
+# 無条件にフォールバックすると、同名ユーザー(例: testuser1)を持つ別環境でも
+# 同じフラットファイルを読んでしまい、直そうとしたパスワード共有が再発する。
+# 旧台帳の持ち主である inventory だけで credentials_adopt_legacy: true を設定する。
 - name: Set the credentials directory for this inventory
   ansible.builtin.set_fact:
     _cred_dir: "{{ ansible_root }}/.credentials/{{ inventory_dir | basename }}"
@@ -96,6 +98,7 @@
   loop_control:
     label: "{{ item.item.item.username | default('skip') }}"
   when:
+    - credentials_adopt_legacy | default(false) | bool
     - item.stat is defined
     - not item.stat.exists
 
@@ -112,13 +115,25 @@
     - item.stat is defined
     - item.stat.exists
 
-# 環境別ディレクトリに無ければ、分離前のフラット配置から引き継ぐ
+# credentials_adopt_legacy を立てた inventory でだけ、フラット配置から引き継ぐ
 - name: Load existing passwords from the legacy flat layout
   ansible.builtin.set_fact:
     _new_user_passwords: >-
       {{ _new_user_passwords | default({}) | combine({
         item.item.item.item.username: lookup('file', _cred_dir_legacy ~ '/' ~ item.item.item.item.username ~ '.password')
       }) }}
+  loop: "{{ _pw_file_legacy.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.item.username | default('skip') }}"
+  when:
+    - item.stat is defined
+    - item.stat.exists
+
+- name: Report adopted legacy passwords
+  ansible.builtin.debug:
+    msg: >-
+      分離前の台帳 {{ _cred_dir_legacy }}/{{ item.item.item.item.username }}.password
+      を引き継ぎました。以後は {{ _cred_dir }}/ 配下に保存されます。
   loop: "{{ _pw_file_legacy.results | default([]) }}"
   loop_control:
     label: "{{ item.item.item.item.username | default('skip') }}"

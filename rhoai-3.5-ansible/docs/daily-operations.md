@@ -163,6 +163,7 @@ TOKEN=$(curl -sk -X POST "${KC_URL}/realms/master/protocol/openid-connect/token"
 
 # 対象ユーザーの ID を引く
 TARGET=ta-suzuki
+INVENTORY=inventory/<env>     # 台帳の保存先を決めるのに使う
 UID=$(curl -sk -H "Authorization: Bearer ${TOKEN}" \
   "${KC_URL}/admin/realms/maas/users?username=${TARGET}&exact=true" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
@@ -174,11 +175,19 @@ curl -sk -X PUT -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: applicatio
   -d "{\"type\":\"password\",\"value\":\"${NEWPASS}\",\"temporary\":false}"
 
 # ローカルの記録も更新しておく（playbook の出力と整合させるため）
-umask 077 && printf '%s' "$NEWPASS" > ".credentials/${TARGET}.password"
+# 台帳は inventory ごとに分かれている。対象環境のディレクトリへ書くこと。
+INV_NAME=$(basename "$INVENTORY")
+mkdir -p ".credentials/${INV_NAME}"
+chmod 700 ".credentials/${INV_NAME}"
+umask 077 && printf '%s' "$NEWPASS" > ".credentials/${INV_NAME}/${TARGET}.password"
 echo "new password: $NEWPASS"
 ```
 
 > 最後の `.credentials/` 更新を忘れると、次に誰かが `cat` したときに古いパスワードを渡してしまう。必ず更新する。
+>
+> 分離前のフラット配置 (`.credentials/<user>.password`) が残っている場合、
+> そちらが古い値のままだと混乱する。環境別ディレクトリへ書いたあと、
+> どの環境のものか判明しているなら旧ファイルは削除してよい。
 
 ### 2.4 ユーザーを無効化・削除する
 

@@ -568,10 +568,13 @@
       register: _cred_dir
       tags: [always]
 
+    # 台帳は .credentials/<inventory名>/ に分かれている。分離前のフラット配置も
+    # 残り得るので、再帰検索して両方を拾う。
     - name: Check for saved credentials
       ansible.builtin.find:
         paths: "{{ ansible_root }}/.credentials"
         patterns: "*.password"
+        recurse: true
       register: _cred_files
       when: _cred_dir.stat.isdir | default(false)
       tags: [always]
