@@ -684,7 +684,7 @@ oc get route maas-gateway -n openshift-ingress -o jsonpath='https://{.spec.host}
 |---|---|---|
 | OpenShift cluster-admin | `oc login` 時に指定 | クラスター管理者。`oc whoami` で確認 |
 | Keycloak 管理者 | Secret `keycloak-initial-admin` (namespace: keycloak) | Keycloak 管理コンソールのログイン |
-| MaaS ユーザー (admin1, testuser1 等) | `.credentials/<username>.password` | MaaS Dashboard / API Key 発行用 |
+| MaaS ユーザー (admin1, testuser1 等) | `.credentials/<inventory名>/<username>.password` | MaaS Dashboard / API Key 発行用 |
 | MaaS API Key | `.vllm-token` | LLM 推論リクエストの Bearer トークン |
 
 認証情報を確認するコマンド:
@@ -696,8 +696,8 @@ oc get secret keycloak-initial-admin -n keycloak \
   xargs -I{} sh -c 'echo {} | sed "s/username: //" | cut -d/ -f1 | base64 -d; echo -n " / "; echo {} | sed "s/.*password: //" | base64 -d; echo'
 
 # MaaS ユーザーパスワード
-cat .credentials/admin1.password
-cat .credentials/testuser1.password
+cat .credentials/<inventory名>/admin1.password
+cat .credentials/<inventory名>/testuser1.password
 
 # MaaS API Key
 cat .vllm-token
@@ -707,7 +707,9 @@ cat .vllm-token
 
 ```
 rhoai-3.5-ansible/
-├── .credentials/              ← Keycloak ユーザーのパスワード (gitignore 対象)
+├── .credentials/<inventory名>/ ← Keycloak ユーザーのパスワード (gitignore 対象)
+│                              環境ごとに分かれる。同じユーザー名を別環境で
+│                              使っていてもパスワードは共有されない
 │   ├── admin1.password
 │   └── testuser1.password
 ├── .vllm-token                ← MaaS API Key (gitignore 対象)

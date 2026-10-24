@@ -116,9 +116,22 @@
       - "draft tokens     : {{ _vi_d_draft_tokens | float | int }}"
       - "accepted tokens  : {{ _vi_d_accepted | float | int }}"
       - "acceptance rate  : {{ _vi_acceptance }}"
-      - "{{ 'MTP: 有効 (ドラフトが生成され検証されています)'
+      # 投機デコードの方式はモデルごとに違う (mtp / ngram など)。
+      # 実際に設定されている method を vllm_args から拾って表示する。
+      - "{{ '投機デコード (' ~ _vi_method ~ '): 有効 — ドラフトが生成され検証されています'
            if (_vi_d_draft_tokens | float) > 0
-           else 'MTP: 無効 — draft tokens が 0。--speculative-config が vLLM に届いていません' }}"
+           else '投機デコード (' ~ _vi_method ~ '): 無効 — draft tokens が 0。'
+                ~ '--speculative-config が vLLM に届いていません' }}"
+  vars:
+    # --speculative-config を持たないモデルや method を書いていない場合、
+    # regex_search は None を返す。そのまま first に渡すと落ちるので
+    # default([], true) で空リストに寄せてから取り出す。
+    _vi_method: >-
+      {{ ((_model_cfg.vllm_args | default([])
+           | select('search', '--speculative-config')
+           | list | first | default(''))
+          | regex_search('"method"\s*:\s*"([^"]+)"', '\1')
+          | default([], true) | first | default('未設定')) }}
 
 - name: "Assert the model actually generated tokens ({{ _model_name }})"
   ansible.builtin.assert:

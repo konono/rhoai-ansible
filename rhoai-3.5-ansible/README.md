@@ -694,7 +694,7 @@ oc get route maas-gateway -n openshift-ingress -o jsonpath='https://{.spec.host}
 |---|---|---|
 | OpenShift cluster-admin | Specified during `oc login` | Cluster administrator. Check with `oc whoami` |
 | Keycloak admin | Secret `keycloak-initial-admin` (namespace: keycloak) | Login for Keycloak admin console |
-| MaaS users (admin1, testuser1, etc.) | `.credentials/<username>.password` | For MaaS Dashboard / API Key issuance |
+| MaaS users (admin1, testuser1, etc.) | `.credentials/<inventory>/<username>.password` | For MaaS Dashboard / API Key issuance |
 | MaaS API Key | `.vllm-token` | Bearer token for LLM inference requests |
 
 Commands to check credentials:
@@ -706,8 +706,8 @@ oc get secret keycloak-initial-admin -n keycloak \
   xargs -I{} sh -c 'echo {} | sed "s/username: //" | cut -d/ -f1 | base64 -d; echo -n " / "; echo {} | sed "s/.*password: //" | base64 -d; echo'
 
 # MaaS user passwords
-cat .credentials/admin1.password
-cat .credentials/testuser1.password
+cat .credentials/<inventory>/admin1.password
+cat .credentials/<inventory>/testuser1.password
 
 # MaaS API Key
 cat .vllm-token
@@ -717,7 +717,9 @@ cat .vllm-token
 
 ```
 rhoai-3.5-ansible/
-├── .credentials/              ← Keycloak user passwords (gitignored)
+├── .credentials/<inventory>/  ← Keycloak user passwords (gitignored)
+│                              Scoped per inventory so the same username in
+│                              different environments does not share a password
 │   ├── admin1.password
 │   └── testuser1.password
 ├── .vllm-token                ← MaaS API Key (gitignored)

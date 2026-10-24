@@ -18,6 +18,75 @@
 ./tools/check-platform-health.sh
 ```
 
+### test-ogx.sh
+
+OGX Server (Llama Stack) の機能テスト。`verify.yml` は OGXServer CR が Ready か
+しか見ないため、「Ready なのに API が動かない」「vLLM に繋がっておらずモデルが
+0 件」は検出できません。実際に API を叩いて確認します。
+
+health / Providers / Models / Chat Completion / Conversations の作成・削除 /
+Files のアップロード・削除を確認し、作ったテストデータはその場で削除します。
+
+```bash
+./tools/test-ogx.sh                 # モデルは OGX の登録済みから自動選択
+./tools/test-ogx.sh qwen3-5-9b
+```
+
+Models が 0 件の場合は vLLM 接続 (`ogx-vllm-connection` Secret) を疑ってください。
+
+### test-guardrails.sh
+
+NeMo Guardrails の機能テスト。`verify.yml` は NemoGuardrails CR が Ready か
+しか見ないため、**「Ready なのに rail が効いておらず有害なプロンプトが素通りする」**
+は検出できません。実際にブロックされるかを確認します。
+
+```bash
+./tools/test-guardrails.sh                 # モデルは自動検出
+./tools/test-guardrails.sh qwen3-5-9b
+
+# rail のパイプラインは複数回 LLM を呼ぶため遅い。必要なら延ばす
+TIMEOUT=600 ./tools/test-guardrails.sh
+
+# ブロック判定の文言が環境と違う場合
+BLOCK_PATTERN='cannot help|declined' ./tools/test-guardrails.sh
+```
+
+ブロックされなかった場合は WARN として報告します（rail の設定内容に依存するため、
+テストの失敗とは区別しています）。
+
+### test-maas-routing.sh
+
+MaaS Gateway の 2 通りのルーティングを個別に試します。RHOAI 3.5 では
+body-based が推奨ですが、従来の path-based も残っているため両方を確認できます。
+
+| 方式 | エンドポイント | ボディの `model` |
+|---|---|---|
+| body-based（推奨） | `POST /v1/chat/completions` | `publishers/<namespace>/models/<model>` |
+| path-based（従来） | `POST /<namespace>/<model>/v1/chat/completions` | `<model>` |
+
+**body-based では完全修飾名が必要です。** 短縮名だと 404 になります。
+`X-Gateway-Model-Name` を手で付けてもボディの内容が優先されるため、
+ヘッダでの回避はできません。
+
+```bash
+# 両方試す（モデル未指定なら Ready なものを自動で選ぶ）
+./tools/test-maas-routing.sh "$(cat .vllm-token)"
+
+# モデルと namespace を指定
+./tools/test-maas-routing.sh maas-xxxx qwen3-5-9b llm-serving "日本の首都は？"
+
+# 片方だけ
+ROUTES=body ./tools/test-maas-routing.sh maas-xxxx
+ROUTES=path ./tools/test-maas-routing.sh maas-xxxx
+```
+
+外部 DNS が未設定でも動きます。Gateway Service の ClusterIP を引いて
+`curl --resolve` で解決させるため、TLS の SNI もルーティングも本番と同じ経路を通ります。
+クラスタ外から名前解決できる環境では `NO_RESOLVE=1` を指定してください。
+
+Ansible でまとめて検証する場合は `playbooks/llm_verify_inference.yml` を
+`-e inference_via=maas` で実行すると、同じ 2 経路を検証して失敗時に落とします。
+
 ### test-maas-inference.sh
 
 MaaS Gateway 経由で LLM の推論をテストします。API Key を渡してモデル一覧の取得と chat/completions の実行を行います。

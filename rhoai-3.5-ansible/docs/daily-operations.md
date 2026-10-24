@@ -869,6 +869,93 @@ for p in d['items']:
 | MaaSModelRef が Pending のまま | MaaSAuthPolicy / MaaSSubscription が未適用 | `playbooks/manage_maas_access.yml` を実行する |
 | transformers の `... is part of ...InitKwargs, but not documented` | 単なる警告（stderr に出るだけ） | 無視してよい |
 
+### 7.z NeMo Guardrails の既知の問題（reasoning モデル使用時）
+
+`verify.yml` は NemoGuardrails CR が Ready かしか見ないため、以下は検出できない。
+`tools/test-guardrails.sh` で機能確認すること。
+
+**判定 rail が reasoning モデルだと機能しない（対処済み）**
+
+`self check input` / `self check output` は「Yes か No で答えよ」という判定
+プロンプトを LLM に投げる。Qwen3 系はこれにも思考を返すため、小さい
+`max_tokens` を思考だけで使い切り **content が空**で返る。判定できないまま
+1 リクエストで input/output 2 つの rail + 本体生成が走り、応答が返らなくなる。
+
+```
+thinking あり: completion_tokens 256 / reasoning 256 / content "" / 33 秒
+thinking なし: completion_tokens   2 / reasoning   0 / content "Yes" / 即答
+```
+
+role 側で `extra_body.chat_template_kwargs.enable_thinking: false` を既定にした。
+思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
+
+**通常の推論が完了せず GPU を占有し続ける（未解決）**
+
+上記の対処でブロック経路は即答するようになったが、**rail に引っかからない
+通常の質問は 10 分待っても完了しない**。このとき vLLM 側は次の状態が続く。
+
+```
+Running: 4 reqs, Avg generation throughput: 132 tokens/s   ← 止まらない
+```
+
+Guardrails が LLM 呼び出しをループしており、`--max-num-seqs` の枠を
+占有し続ける。**本体モデルの応答性能を食い潰す**ため、Guardrails を
+使わない環境では無効化を推奨する。
+
+```yaml
+# components.yml
+install_guardrails: false
+```
+
+既に動いてしまっている場合の緊急停止:
+
+```bash
+oc scale deploy/nemo-guardrails -n redhat-ods-applications --replicas=0
+# vLLM 側で Running: 0 reqs に戻ることを確認する
+oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running
+```
+
+原因は Colang の intent 生成が収束しないことと見られる（Pod ログに
+`generate_user_intent` のプロンプト構築が繰り返し現れる）。
+小型の非 reasoning モデルを判定用に別途割り当てる構成が本筋だが未検証。
+
+### 7.y MaaS Gateway のルーティング方式
+
+RHOAI 3.5 の Gateway は 2 通りのルーティングを提供する。
+`llm_verify_inference.yml` は `inference_via=maas` のとき**両方**を検証する。
+
+| 方式 | エンドポイント | ボディの `model` |
+|---|---|---|
+| body-based（推奨） | `POST https://maas.<domain>/v1/chat/completions` | `publishers/<namespace>/models/<model>` |
+| path-based（従来） | `POST https://maas.<domain>/<namespace>/<model>/v1/chat/completions` | `<model>` |
+
+**body-based では完全修飾名が必要。** 短縮名だと 404 になる（実機で確認）。
+
+```
+model: "qwen3-5-9b"                               → 404
+model: "publishers/llm-serving/models/qwen3-5-9b" → 200
+```
+
+KServe は vLLM に `--served-model-name <model> publishers/<ns>/models/<model>` と
+両方を登録するが、Gateway のルーティングキーは完全修飾名の方。
+`X-Gateway-Model-Name` ヘッダを手で付けてもボディの内容が優先されるため、
+ヘッダでの回避はできない。
+
+path-based のパスは `/<namespace>/<model>/...` であって `/llm/<model>/...` ではない。
+実際のパスは HTTPRoute で確認できる。
+
+```bash
+oc get httproute <model>-kserve-route -n <namespace> \
+  -o jsonpath='{range .spec.rules[*].matches[*]}{.path.value}{"\n"}{end}'
+```
+
+片方だけ確認したい場合:
+
+```bash
+uv run ansible-playbook playbooks/llm_verify_inference.yml -i inventory/<env> \
+  -e inference_via=maas -e '{"maas_routes": ["body"]}'
+```
+
 ### 7.x 推論の疎通と MTP の動作確認
 
 `playbooks/verify.yml` は「リソースが Ready か」しか見ないため、
@@ -928,6 +1015,32 @@ Qwen3 系は既定で思考に数百トークン使うため、`max_tokens` が�
 thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を指定します。
 
 ---
+
+### 【移行時の注意】パスワード台帳が inventory 単位になりました
+
+以前は `.credentials/<username>.password` のように環境を区別せず置いていたため、
+**同じユーザー名を複数の環境で使っていると台帳が共有**されていました。
+たとえば `testuser1` を検証環境と本番の両方に定義していると、後から作った方に
+先に作った方と同じパスワードが設定されます。
+
+`.credentials/<inventory名>/<username>.password` に分離しました。
+
+```
+.credentials/
+├── nict/
+│   └── testuser1.password
+└── aws-sno-ipi/
+    └── testuser1.password     ← 別物として扱われる
+```
+
+**既存の台帳は消さずにそのまま残してください。** 分離前のフラット配置は
+読み取り時のフォールバックとして参照します。ユーザーを作り直した際、
+環境別ディレクトリに無ければフラット配置から引き継ぎ、以後は環境別の方へ
+保存します。
+
+既に Keycloak に存在するユーザーについては読み書きしないため、フラット配置の
+ファイルはそのまま残ります。どの環境のものか分かる場合は手で移動しておくと
+台帳が整理されます（移動しなくても動作に支障はありません）。
 
 ## 8. 秘密情報の保管場所
 

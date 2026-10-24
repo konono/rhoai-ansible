@@ -58,16 +58,28 @@
   loop_control:
     label: "{{ item.username }}"
 
-- name: Ensure .credentials directory exists
+# パスワード台帳は inventory 単位で分ける。
+# 以前は {{ ansible_root }}/.credentials 直下にユーザー名だけで置いていたため、
+# 同じユーザー名を持つ別環境（例: testuser1）でファイルが共有され、
+# 片方の環境のパスワードがもう片方に設定されてしまっていた。
+#
+# 既存のフラット配置は読み取り時のフォールバックとして残すので、
+# これまでの台帳を失わない。新規に発行したものは環境別ディレクトリへ書く。
+- name: Set the credentials directory for this inventory
+  ansible.builtin.set_fact:
+    _cred_dir: "{{ ansible_root }}/.credentials/{{ inventory_dir | basename }}"
+    _cred_dir_legacy: "{{ ansible_root }}/.credentials"
+
+- name: Ensure the credentials directory exists
   ansible.builtin.file:
-    path: "{{ ansible_root }}/.credentials"
+    path: "{{ _cred_dir }}"
     state: directory
     mode: "0700"
   delegate_to: localhost
 
 - name: Check existing password files for new users
   ansible.builtin.stat:
-    path: "{{ ansible_root }}/.credentials/{{ item.item.username }}.password"
+    path: "{{ _cred_dir }}/{{ item.item.username }}.password"
   register: _pw_file_check
   delegate_to: localhost
   loop: "{{ _user_check.results }}"
@@ -75,15 +87,41 @@
     label: "{{ item.item.username }}"
   when: item.json | length == 0
 
+- name: Check legacy (flat) password files
+  ansible.builtin.stat:
+    path: "{{ _cred_dir_legacy }}/{{ item.item.item.username }}.password"
+  register: _pw_file_legacy
+  delegate_to: localhost
+  loop: "{{ _pw_file_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.username | default('skip') }}"
+  when:
+    - item.stat is defined
+    - not item.stat.exists
+
 - name: Load existing passwords from files
   ansible.builtin.set_fact:
     _new_user_passwords: >-
       {{ _new_user_passwords | default({}) | combine({
-        item.item.item.username: lookup('file', ansible_root ~ '/.credentials/' ~ item.item.item.username ~ '.password')
+        item.item.item.username: lookup('file', _cred_dir ~ '/' ~ item.item.item.username ~ '.password')
       }) }}
   loop: "{{ _pw_file_check.results | default([]) }}"
   loop_control:
     label: "{{ item.item.item.username | default('skip') }}"
+  when:
+    - item.stat is defined
+    - item.stat.exists
+
+# 環境別ディレクトリに無ければ、分離前のフラット配置から引き継ぐ
+- name: Load existing passwords from the legacy flat layout
+  ansible.builtin.set_fact:
+    _new_user_passwords: >-
+      {{ _new_user_passwords | default({}) | combine({
+        item.item.item.item.username: lookup('file', _cred_dir_legacy ~ '/' ~ item.item.item.item.username ~ '.password')
+      }) }}
+  loop: "{{ _pw_file_legacy.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.item.username | default('skip') }}"
   when:
     - item.stat is defined
     - item.stat.exists
@@ -131,7 +169,7 @@
 - name: Save user password locally
   ansible.builtin.copy:
     content: "{{ _new_user_passwords[item.item.username] }}"
-    dest: "{{ ansible_root }}/.credentials/{{ item.item.username }}.password"
+    dest: "{{ _cred_dir }}/{{ item.item.username }}.password"
     mode: "0600"
   delegate_to: localhost
   loop: "{{ _user_check.results }}"

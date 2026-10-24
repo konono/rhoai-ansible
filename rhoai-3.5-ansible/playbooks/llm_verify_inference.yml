@@ -13,8 +13,11 @@
 #   # モデルを指定
 #   ... -e model=qwen3-5-9b
 #
-#   # MaaS Gateway 経由で認証込みの疎通も確認する
+#   # MaaS Gateway 経由で認証込みの疎通も確認する (body-based と path-based の両方)
 #   ... -e inference_via=maas -e maas_api_user=admin1
+#
+#   # 片方だけ確認する
+#   ... -e inference_via=maas -e '{"maas_routes": ["body"]}'
 #
 #   # 受理率の測定精度を上げる (既定 3 リクエスト x 512 トークン)
 #   ... -e inference_requests=10 -e inference_max_tokens=1024
@@ -43,11 +46,20 @@
     # MTP の受理率がこれを下回ったら警告する (0 なら MTP が効いていない)
     inference_min_acceptance_rate: 0.0
     maas_api_user: ""
+    # MaaS Gateway のルーティング方式。既定は両方を検証する。
+    #   body: POST /v1/chat/completions         (RHOAI 3.5 推奨。ボディの model で振り分け)
+    #   path: POST /<namespace>/<model>/v1/...  (従来方式)
+    maas_routes: [body, path]
   tasks:
     - name: Load llm_serving role defaults
       ansible.builtin.include_vars:
         file: "{{ playbook_dir }}/../roles/llm_serving/defaults/main.yml"
         name: _rd
+      tags: [always]
+
+    - name: Load per-model vLLM recipes
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/vars/model_recipes.yml"
       tags: [always]
 
     - name: Select target models
@@ -83,4 +95,11 @@
           {{ _m.value.namespace
              | default((model_defaults | default(_rd.model_defaults)).namespace
                        | default('llm-serving')) }}
+        # 投機デコードの方式を表示するために解決しておく。
+        # roles/llm_serving/tasks/main.yml と同じ順序。
+        _model_cfg: >-
+          {{ model_defaults | default(_rd.model_defaults)
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(_m.value.hf_repo | default(''), {}), recursive=True)
+             | combine(_m.value, recursive=True) }}
       tags: [workload, llm, inference]

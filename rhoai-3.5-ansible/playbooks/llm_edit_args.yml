@@ -17,6 +17,9 @@
 #   bash scripts/vllm-args.sh qwen3-8-27b -i inventory/<env>
 #
 # 注意:
+#   webhook が応答しない場合は 10 秒間隔で 12 回まで再試行する。
+#   変更するには -e edit_args_webhook_retries=<回数>。
+#
 #   ここでの変更はクラスタ上のリソースにのみ適用される。
 #   inventory を更新しないと、次に llm_add_model.yml / site.yml を流したときに戻る。
 #   実行後に表示される inventory スニペットを components.yml に貼ること。
@@ -160,8 +163,39 @@
             [{"op": "replace", "path": "/spec/template/containers/0/args",
               "value": {{ _apply_args | to_json }}}]
       register: _patch
+      # LLMInferenceService の更新は KServe の admission webhook を通る。
+      # ノード再起動直後などは webhook が応答せず
+      #   failed calling webhook "...defaulter": context deadline exceeded
+      # で失敗する（実機で発生）。一時的なものなのでリトライする。
+      # 待って直るのは「webhook に届かない」系だけ。validating webhook が
+      # spec を拒否した場合などは何度待っても同じなので即座に抜ける。
+      until: >-
+        _patch.rc == 0
+        or not (_patch.stderr | default('')
+                is search('context deadline exceeded|connection refused|no endpoints available|EOF|i/o timeout'))
+      retries: "{{ edit_args_webhook_retries | default(12) | int }}"
+      delay: 10
+      failed_when: false
       # oc は変更が無くても "... patched (no change)" を返すため除外する
-      changed_when: "'patched' in _patch.stdout and '(no change)' not in _patch.stdout"
+      changed_when: >-
+        _patch.rc == 0 and 'patched' in _patch.stdout
+        and '(no change)' not in _patch.stdout
+
+    - name: Fail with guidance when the patch did not apply
+      ansible.builtin.fail:
+        msg: >-
+          {{ model }} の args を更新できませんでした。
+          {% if 'webhook' in (_patch.stderr | default('')) %}
+          KServe の admission webhook が応答していません。Pod は動いていても
+          webhook だけ落ちていることがあります。次を確認してください:
+            oc get pods -n redhat-ods-applications | grep llmisvc
+            oc get endpoints llmisvc-webhook-server-service -n redhat-ods-applications
+          ノード再起動直後は kubelet の serving 証明書が未発行で
+          webhook に到達できないことがあります:
+            oc get csr | grep Pending
+          {% endif %}
+          oc の出力: {{ _patch.stderr | default(_patch.stdout) | trim }}
+      when: _patch.rc != 0
 
     - name: Show applied arguments and the inventory snippet
       ansible.builtin.debug:

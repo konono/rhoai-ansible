@@ -44,6 +44,15 @@ case "$1" in
   whoami) echo "kube:admin"; exit 0 ;;
   get)    echo '["--max-model-len=4096"]'; exit 0 ;;
   patch)
+      # WEBHOOK_FAILS 回だけ webhook エラーを返してリトライを検証する
+      if [ -n "$WEBHOOK_FAILS" ]; then
+        n=0; [ -f "$FAIL_COUNT" ] && n=$(cat "$FAIL_COUNT")
+        if [ "$n" -lt "$WEBHOOK_FAILS" ]; then
+          echo $((n + 1)) > "$FAIL_COUNT"
+          echo 'Error from server (InternalError): Internal error occurred: failed calling webhook "llminferenceservice.kserve-webhook-server.v1alpha2.defaulter": context deadline exceeded' >&2
+          exit 1
+        fi
+      fi
       for a in "$@"; do
         case "$a" in
           '[{"op":'*|'[{"op": '*) printf '%s' "$a" > "$PATCH_LOG" ;;
@@ -271,3 +280,55 @@ class TestQuotingIsIdempotent(unittest.TestCase):
         out = [ln for ln in r.stdout.splitlines() if ln]
         self.assertEqual(out, [SPEC_ARG],
                          "再適用後に分割・変形しています: " + repr(out))
+
+
+class TestWebhookRetry(TestLlmEditArgs):
+    """KServe の admission webhook が一時的に応答しない場合の挙動
+
+    ノード再起動直後などに
+      failed calling webhook "...defaulter": context deadline exceeded
+    で patch が失敗する（実機で発生）。一時的なものなのでリトライし、
+    それでも駄目なら原因が分かるメッセージを出す。
+    """
+
+    def _run_with(self, args_list, env_extra, expect_ok=True):
+        env = {
+            **os.environ,
+            "PATH": f"{self.bin_dir}:{os.environ['PATH']}",
+            "PATCH_LOG": str(self.patch_log),
+            "FAIL_COUNT": str(self.tmp / "failcount"),
+            "ANSIBLE_LOCALHOST_WARNING": "False",
+            "ANSIBLE_INVENTORY_UNPARSED_WARNING": "False",
+            **env_extra,
+        }
+        r = subprocess.run(
+            ["ansible-playbook", str(PLAYBOOK), "-i", str(self.inv),
+             "-e", "model=demo-model",
+             "-e", "edit_args_wait=0",
+             "-e", "edit_args_webhook_retries=3",
+             "-e", json.dumps({"vllm_args": args_list})],
+            cwd=str(ANSIBLE_DIR), capture_output=True, text=True, env=env,
+        )
+        if expect_ok:
+            self.assertEqual(r.returncode, 0,
+                             f"リトライで復帰していません:\n{r.stdout[-3000:]}")
+        return r
+
+    def test_transient_webhook_error_is_retried(self):
+        """数回 webhook エラーでも、復帰すれば成功すること"""
+        self._run_with(["--max-model-len=8192"], {"WEBHOOK_FAILS": "2"})
+        self.assertTrue(self.patch_log.exists(),
+                        "リトライ後も patch が適用されていません")
+
+    def test_persistent_webhook_error_fails_with_guidance(self):
+        """回復しない場合は原因と確認手順を示して失敗すること"""
+        r = self._run_with(["--max-model-len=8192"], {"WEBHOOK_FAILS": "99"},
+                           expect_ok=False)
+        self.assertNotEqual(r.returncode, 0, "失敗すべきところで成功しています")
+        out = r.stdout
+        self.assertIn("admission webhook", out,
+                      "webhook が原因であることを案内していません")
+        self.assertIn("llmisvc-webhook-server-service", out,
+                      "確認コマンドを案内していません")
+        self.assertFalse(self.patch_log.exists(),
+                         "失敗したのに patch が適用されています")

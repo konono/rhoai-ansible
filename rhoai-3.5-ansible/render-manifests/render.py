@@ -2197,6 +2197,9 @@ class ManifestRenderer:
 
     def render_guardrails(self):
         model_name = self.llm_model_name or "unknown"
+        guardrails_thinking = str(
+            self.cfg.get("guardrails_enable_thinking", False)
+        ).lower()
 
         config_yaml = f"""models:
   - type: main
@@ -2205,6 +2208,15 @@ class ManifestRenderer:
     parameters:
       base_url: "https://{model_name}-kserve-workload-svc.llm-serving.svc.cluster.local:8000/v1"
       api_key: "dummy"
+      # Qwen3 系のような reasoning モデルは rail の判定プロンプトにも思考を返す。
+      # self_check は max_tokens が小さく思考だけで使い切るため content が空になり、
+      # Yes/No を判定できず chat/completions が返らなくなる（実機で発生）。
+      #   thinking あり: 256 tokens 全部が reasoning、content 空、33 秒
+      #   thinking なし: 2 tokens で "Yes"、即答
+      # roles/guardrails/templates/nemo-guardrails-config.yml.j2 と同じ設定にすること。
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: {guardrails_thinking}
 
 rails:
   input:
