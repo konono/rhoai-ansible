@@ -71,7 +71,7 @@ models (components.yml)
 
 ### ユーザーの追加
 
-**何が起きるか**: Keycloak の `maas` realm にユーザーが作成され、指定したグループに割り当てられます。パスワードが自動生成され、`.credentials/<username>.password` に保存されます。
+**何が起きるか**: Keycloak の `maas` realm にユーザーが作成され、指定したグループに割り当てられます。パスワードが自動生成され、`.credentials/<inventory名>/<username>.password` に保存されます（台帳は inventory ごとに分かれます）。
 
 1. `inventory/myenv/group_vars/all/components.yml` を編集:
 
@@ -97,7 +97,7 @@ models (components.yml)
 3. パスワードを確認:
 
    ```bash
-   cat .credentials/newuser.password
+   cat .credentials/<inventory名>/newuser.password
    ```
 
 **注意**:

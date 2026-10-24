@@ -89,12 +89,12 @@ uv run ansible-playbook playbooks/manage_maas_access.yml -i inventory/<env>
 **Step 3.** 発行されたパスワードを確認して本人に渡す。
 
 ```bash
-cat .credentials/ta-suzuki.password
+cat .credentials/<inventory名>/ta-suzuki.password
 ```
 
 **仕組み**（`roles/keycloak/tasks/manage_maas_access.yml`）:
 - Keycloak に同名ユーザーが**存在しない場合のみ**、12文字の英数字パスワードを生成してユーザーを作成する
-- 生成したパスワードを `.credentials/<username>.password`（パーミッション 0600）に保存する
+- 生成したパスワードを `.credentials/<inventory名>/<username>.password`（パーミッション 0600）に保存する
 - `temporary: false` で作成するため、初回ログイン時のパスワード変更は要求されない
 - 既に存在するユーザーには**一切触れない**（パスワードは再生成されない）
 - グループ割当は差分のみ適用する（既に所属していればスキップ）
@@ -113,19 +113,21 @@ cat .credentials/ta-suzuki.password
 
 ```bash
 # 個別
-cat .credentials/<username>.password
+cat .credentials/<inventory名>/<username>.password
 
 # 一覧
-ls -l .credentials/
-for f in .credentials/*.password; do
+ls -l .credentials/<inventory名>/
+for f in .credentials/<inventory名>/*.password; do
   printf "%-20s %s\n" "$(basename "$f" .password)" "$(cat "$f")"
 done
 ```
 
 `playbooks/verify.yml` の環境サマリーにも、保存済み資格情報の一覧が `cat` コマンド付きで表示される。
 
-> `.credentials/` に無いユーザーは、**この playbook 以外の経路で作られた**か、
-> **別の作業ディレクトリで作成された**。後者の場合は旧ディレクトリの `.credentials/` を探す。
+> `.credentials/<inventory名>/` に無いユーザーは、**この playbook 以外の経路で
+> 作られた**か、**別の作業ディレクトリ・別 inventory で作成された**。
+> 分離前のフラット配置 `.credentials/<username>.password` にある場合もあるので
+> そちらも確認する。
 
 ### 2.3 既存ユーザーのパスワードをリセットする
 
@@ -206,7 +208,7 @@ curl -sk -X DELETE -H "Authorization: Bearer ${TOKEN}" \
 ```
 
 あわせて `components.yml` の `keycloak_users` から該当エントリを削除し、
-`.credentials/<username>.password` も削除しておく（inventory と実態を合わせるため）。
+`.credentials/<inventory名>/<username>.password` も削除しておく（inventory と実態を合わせるため）。
 
 ---
 
@@ -1056,14 +1058,25 @@ thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を�
     └── testuser1.password     ← 別物として扱われる
 ```
 
-**既存の台帳は消さずにそのまま残してください。** 分離前のフラット配置は
-読み取り時のフォールバックとして参照します。ユーザーを作り直した際、
-環境別ディレクトリに無ければフラット配置から引き継ぎ、以後は環境別の方へ
-保存します。
+**既存の台帳は消さずにそのまま残してください。** 既に Keycloak に存在する
+ユーザーについては読み書きしないため、そのままでも動作に支障はありません。
 
-既に Keycloak に存在するユーザーについては読み書きしないため、フラット配置の
-ファイルはそのまま残ります。どの環境のものか分かる場合は手で移動しておくと
-台帳が整理されます（移動しなくても動作に支障はありません）。
+分離前のフラット配置を引き継ぐかは **inventory ごとの opt-in** です。
+無条件に引き継ぐと、同名ユーザーを持つ別環境でも同じファイルを読んでしまい、
+分離した意味がなくなるためです。旧台帳の持ち主である inventory にだけ設定します。
+
+```yaml
+# inventory/<旧台帳の持ち主>/group_vars/all/components.yml
+credentials_adopt_legacy: true
+```
+
+これを設定した inventory でユーザーを作り直すと、環境別ディレクトリに
+ファイルが無い場合にフラット配置から引き継ぎ、以後は環境別の方へ保存します。
+引き継いだ際は、どのファイルをどこへ移したかが実行ログに出ます。
+
+設定していない inventory（既定）では旧台帳を読まず、新しいパスワードを
+生成します。どの環境のものか分かっている旧ファイルは、手で
+`.credentials/<inventory名>/` へ移しておくと台帳が整理されます。
 
 ## 8. 秘密情報の保管場所
 

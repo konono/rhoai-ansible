@@ -568,14 +568,26 @@
       register: _cred_dir
       tags: [always]
 
-    # 台帳は .credentials/<inventory名>/ に分かれている。分離前のフラット配置も
-    # 残り得るので、再帰検索して両方を拾う。
-    - name: Check for saved credentials
+    # 台帳は .credentials/<inventory名>/ に分かれている。再帰検索で全環境を
+    # まとめて拾うと、同名ユーザーがどの環境のものか分からないまま並ぶので、
+    # 実行中の inventory のものだけを出す。
+    - name: Check for saved credentials of this inventory
+      ansible.builtin.find:
+        paths: "{{ ansible_root }}/.credentials/{{ inventory_dir | basename }}"
+        patterns: "*.password"
+      register: _cred_files
+      failed_when: false
+      when: _cred_dir.stat.isdir | default(false)
+      tags: [always]
+
+    # 分離前のフラット配置。移行待ちとして別に示す。
+    - name: Check for credentials left in the legacy flat layout
       ansible.builtin.find:
         paths: "{{ ansible_root }}/.credentials"
         patterns: "*.password"
-        recurse: true
-      register: _cred_files
+        recurse: false
+      register: _cred_files_legacy
+      failed_when: false
       when: _cred_dir.stat.isdir | default(false)
       tags: [always]
 
@@ -652,10 +664,19 @@
           {% endif %}
           {% if _cred_files.files | default([]) | length > 0 %}
 
-          --- Saved Credentials ---
+          --- Saved Credentials ({{ inventory_dir | basename }}) ---
           {% for f in _cred_files.files %}
           {{ f.path | basename | replace('.password', '') }}:  cat {{ f.path }}
           {% endfor %}
+          {% endif %}
+          {% if _cred_files_legacy.files | default([]) | length > 0 %}
+
+          --- 分離前の台帳 (どの環境のものか不明。移行推奨) ---
+          {% for f in _cred_files_legacy.files %}
+          {{ f.path | basename | replace('.password', '') }}:  cat {{ f.path }}
+          {% endfor %}
+          引き継ぐ inventory で credentials_adopt_legacy: true を設定するか、
+          .credentials/<inventory名>/ へ手で移動してください。
           {% endif %}
       tags: [always]
 

@@ -126,8 +126,15 @@ keycloak_realm: maas
 
 # ユーザーは宣言的に管理される。
 # 新規ユーザーには 12 文字のパスワードが自動発行され、
-# .credentials/<username>.password (0600) に保存される。
+# .credentials/<この inventory のディレクトリ名>/<username>.password (0600) に保存される。
+# 台帳は inventory ごとに分かれるため、同名ユーザーを別環境で使っても
+# パスワードは共有されない。
 # 既存ユーザーのパスワードは変更されない (リセットは docs/daily-operations.md 2.3 を参照)。
+
+# 分離前は .credentials/<username>.password のようにフラットに置いていた。
+# その台帳を引き継ぐ inventory でだけ true にする (既定 false)。
+# 無条件に引き継ぐと同名ユーザーで環境間のパスワード共有が再発するため。
+# credentials_adopt_legacy: false
 # groups からグループ名を外すと Keycloak 側の所属も解除される
 # (解除対象は keycloak_groups に定義済みのグループのみ。
 #  止めたい場合は -e keycloak_prune_group_membership=false)。
