@@ -201,3 +201,73 @@ class TestLlmEditArgs(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestQuotingIsIdempotent(unittest.TestCase):
+    """既にクォート済みの引数を再適用しても二重にならないこと
+
+    scripts/vllm-args.sh は稼働中の LLMInferenceService から args を読んで
+    $EDITOR に渡し、保存すると llm_edit_args.yml に戻す。読んだ時点で値は
+    既にシングルクォート済みなので、素朴に再クォートすると
+      --speculative-config=''{"method":"mtp",...}''
+    となり、eval 後にまた 2 引数へ分割されて MTP が壊れる。
+    """
+
+    def _render(self, args_list):
+        import json
+        import re
+
+        import yaml
+        from jinja2 import Environment, FileSystemLoader
+
+        env = Environment(loader=FileSystemLoader(str(TEMPLATE.parent)))
+        env.filters["to_json"] = json.dumps
+        env.filters["default"] = lambda val, d="": val if val else d
+        env.filters["combine"] = lambda a, b: {**a, **b}
+        env.tests["search"] = (
+            lambda val, pattern: re.search(pattern, str(val)) is not None
+        )
+        doc = yaml.safe_load(env.get_template(TEMPLATE.name).render(
+            _model_name="demo-model",
+            _model_cfg={
+                "namespace": "llm-serving",
+                "vllm_image": "vllm/vllm-openai:v0.28.0",
+                "vllm_args": args_list,
+                "vllm_env": {},
+                "custom_chat_template": "",
+                "chat_template_configmap": "",
+                "shm_size": "",
+            },
+        ))
+        return doc["spec"]["template"]["containers"][0]["args"]
+
+    def test_template_quoting_is_idempotent(self):
+        once = self._render([SPEC_ARG])
+        twice = self._render(once)
+        self.assertEqual(once, twice,
+                         "再適用で二重クォートになっています: " + repr(twice))
+
+    def test_double_quoted_value_would_split(self):
+        """二重クォートが実際に壊れることを示し、テストの意味を担保する"""
+        broken = SPEC_ARG.split("=", 1)[0] + "=''" + SPEC_ARG.split("=", 1)[1] + "''"
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "e.sh"
+            script.write_text('eval "set -- $1"\nprintf \'%s\\n\' "$@"\n')
+            r = subprocess.run(["bash", str(script), broken],
+                               capture_output=True, text=True)
+        out = [ln for ln in r.stdout.splitlines() if ln]
+        self.assertGreater(len(out), 1,
+                           "二重クォートが分割されない前提が崩れています")
+
+    def test_round_trip_through_cluster_args_survives_eval(self):
+        """クラスタから読んだ args を再適用しても eval 後に原形を保つこと"""
+        once = self._render([SPEC_ARG])
+        twice = self._render(once)
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d) / "e.sh"
+            script.write_text('eval "set -- $1"\nprintf \'%s\\n\' "$@"\n')
+            r = subprocess.run(["bash", str(script), twice[-1]],
+                               capture_output=True, text=True)
+        out = [ln for ln in r.stdout.splitlines() if ln]
+        self.assertEqual(out, [SPEC_ARG],
+                         "再適用後に分割・変形しています: " + repr(out))

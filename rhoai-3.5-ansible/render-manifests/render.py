@@ -164,9 +164,15 @@ def _shell_safe_arg(arg: str) -> str:
       -> --speculative-config=method:mtp / --speculative-config=num_speculative_tokens:1
     値をシングルクォートで囲むと原形を保てる。
     roles/llm_serving/templates/llminferenceservice.yml.j2 と同じ条件にすること。
+
+    既にクォート済みの値は二重に囲まない。scripts/vllm-args.sh のように
+    クラスタから読んだ args をそのまま渡してくる経路があり、再適用すると
+    ''{...}'' になって eval 後にまた分割されてしまう。
     """
     if _SHELL_SPECIAL.search(arg) and "=" in arg:
         key, value = arg.split("=", 1)
+        if len(value) > 1 and value.startswith("'") and value.endswith("'"):
+            return arg
         return f"{key}='{value}'"
     return arg
 
@@ -1750,6 +1756,8 @@ class ManifestRenderer:
         model_steps = []
         absent_steps = []
         cm_names_created: set[tuple[str, str]] = set()
+        # present なモデルが参照している ConfigMap 名（作成有無を問わない）
+        referenced_cms: set[str] = set()
         for model_name, model_cfg_raw in self.models.items():
             model_cfg = self._merge_model_cfg(model_cfg_raw)
 
@@ -1800,6 +1808,8 @@ class ManifestRenderer:
             use_chat_template = bool(custom_ct) or bool(
                 model_cfg.get("chat_template_configmap")
             )
+            if use_chat_template:
+                referenced_cms.add(cm_name)
 
             # Download Job
             job = {
@@ -1938,6 +1948,16 @@ class ManifestRenderer:
             )
 
         # Generate ConfigMap creation commands for all unique names
+        # モデルを absent にしたり custom_chat_template を外すと、作成済みの
+        # ConfigMap がクラスタに残る。Ansible 側 (llm_serving) と同じ後始末を
+        # 手順書にも入れる。対象は models から導ける名前だけに限定する。
+        # 作成対象だけでなく「present なモデルが参照している名前」も除外する。
+        # chat_template_configmap だけ指定して利用者が自分で作った ConfigMap を
+        # マウントする使い方があり、これを消してはいけない。
+        keep_cms = {cm for cm, _ in cm_names_created} | referenced_cms
+        stale_cms = sorted(
+            f"{m}-chat-template" for m in self.models if f"{m}-chat-template" not in keep_cms
+        )
         cm_cmds = "\n".join(
             f"oc create configmap {cm} -n {llm_ns} \\\n"
             f"  --from-file=chat_template.jinja=manifests/09-llm-serving/chat_template-{tpl}.jinja \\\n"
@@ -1982,7 +2002,12 @@ class ManifestRenderer:
             "fi\n\n"
             "# Chat template ConfigMap\n"
             + cm_cmds + "\n"
-            "```\n\n"
+            + ("\n# 不要になった chat template ConfigMap を削除する\n"
+               + "\n".join(
+                   f"oc delete configmap {cm} -n {llm_ns} --ignore-not-found"
+                   for cm in stale_cms)
+               + "\n" if stale_cms else "")
+            + "```\n\n"
             + absent_section
             + present_section
         ))

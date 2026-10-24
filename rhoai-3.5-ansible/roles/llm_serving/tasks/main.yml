@@ -192,6 +192,31 @@
         # 作成済みの ConfigMap をマウントするだけなので作らない。
         - (_cfg.custom_chat_template | default('')) | length > 0
 
+    # 「作成対象」(_chat_template_specs) とは別に、「present なモデルが参照して
+    # いる ConfigMap 名」を集める。chat_template_configmap だけを指定して
+    # 利用者が自分で作った ConfigMap をマウントする使い方があり、これを
+    # prune で消してはいけない。
+    - name: Collect chat template ConfigMap names referenced by present models
+      ansible.builtin.set_fact:
+        _chat_template_refs: >-
+          {{ (_chat_template_refs | default([]))
+             + [ (_cfg.chat_template_configmap | default(''))
+                 if (_cfg.chat_template_configmap | default('')) | length > 0
+                 else (item.key ~ '-chat-template') ] }}
+      vars:
+        _cfg: >-
+          {{ model_defaults
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(item.value.hf_repo | default(''), {}), recursive=True)
+             | combine(item.value, recursive=True) }}
+      loop: "{{ models | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+      when:
+        - (item.value.state | default(model_defaults.state)) == 'present'
+        - ((_cfg.custom_chat_template | default('')) | length > 0)
+          or ((_cfg.chat_template_configmap | default('')) | length > 0)
+
     - name: Check that the referenced chat templates exist
       ansible.builtin.stat:
         path: "{{ inventory_dir }}/chat_templates/{{ item.src }}.jinja"
@@ -241,6 +266,28 @@
       loop: "{{ _chat_template_contents.results | default([]) }}"
       loop_control:
         label: "{{ item.item.name }} <- {{ item.item.src }}.jinja"
+
+    # モデルを absent にしたり custom_chat_template を外すと、作成済みの
+    # ConfigMap がクラスタに残り続ける（作るだけで消していなかった。実機で確認）。
+    # 対象は inventory の models から導ける名前だけに限定するので、
+    # 無関係な ConfigMap を巻き込むことはない。
+    - name: Collect chat template ConfigMap names that are no longer needed
+      ansible.builtin.set_fact:
+        _stale_chat_template_cms: >-
+          {{ (models | default({}) | dict2items
+              | map(attribute='key') | map('regex_replace', '$', '-chat-template')
+              | list)
+             | difference(_chat_template_refs | default([]))
+             | difference(_chat_template_specs | default([]) | map(attribute='name') | list) }}
+
+    - name: Remove chat template ConfigMaps that are no longer needed
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: ConfigMap
+        name: "{{ item }}"
+        namespace: "{{ llm_namespace }}"
+      loop: "{{ _stale_chat_template_cms | default([]) }}"
 
     - name: Create llm-serving-sa ServiceAccount
       kubernetes.core.k8s:

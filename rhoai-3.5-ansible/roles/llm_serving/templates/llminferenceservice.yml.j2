@@ -52,7 +52,11 @@ spec:
 {%   if _needs_quote and '=' in arg %}
 {%     set _k = arg.split('=', 1)[0] %}
 {%     set _v = arg.split('=', 1)[1] %}
-{%     set _arg = _k ~ "='" ~ _v ~ "'" %}
+{#     既にクォート済みの値を二重に囲まない。scripts/vllm-args.sh のように
+       クラスタから読んだ args をそのまま渡してくる経路があり、再適用すると
+       ''{...}'' になって eval 後にまた分割されてしまう。 #}
+{%     set _quoted = _v | length > 1 and _v.startswith("'") and _v.endswith("'") %}
+{%     set _arg = (_k ~ "=" ~ _v) if _quoted else (_k ~ "='" ~ _v ~ "'") %}
 {%   else %}
 {%     set _arg = arg %}
 {%   endif %}
