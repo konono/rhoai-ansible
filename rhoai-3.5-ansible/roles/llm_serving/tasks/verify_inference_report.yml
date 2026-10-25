@@ -1,0 +1,33 @@
+---
+# roles/llm_serving/tasks/verify_inference_report.yml
+# 1 件目のレスポンスを人間が読める形で出す。direct / maas 双方から呼ばれる。
+#
+# Qwen3 系のような reasoning モデルは、max_tokens を使い切って思考段階で
+# 打ち切られると content が null になる。それを「応答なし」と誤読しないよう、
+# finish_reason と reasoning トークン数も一緒に表示する。
+
+- name: "Parse the first response ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    # 成功したリクエストの 1 件目を見る（経路ごとにループしている場合がある）
+    _vi_resp: >-
+      {{ (_vi_calls.results | selectattr('rc', 'equalto', 0) | list | first).stdout
+         | regex_replace('\n__TIMING__.*$', '') | from_json }}
+
+- name: "Response summary ({{ _model_name }})"
+  ansible.builtin.debug:
+    msg:
+      - "finish_reason    : {{ _vi_choice.finish_reason | default('不明') }}"
+      - "completion tokens: {{ _vi_usage.completion_tokens | default(0) }}
+         (うち reasoning {{ _vi_usage.completion_tokens_details.reasoning_tokens | default(0) }})"
+      - "content          : {{ _vi_content | default('', true) | truncate(400)
+                               if (_vi_content | default('', true)) | length > 0
+                               else '(空)' }}"
+      - "{{ 'NOTE: max_tokens を思考で使い切って本文が出ていません。'
+             ~ 'inference_max_tokens を増やすか、chat_template_kwargs で thinking を切ってください。'
+           if _vi_choice.finish_reason | default('') == 'length'
+              and (_vi_content | default('', true)) | length == 0
+           else '' }}"
+  vars:
+    _vi_choice: "{{ _vi_resp.choices[0] | default({}) }}"
+    _vi_usage: "{{ _vi_resp.usage | default({}) }}"
+    _vi_content: "{{ _vi_choice.message.content | default('', true) }}"

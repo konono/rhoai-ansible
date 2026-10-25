@@ -12,6 +12,18 @@ data:
         parameters:
           base_url: "https://{{ llm_model_name }}-kserve-workload-svc.llm-serving.svc.cluster.local:8000/v1"
           api_key: "dummy"
+          # Qwen3 系のような reasoning モデルは、rail の判定プロンプトに対しても
+          # まず思考を出力する。self_check は max_tokens が小さいため思考だけで
+          # 使い切り、content が空のまま返って Yes/No を判定できない。
+          # 1 リクエストで input/output の 2 つの rail + 本体生成が走るため、
+          # 結果として chat/completions が返らなくなる（実機で発生）。
+          #   thinking あり: 256 tokens 全部が reasoning、content 空、33 秒
+          #   thinking なし: 2 tokens で "Yes"、即答
+          # vLLM は chat_template_kwargs で思考を切れる。OpenAI 互換クライアント
+          # からは extra_body 経由で渡す。
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: {{ guardrails_enable_thinking | default(false) | lower }}
 
     rails:
       input:

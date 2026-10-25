@@ -1,0 +1,105 @@
+---
+# 実際に推論リクエストを投げて、モデルが応答することと
+# speculative decoding (MTP) が効いているかを確認する。
+#
+# verify.yml はリソースが Ready かどうかの構造チェックしかしないため、
+# 「Ready なのに推論が返らない」「MTP を設定したのに効いていない」は検出できない。
+# この playbook は vLLM の /metrics を推論の前後で差分取りして受理率を出す。
+#
+# Usage:
+#   # 全 present モデルを直接叩く (DNS 不要。vLLM 自体の確認)
+#   uv run ansible-playbook playbooks/llm_verify_inference.yml -i inventory/<env>
+#
+#   # モデルを指定
+#   ... -e model=qwen3-5-9b
+#
+#   # MaaS Gateway 経由で認証込みの疎通も確認する (body-based と path-based の両方)
+#   ... -e inference_via=maas -e maas_api_user=admin1
+#
+#   # 片方だけ確認する
+#   ... -e inference_via=maas -e '{"maas_routes": ["body"]}'
+#
+#   # 受理率の測定精度を上げる (既定 3 リクエスト x 512 トークン)
+#   ... -e inference_requests=10 -e inference_max_tokens=1024
+#
+# 注: inference_via=direct は oc exec でコンテナ内から localhost を叩くため、
+#     Route53 未設定の環境でも動く。MaaS の認可は検証されない。
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  vars:
+    inference_via: direct          # direct | maas
+    inference_requests: 3
+    inference_max_tokens: 512
+    # reasoning モデル (Qwen3 系) は思考だけで 512 トークンを使い切り、
+    # content が空のまま finish_reason=length で返る。検証では思考を切って
+    # 短く確定的に応答させる。thinking 込みで見たいときは {} を渡す。
+    inference_chat_template_kwargs:
+      enable_thinking: false
+    inference_prompt: >-
+      Explain in three sentences why speculative decoding speeds up
+      large language model inference.
+    # MTP の受理率がこれを下回ったら警告する (0 なら MTP が効いていない)
+    inference_min_acceptance_rate: 0.0
+    maas_api_user: ""
+    # MaaS Gateway のルーティング方式。既定は両方を検証する。
+    #   body: POST /v1/chat/completions         (RHOAI 3.5 推奨。ボディの model で振り分け)
+    #   path: POST /<namespace>/<model>/v1/...  (従来方式)
+    maas_routes: [body, path]
+  tasks:
+    - name: Load llm_serving role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/defaults/main.yml"
+        name: _rd
+      tags: [always]
+
+    - name: Load per-model vLLM recipes
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/llm_serving/vars/model_recipes.yml"
+      tags: [always]
+
+    - name: Select target models
+      ansible.builtin.set_fact:
+        _targets: >-
+          {{ models | default({}) | dict2items
+             | selectattr('key', 'equalto', model) | list
+             if model is defined
+             else models | default({}) | dict2items
+                  | rejectattr('value.state', 'defined') | list
+                  + models | default({}) | dict2items
+                    | selectattr('value.state', 'defined')
+                    | selectattr('value.state', 'equalto', 'present') | list }}
+      tags: [always]
+
+    - name: Fail when there is no model to test
+      ansible.builtin.fail:
+        msg: >-
+          検証対象のモデルがありません。
+          定義済み: {{ models | default({}) | list | join(', ') }}
+      when: _targets | length == 0
+      tags: [always]
+
+    - name: Run inference verification
+      ansible.builtin.include_tasks: ../roles/llm_serving/tasks/verify_inference.yml
+      loop: "{{ _targets }}"
+      loop_control:
+        loop_var: _m
+        label: "{{ _m.key }}"
+      vars:
+        _model_name: "{{ _m.key }}"
+        _namespace: >-
+          {{ _m.value.namespace
+             | default((model_defaults | default(_rd.model_defaults)).namespace
+                       | default('llm-serving')) }}
+        # 投機デコードの方式を表示するために解決しておく。
+        # roles/llm_serving/tasks/main.yml と同じ順序。
+        _model_cfg: >-
+          {{ model_defaults | default(_rd.model_defaults)
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(_m.value.hf_repo | default(''), {}), recursive=True)
+             | combine(_m.value, recursive=True) }}
+      tags: [workload, llm, inference]

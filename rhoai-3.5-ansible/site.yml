@@ -156,7 +156,7 @@
     - name: NeMo Guardrails
       ansible.builtin.import_role:
         name: guardrails
-      when: install_guardrails
+      when: install_guardrails | default(false)
       tags: [workload, guardrails]
 
     - name: RHOAI Observability
@@ -176,6 +176,8 @@
       register: _opencode
       changed_when: "'opencode.json' in _opencode.stdout"
       failed_when: false
+      # download_only ではモデルが公開されていないため API キーを発行できない。
+      when: not (download_only | default(false) | bool)
       tags: [post_deploy, opencode]
 
     - name: Warn if OpenCode setup failed
@@ -184,7 +186,9 @@
           WARNING: OpenCode setup failed (rc={{ _opencode.rc }}).
           API Key / opencode.json が未生成の可能性があります。
           手動で実行: bash scripts/setup-opencode.sh setup
-      when: _opencode.rc | default(0) != 0
+      when:
+        - not (download_only | default(false) | bool)
+        - _opencode.rc | default(0) != 0
       tags: [post_deploy, opencode]
 
 # A full deployment is complete only after the unscoped verification passes.

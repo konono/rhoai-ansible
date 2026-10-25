@@ -7,6 +7,10 @@
 #   ansible-playbook playbooks/verify.yml -i inventory/myenv --tags platform
 #   ansible-playbook playbooks/verify.yml -i inventory/myenv -e install_ogx=false  # OGX スキップ
 #
+# download_only=true でデプロイした場合は LLMInferenceService を作っていないため、
+# LIS / MaaSModelRef / Subscription の検証はスキップされる。
+#   ansible-playbook playbooks/verify.yml -i inventory/myenv -e download_only=true
+#
 - hosts: localhost
   connection: local
   gather_facts: false
@@ -272,6 +276,7 @@
         label: "{{ item.key }}"
       when:
         - install_llm_serving | default(true)
+        - not (download_only | default(false) | bool)
         - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
       tags: [workload, llm]
 
@@ -304,6 +309,7 @@
         label: "{{ item.key }}"
       when:
         - install_maas_resources | default(true)
+        - not (download_only | default(false) | bool)
         - (item.value.state | default(model_defaults.state | default('present'))) == 'present'
       tags: [workload, maas]
 
@@ -342,6 +348,9 @@
       when:
         - install_maas_resources | default(true)
         - install_keycloak | default(true)
+        # download_only では MaaSModelRef が無く Subscription は Failed のまま。
+        # LLMInferenceService を作れば解消するので、ここでは検証しない。
+        - not (download_only | default(false) | bool)
         - _expected_models | length > 0
       tags: [workload, maas]
 
@@ -444,7 +453,7 @@
       failed_when: >-
         _guardrails.resources | length == 0 or
         _guardrails.resources[0].status.phase | default('') != 'Ready'
-      when: install_guardrails | default(true)
+      when: install_guardrails | default(false)
       tags: [workload, guardrails]
 
     # ==================== Health: Routes ====================
@@ -559,11 +568,26 @@
       register: _cred_dir
       tags: [always]
 
-    - name: Check for saved credentials
+    # 台帳は .credentials/<inventory名>/ に分かれている。再帰検索で全環境を
+    # まとめて拾うと、同名ユーザーがどの環境のものか分からないまま並ぶので、
+    # 実行中の inventory のものだけを出す。
+    - name: Check for saved credentials of this inventory
+      ansible.builtin.find:
+        paths: "{{ ansible_root }}/.credentials/{{ inventory_dir | basename }}"
+        patterns: "*.password"
+      register: _cred_files
+      failed_when: false
+      when: _cred_dir.stat.isdir | default(false)
+      tags: [always]
+
+    # 分離前のフラット配置。移行待ちとして別に示す。
+    - name: Check for credentials left in the legacy flat layout
       ansible.builtin.find:
         paths: "{{ ansible_root }}/.credentials"
         patterns: "*.password"
-      register: _cred_files
+        recurse: false
+      register: _cred_files_legacy
+      failed_when: false
       when: _cred_dir.stat.isdir | default(false)
       tags: [always]
 
@@ -640,10 +664,19 @@
           {% endif %}
           {% if _cred_files.files | default([]) | length > 0 %}
 
-          --- Saved Credentials ---
+          --- Saved Credentials ({{ inventory_dir | basename }}) ---
           {% for f in _cred_files.files %}
           {{ f.path | basename | replace('.password', '') }}:  cat {{ f.path }}
           {% endfor %}
+          {% endif %}
+          {% if _cred_files_legacy.files | default([]) | length > 0 %}
+
+          --- 分離前の台帳 (どの環境のものか不明。移行推奨) ---
+          {% for f in _cred_files_legacy.files %}
+          {{ f.path | basename | replace('.password', '') }}:  cat {{ f.path }}
+          {% endfor %}
+          引き継ぐ inventory で credentials_adopt_legacy: true を設定するか、
+          .credentials/<inventory名>/ へ手で移動してください。
           {% endif %}
       tags: [always]
 

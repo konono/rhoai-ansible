@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import base64
 import os
+import re
 import secrets
 import string
 import sys
@@ -110,6 +111,12 @@ def render_operator(name: str, namespace: str, channel: str,
 # （render.py 内に同じ値を二重に持たないため）。
 # inventory が model_defaults を丸ごと置き換えてキーが欠けても、
 # Ansible 側と同じ結果になるよう揃える。
+# Ansible が生成した MaaS ポリシーの目印。
+# これが無いと、モデルを absent にしてテンプレートから消えたポリシーを
+# 後から特定して削除できない (oc apply は manifest に無いものを消さない)。
+# roles/keycloak/templates/maas-policies.yml.j2 と同じ値にすること。
+_MAAS_MANAGED_LABELS = {"app.kubernetes.io/managed-by": "ansible-maas-access"}
+
 _TEMPLATE_DEFAULT_KEYS = (
     "replicas",
     "gpu_count",
@@ -144,6 +151,32 @@ def _fill_missing(target: dict, defaults: dict) -> dict:
 _REQUIRED_MODEL_KEYS = ("hf_repo", "namespace", "vllm_image")
 
 
+_SHELL_SPECIAL = re.compile(r"[{}(),*?\[\]]")
+
+
+def _shell_safe_arg(arg: str) -> str:
+    """KServe の eval を通しても壊れない形にする。
+
+    LLMInferenceService の args は
+      eval "exec vllm serve ... $@"
+    で評価されるため、{} , などを含む値は bash のブレース展開で分割される。
+    実測: --speculative-config={"method":"mtp","num_speculative_tokens":1}
+      -> --speculative-config=method:mtp / --speculative-config=num_speculative_tokens:1
+    値をシングルクォートで囲むと原形を保てる。
+    roles/llm_serving/templates/llminferenceservice.yml.j2 と同じ条件にすること。
+
+    既にクォート済みの値は二重に囲まない。scripts/vllm-args.sh のように
+    クラスタから読んだ args をそのまま渡してくる経路があり、再適用すると
+    ''{...}'' になって eval 後にまた分割されてしまう。
+    """
+    if _SHELL_SPECIAL.search(arg) and "=" in arg:
+        key, value = arg.split("=", 1)
+        if len(value) > 1 and value.startswith("'") and value.endswith("'"):
+            return arg
+        return f"{key}='{value}'"
+    return arg
+
+
 class _QuotingDumper(yaml.SafeDumper):
     """JSON を値に含む文字列をシングルクォートで出力する Dumper。
 
@@ -164,9 +197,13 @@ _QuotingDumper.add_representer(str, _represent_str)
 
 
 class ManifestRenderer:
-    def __init__(self, cfg: dict[str, Any], output_dir: Path):
+    def __init__(self, cfg: dict[str, Any], output_dir: Path,
+                 inventory_dir: Path | None = None):
         self.cfg = cfg
         self.out = output_dir
+        # custom_chat_template の実体を探す起点 (inventory/<env>)。
+        # Ansible の inventory_dir に相当する。
+        self.inventory_dir = Path(inventory_dir) if inventory_dir else Path(".")
         self.guide_steps: list[str] = []
         self.step_num = 0
         self._generated_passwords: dict[str, str] = {}
@@ -186,7 +223,8 @@ class ManifestRenderer:
             "namespace": "llm-serving",
             "state": "present",
             "vllm_image": "vllm/vllm-openai:v0.28.0",
-            "chat_template_configmap": "qwen3-chat-template",
+            "custom_chat_template": "",
+            "chat_template_configmap": "",
             "replicas": 1,
             "gpu_count": 1,
             # vLLM 引数は hf_repo をキーにした model_recipes から解決する
@@ -665,7 +703,7 @@ class ManifestRenderer:
             "install_ogx": self.cfg.get("install_ogx", True),
             "install_mlflow": self.cfg.get("install_mlflow", True),
             "install_maas_resources": self.cfg.get("install_maas_resources", True),
-            "install_guardrails": self.cfg.get("install_guardrails", True),
+            "install_guardrails": self.cfg.get("install_guardrails", False),
         }
 
         # Operator
@@ -1351,6 +1389,13 @@ class ManifestRenderer:
         # Generate MaaS policies manifest
         maas_policy_docs = self._render_maas_policies()
         self._write_manifests("07-integration", "maas-policies.yml", maas_policy_docs)
+        # prune 手順で「残すもの」として使う。手順書の実行時に YAML を
+        # 解析させると PyYAML 不在で空になり、全件削除に化ける危険がある。
+        # 名前はここで確定しているので、そのまま手順書へ埋め込む。
+        keep_policy_names = sorted(
+            d["metadata"]["name"] for d in maas_policy_docs
+            if d.get("kind") in ("MaaSAuthPolicy", "MaaSSubscription")
+        )
 
         self._step("Keycloak → MaaS Policies 統合", (
             "この手順では Keycloak API でユーザー/グループを作成し、MaaS ポリシーを適用します。\n\n"
@@ -1397,6 +1442,29 @@ class ManifestRenderer:
             "### MaaS Policies 適用\n\n"
             "```bash\n"
             "oc apply --server-side --force-conflicts -f manifests/07-integration/maas-policies.yml\n"
+            "```\n\n"
+            "### 不要になった MaaS Policy の削除\n\n"
+            "`oc apply` は manifest に無いリソースを削除しない。モデルを absent に\n"
+            "したりグループを設定から外すと、生成物から消えた AuthPolicy /\n"
+            "Subscription がクラスタに残り、存在しないモデルを参照したまま Failed に\n"
+            "なる（実機で発生）。Ansible 側 (manage_maas_access) と同じ後始末を行う。\n\n"
+            "```bash\n"
+            "# 今回の manifest に含まれる名前 (レンダリング時に確定済み)\n"
+            f"KEEP='{' '.join(keep_policy_names)}'\n"
+            "\n"
+            "# Ansible/手順書が作ったものだけを対象にする (ラベルで限定)\n"
+            "for KIND in maasauthpolicy maassubscription; do\n"
+            "  NAMES=$(oc get $KIND -n models-as-a-service \\\n"
+            "    -l app.kubernetes.io/managed-by=ansible-maas-access \\\n"
+            "    -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}') || {\n"
+            "      echo \"$KIND の一覧取得に失敗。削除せず中断する\" >&2; break; }\n"
+            "  for NAME in $NAMES; do\n"
+            "    case \" $KEEP \" in\n"
+            "      *\" $NAME \"*) ;;\n"
+            "      *) echo \"deleting $KIND/$NAME\"; oc delete $KIND/$NAME -n models-as-a-service ;;\n"
+            "    esac\n"
+            "  done\n"
+            "done\n"
             "```"
         ))
 
@@ -1450,8 +1518,12 @@ class ManifestRenderer:
         # Ansible 側は combine でそのまま取り込むため、落とすと
         # 解決後の設定が両者でずれる（テンプレートは参照しないので出力は同じだが、
         # 将来キーを列挙する処理を足したときに差が出る）。
-        recipe = {**(recipes.get("_fallback") or {}),
-                  **(recipes.get(cfg.get("hf_repo", ""), {}) or {})}
+        # レシピ層も再帰マージする。Ansible 側は
+        # combine(_fallback, recursive=True) | combine(recipe, recursive=True)
+        # なので、浅いマージだと _fallback のネストしたキーが
+        # モデル別レシピに丸ごと上書きされてずれる。
+        recipe = _deep_merge(recipes.get("_fallback") or {},
+                             recipes.get(cfg.get("hf_repo", ""), {}) or {})
 
         # Ansible 側は combine(..., recursive=True) なので再帰マージで揃える。
         # 浅いマージだと vllm_env や resources のようなネスト dict が
@@ -1496,15 +1568,21 @@ class ManifestRenderer:
 
         # Admin AuthPolicy
         admin_model_refs = [{"name": n, "namespace": m["namespace"]} for n, m in active_models.items()]
-        docs.append({
-            "apiVersion": "maas.opendatahub.io/v1alpha1",
-            "kind": "MaaSAuthPolicy",
-            "metadata": {"name": "admin-auth-policy", "namespace": "models-as-a-service"},
-            "spec": {
-                "subjects": {"groups": [{"name": "cluster-admins"}, {"name": "maas-admins"}], "users": ["cluster-admin"]},
-                "modelRefs": admin_model_refs,
-            },
-        })
+        # present なモデルが 0 件だと modelRefs が null になり、CRD の
+        # "spec.modelRefs in body must be of type array" で apply が失敗する。
+        # 全モデルを absent にしたときに実際に発生したため、モデルが無ければ出力しない。
+        # roles/keycloak/templates/maas-policies.yml.j2 と同じ条件にすること。
+        if admin_model_refs:
+            docs.append({
+                "apiVersion": "maas.opendatahub.io/v1alpha1",
+                "kind": "MaaSAuthPolicy",
+                "metadata": {"name": "admin-auth-policy", "namespace": "models-as-a-service",
+                             "labels": _MAAS_MANAGED_LABELS},
+                "spec": {
+                    "subjects": {"groups": [{"name": "cluster-admins"}, {"name": "maas-admins"}], "users": ["cluster-admin"]},
+                    "modelRefs": admin_model_refs,
+                },
+            })
 
         # Per-group AuthPolicy + Subscription
         for group_name, group_cfg in keycloak_groups.items():
@@ -1520,7 +1598,8 @@ class ManifestRenderer:
                 docs.append({
                     "apiVersion": "maas.opendatahub.io/v1alpha1",
                     "kind": "MaaSAuthPolicy",
-                    "metadata": {"name": f"{group_name}-auth-policy", "namespace": "models-as-a-service"},
+                    "metadata": {"name": f"{group_name}-auth-policy", "namespace": "models-as-a-service",
+                                 "labels": _MAAS_MANAGED_LABELS},
                     "spec": {
                         "subjects": {"groups": [{"name": group_name}]},
                         "modelRefs": [{"name": m, "namespace": active_models[m]["namespace"]} for m in target],
@@ -1543,7 +1622,8 @@ class ManifestRenderer:
             docs.append({
                 "apiVersion": "maas.opendatahub.io/v1alpha1",
                 "kind": "MaaSSubscription",
-                "metadata": {"name": f"{group_name}-subscription", "namespace": "models-as-a-service"},
+                "metadata": {"name": f"{group_name}-subscription", "namespace": "models-as-a-service",
+                             "labels": _MAAS_MANAGED_LABELS},
                 "spec": sub_spec,
             })
 
@@ -1667,16 +1747,17 @@ class ManifestRenderer:
         self._write_manifests("09-llm-serving", "01-base.yml", [ns_doc, hf_secret, pvc, sa, rb])
         self._write_manifests("09-llm-serving", "02-csc.yml", [csc])
 
-        # Copy chat template
-        chat_template_src = Path(__file__).parent.parent / "roles" / "llm_serving" / "files" / "chat_template.jinja"
-        if chat_template_src.exists():
-            content = chat_template_src.read_text()
-            self._write_file("09-llm-serving", "chat_template.jinja", content)
+        # custom_chat_template は inventory 配下に置いた chat template の名前
+        # (inventory/<env>/chat_templates/<name>.jinja) を指す。
+        # 参照されたものだけを出力ディレクトリへコピーする。
+        chat_template_dir = self.inventory_dir / "chat_templates"
 
         # Per-model manifests
         model_steps = []
         absent_steps = []
-        cm_names_created: set[str] = set()
+        cm_names_created: set[tuple[str, str]] = set()
+        # present なモデルが参照している ConfigMap 名（作成有無を問わない）
+        referenced_cms: set[str] = set()
         for model_name, model_cfg_raw in self.models.items():
             model_cfg = self._merge_model_cfg(model_cfg_raw)
 
@@ -1715,8 +1796,20 @@ class ManifestRenderer:
                 )
                 continue
 
-            # chat template ConfigMap
-            cm_name = model_cfg.get("chat_template_configmap", "qwen3-chat-template")
+            # chat template ConfigMap。
+            # custom_chat_template を指定したモデルだけ ConfigMap を作る。
+            # chat_template_configmap だけの指定は「作成済みの ConfigMap を
+            # マウントするだけ」を意味する。
+            custom_ct = model_cfg.get("custom_chat_template") or ""
+            cm_name = (
+                model_cfg.get("chat_template_configmap")
+                or f"{model_name}-chat-template"
+            )
+            use_chat_template = bool(custom_ct) or bool(
+                model_cfg.get("chat_template_configmap")
+            )
+            if use_chat_template:
+                referenced_cms.add(cm_name)
 
             # Download Job
             job = {
@@ -1748,10 +1841,12 @@ class ManifestRenderer:
             # roles/llm_serving/templates/llminferenceservice.yml.j2 と同じ順序で組み立てる。
             # 自動付与は --served-model-name と --chat-template のみ。
             # それ以外の vLLM 引数は inventory の vllm_args をそのまま渡す。
-            vllm_args = [f"--served-model-name={model_name}"]
-            if model_cfg.get("chat_template_configmap"):
+            # --served-model-name は KServe/llm-d の起動スクリプトが付与するので足さない
+            vllm_args = []
+            if use_chat_template:
                 vllm_args.append("--chat-template=/chat-templates/chat_template.jinja")
-            vllm_args.extend(model_cfg.get("vllm_args", []))
+            vllm_args.extend(_shell_safe_arg(a)
+                             for a in model_cfg.get("vllm_args", []))
 
             gpu_count = str(model_cfg["gpu_count"])
             res = model_cfg["resources"]
@@ -1764,7 +1859,7 @@ class ManifestRenderer:
 
             volume_mounts = []
             volumes = []
-            if model_cfg.get("chat_template_configmap"):
+            if use_chat_template:
                 volume_mounts.append({"name": "chat-template", "mountPath": "/chat-templates", "readOnly": True})
                 volumes.append({"name": "chat-template", "configMap": {"name": cm_name, "items": [{"key": "chat_template.jinja", "path": "chat_template.jinja"}]}})
             if str(model_cfg.get("shm_size", "")) != "":
@@ -1818,9 +1913,19 @@ class ManifestRenderer:
             self._write_manifests("09-llm-serving", f"model-{model_name}-download.yml", [job])
             self._write_manifests("09-llm-serving", f"model-{model_name}-deploy.yml", [lis, modelref])
 
-            # Track unique ConfigMap names（空なら chat template を使わない）
-            if model_cfg.get("chat_template_configmap"):
-                cm_names_created.add(cm_name)
+            # custom_chat_template を指定したモデルの ConfigMap だけ手順書に出す。
+            # テンプレート本体も、参照されたものだけ出力ディレクトリへコピーする。
+            if custom_ct:
+                src = chat_template_dir / f"{custom_ct}.jinja"
+                if not src.exists():
+                    available = sorted(q.stem for q in chat_template_dir.glob("*.jinja"))
+                    raise SystemExit(
+                        f"custom_chat_template: {custom_ct} に対応するファイルが "
+                        f"{src} にありません。inventory/sample/chat_templates/ から "
+                        f"コピーしてください。現在利用可能: {', '.join(available) or '(なし)'}"
+                    )
+                self._write_file("09-llm-serving", f"chat_template-{custom_ct}.jinja", src.read_text())
+                cm_names_created.add((cm_name, custom_ct))
 
             model_steps.append(
                 f"### モデル: {model_name} ({model_cfg['hf_repo']})\n\n"
@@ -1843,11 +1948,21 @@ class ManifestRenderer:
             )
 
         # Generate ConfigMap creation commands for all unique names
+        # モデルを absent にしたり custom_chat_template を外すと、作成済みの
+        # ConfigMap がクラスタに残る。Ansible 側 (llm_serving) と同じ後始末を
+        # 手順書にも入れる。対象は models から導ける名前だけに限定する。
+        # 作成対象だけでなく「present なモデルが参照している名前」も除外する。
+        # chat_template_configmap だけ指定して利用者が自分で作った ConfigMap を
+        # マウントする使い方があり、これを消してはいけない。
+        keep_cms = {cm for cm, _ in cm_names_created} | referenced_cms
+        stale_cms = sorted(
+            f"{m}-chat-template" for m in self.models if f"{m}-chat-template" not in keep_cms
+        )
         cm_cmds = "\n".join(
             f"oc create configmap {cm} -n {llm_ns} \\\n"
-            f"  --from-file=chat_template.jinja=manifests/09-llm-serving/chat_template.jinja \\\n"
+            f"  --from-file=chat_template.jinja=manifests/09-llm-serving/chat_template-{tpl}.jinja \\\n"
             f"  --dry-run=client -o yaml | oc apply -f -"
-            for cm in sorted(cm_names_created)
+            for cm, tpl in sorted(cm_names_created)
         )
 
         absent_section = ""
@@ -1887,7 +2002,12 @@ class ManifestRenderer:
             "fi\n\n"
             "# Chat template ConfigMap\n"
             + cm_cmds + "\n"
-            "```\n\n"
+            + ("\n# 不要になった chat template ConfigMap を削除する\n"
+               + "\n".join(
+                   f"oc delete configmap {cm} -n {llm_ns} --ignore-not-found"
+                   for cm in stale_cms)
+               + "\n" if stale_cms else "")
+            + "```\n\n"
             + absent_section
             + present_section
         ))
@@ -2077,6 +2197,9 @@ class ManifestRenderer:
 
     def render_guardrails(self):
         model_name = self.llm_model_name or "unknown"
+        guardrails_thinking = str(
+            self.cfg.get("guardrails_enable_thinking", False)
+        ).lower()
 
         config_yaml = f"""models:
   - type: main
@@ -2085,6 +2208,15 @@ class ManifestRenderer:
     parameters:
       base_url: "https://{model_name}-kserve-workload-svc.llm-serving.svc.cluster.local:8000/v1"
       api_key: "dummy"
+      # Qwen3 系のような reasoning モデルは rail の判定プロンプトにも思考を返す。
+      # self_check は max_tokens が小さく思考だけで使い切るため content が空になり、
+      # Yes/No を判定できず chat/completions が返らなくなる（実機で発生）。
+      #   thinking あり: 256 tokens 全部が reasoning、content 空、33 秒
+      #   thinking なし: 2 tokens で "Yes"、即答
+      # roles/guardrails/templates/nemo-guardrails-config.yml.j2 と同じ設定にすること。
+      extra_body:
+        chat_template_kwargs:
+          enable_thinking: {guardrails_thinking}
 
 rails:
   input:
@@ -2253,6 +2385,7 @@ def main():
     args = parser.parse_args()
 
     config_dir = Path(args.config_dir).resolve()
+    inventory_dir = config_dir
     # inventory/<env> → inventory/<env>/group_vars/all/ を自動解決
     candidate = config_dir / "group_vars" / "all"
     if candidate.is_dir():
@@ -2260,6 +2393,8 @@ def main():
         config_dir = candidate
     else:
         inv_name = config_dir.parent.parent.name if config_dir.name == "all" else config_dir.name
+        if config_dir.name == "all":
+            inventory_dir = config_dir.parent.parent
 
     if not config_dir.exists():
         print(f"Error: config directory not found: {config_dir}", file=sys.stderr)
@@ -2273,7 +2408,7 @@ def main():
     os.chmod(output_dir, 0o700)
 
     cfg = load_config(config_dir)
-    renderer = ManifestRenderer(cfg, output_dir)
+    renderer = ManifestRenderer(cfg, output_dir, inventory_dir)
     renderer.render_all()
     print(f"\nManifests: {output_dir / 'manifests'}/")
     print(f"Passwords: {output_dir / 'generated-passwords.yml'}")

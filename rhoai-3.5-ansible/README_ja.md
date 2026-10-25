@@ -381,7 +381,7 @@ models:
     hf_repo: Qwen/Qwen3-0.6B       # (必須) HuggingFace リポジトリ名
     state: present                   # present=デプロイ, absent=削除
     # vLLM 引数は生のリスト。role が自動付与するのは
-    # --served-model-name と --chat-template だけなので、
+    # --chat-template だけ (custom_chat_template を指定したときのみ) なので、
     # vLLM のバージョンアップで増えたフラグも inventory だけで追従できる。
     vllm_args:
       - "--enable-prefix-caching"
@@ -394,7 +394,9 @@ models:
     # 以下はデフォルト値があるため省略可能
     # vllm_image: vllm/vllm-openai:v0.28.0
     # vllm_env: {}                   # コンテナ環境変数の追加
-    # chat_template_configmap: qwen3-chat-template
+    # custom_chat_template: ""      # 既定は空 = モデル同梱の chat template を使う
+    #                                # 名前を書くと inventory/<env>/chat_templates/<名前>.jinja を適用
+    # chat_template_configmap: ""    # 作成する ConfigMap 名の上書き (既定 <モデル名>-chat-template)
     # replicas: 1
     # gpu_count: 1
     # resources: {requests: {cpu: "500m", memory: 4Gi}, limits: {cpu: "2", memory: 8Gi}}
@@ -410,7 +412,8 @@ models:
 | `vllm_image` | vLLM コンテナイメージ | `vllm/vllm-openai:v0.28.0` |
 | `vllm_args` | vLLM 引数（そのまま args に渡る） | `model_defaults` 参照 |
 | `vllm_env` | コンテナ環境変数の追加（マップ） | `{}` |
-| `chat_template_configmap` | チャットテンプレート ConfigMap 名（空なら `--chat-template` を付けない） | `qwen3-chat-template` |
+| `custom_chat_template` | 差し替える chat template 名。実体は `inventory/<env>/chat_templates/<名前>.jinja`。空ならモデル同梱のものを使い `--chat-template` を付けない | `""` |
+| `chat_template_configmap` | 作成する ConfigMap 名の上書き | `<モデル名>-chat-template` |
 | `replicas` | LLMInferenceService のレプリカ数 | `1` |
 | `gpu_count` | 要求 GPU 数 | `1` |
 | `resources` | CPU/メモリの requests・limits（再帰マージ） | `500m`/`4Gi` → `2`/`8Gi` |
@@ -468,7 +471,7 @@ models:
 | `install_maas_resources` | MaaS リソース | `true` | 通常変更不要（llm_serving の依存） |
 | `install_mlflow` | MLflow | `true` | 実験管理が不要なら `false` |
 | `install_ogx` | OGX Server | `true` | OGX が不要なら `false` |
-| `install_guardrails` | NeMo Guardrails | `true` | Guardrails が不要なら `false` |
+| `install_guardrails` | NeMo Guardrails | `false` | 既知の問題のため既定で無効 ([#15](https://github.com/konono/rhoai-ansible/issues/15))。有効にする前に docs/daily-operations.md を参照 |
 | `install_observability` | Observability | `true` | 監視が不要なら `false` |
 
 > **依存関係の自動解決**: 親 Role を有効にすると、依存 Role が自動的に有効化されます。例えば `install_rhoai: true` にすると `cert_manager`, `servicemesh`, `rhcl`, `kueue`, `jobset`, `leaderworkerset`, `nfd`, `gpu_operator` が自動的に有効になります。また `storage_class: lvms-*` の場合、`install_lvm` が自動的に有効化されます。
@@ -699,7 +702,7 @@ oc get route maas-gateway -n openshift-ingress -o jsonpath='https://{.spec.host}
 |---|---|---|
 | OpenShift cluster-admin | `oc login` 時に指定 | クラスター管理者。`oc whoami` で確認 |
 | Keycloak 管理者 | Secret `keycloak-initial-admin` (namespace: keycloak) | Keycloak 管理コンソールのログイン |
-| MaaS ユーザー (admin1, testuser1 等) | `.credentials/<username>.password` | MaaS Dashboard / API Key 発行用 |
+| MaaS ユーザー (admin1, testuser1 等) | `.credentials/<inventory名>/<username>.password` | MaaS Dashboard / API Key 発行用 |
 | MaaS API Key | `.vllm-token` | LLM 推論リクエストの Bearer トークン |
 
 認証情報を確認するコマンド:
@@ -711,8 +714,8 @@ oc get secret keycloak-initial-admin -n keycloak \
   xargs -I{} sh -c 'echo {} | sed "s/username: //" | cut -d/ -f1 | base64 -d; echo -n " / "; echo {} | sed "s/.*password: //" | base64 -d; echo'
 
 # MaaS ユーザーパスワード
-cat .credentials/admin1.password
-cat .credentials/testuser1.password
+cat .credentials/<inventory名>/admin1.password
+cat .credentials/<inventory名>/testuser1.password
 
 # MaaS API Key
 cat .vllm-token
@@ -722,7 +725,9 @@ cat .vllm-token
 
 ```
 rhoai-3.5-ansible/
-├── .credentials/              ← Keycloak ユーザーのパスワード (gitignore 対象)
+├── .credentials/<inventory名>/ ← Keycloak ユーザーのパスワード (gitignore 対象)
+│                              環境ごとに分かれる。同じユーザー名を別環境で
+│                              使っていてもパスワードは共有されない
 │   ├── admin1.password
 │   └── testuser1.password
 ├── .vllm-token                ← MaaS API Key (gitignore 対象)
@@ -891,6 +896,8 @@ ansible/
 │   └── observability/            # Monitoring / Dashboards
 ├── docs/
 │   ├── operations.md             # 運用ガイド（モデル追加・ユーザー管理等）
+│   ├── daily-operations.md       # 日常運用（ユーザー・quota・モデルの依頼対応）
+│   ├── offline-environment.md    # オフライン実行環境の構築・移行
 │   └── troubleshooting.md        # トラブルシューティング
 ├── vendor/                       # Disconnected 用資材 (.gitignore 対象)
 │   ├── wheels/                   # Python wheels
@@ -1000,4 +1007,6 @@ fatal: [localhost]: FAILED! =>
 | ドキュメント | 内容 |
 |---|---|
 | [docs/operations.md](docs/operations.md) | 運用ガイド — モデル追加手順、ユーザー/グループ管理、MaaS アクセス制御、API Key 発行、クォータ設定、削除手順 |
+| [docs/daily-operations.md](docs/daily-operations.md) | 日常運用ガイド — 利用者からの依頼対応（ユーザー追加・無効化、パスワードリセット、quota 変更、モデルの追加/入れ替え/削除、API キー発行、Keycloak 管理者復旧、秘密情報の保管場所） |
+| [docs/offline-environment.md](docs/offline-environment.md) | オフライン実行環境 — 資材の構成、ゼロからの構築、稼働中環境からの移行、venv の絶対パス書き換え、pack/unpack による更新配布 |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | トラブルシューティング — 過去のトラブル事例、デプロイ前チェックリスト、監視方法、失敗時の対処フロー、各リソースの正常状態確認コマンド集、Disconnected 環境固有の注意点 |

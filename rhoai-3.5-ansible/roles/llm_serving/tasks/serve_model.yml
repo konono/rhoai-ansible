@@ -118,6 +118,126 @@
   changed_when: false
   when: not (_model_already_ready | bool)
 
+# GPU に余裕が無い環境では LLMInferenceService を「更新」できない。
+# KServe が作る Deployment は RollingUpdate(maxSurge 25% / maxUnavailable 25%) で、
+# replicas=1 だと maxUnavailable が 0 に丸められるため旧 Pod を落とせない。
+# 一方 GPU は 1 枚しか無いので新 Pod は Insufficient nvidia.com/gpu で Pending になり、
+# 新旧どちらも Ready にならないデッドロックに陥る(実機で発生)。
+# 全 GPU 数が必要数の 2 倍に満たない場合は、更新ではなく作り直す。
+# 作り直しは「更新が必要なとき」だけに限る。
+# GPU 数の条件だけで判定すると、GPU 1 枚の環境では何も変わっていなくても
+# 毎回 LIS を削除→再作成してしまい、実行のたびにサービスが落ちる(実機で発生)。
+# Pod の再起動を伴うフィールドだけを比較する。spec 全体を比較すると
+# API server が補完した既定値との差分で必ず「変更あり」になってしまう。
+- name: "Render the desired LLMInferenceService ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _desired_lis: "{{ lookup('template', 'llminferenceservice.yml.j2') | from_yaml }}"
+  when: _existing_lis.resources | length > 0
+
+- name: "Compare the desired spec with the live one ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _lis_spec_changed: >-
+      {{ (_cur.image | default('')) != (_new.image | default(''))
+         or (_cur.args | default([])) != (_new.args | default([]))
+         or (_cur.env | default([])) != (_new.env | default([]))
+         or (_cur.resources | default({})) != (_new.resources | default({}))
+         or (_cur.volumeMounts | default([])) != (_new.volumeMounts | default([]))
+         or (_cur.startupProbe | default({})) != (_new.startupProbe | default({}))
+         or (_existing_lis.resources[0].spec.template.volumes | default([]))
+            != (_desired_lis.spec.template.volumes | default([]))
+         or (_existing_lis.resources[0].spec.replicas | default(1))
+            != (_desired_lis.spec.replicas | default(1))
+         or (_existing_lis.resources[0].spec.model.uri | default(''))
+            != (_desired_lis.spec.model.uri | default('')) }}
+  vars:
+    _cur: >-
+      {{ (_existing_lis.resources[0].spec.template.containers | default([]))
+         | selectattr('name', 'equalto', 'main') | list | first | default({}) }}
+    _new: >-
+      {{ (_desired_lis.spec.template.containers | default([]))
+         | selectattr('name', 'equalto', 'main') | list | first | default({}) }}
+  when: _existing_lis.resources | length > 0
+
+# GPU に余裕が無い環境では LLMInferenceService を「更新」できない。
+# KServe が作る Deployment は RollingUpdate(maxSurge 25% / maxUnavailable 25%) で、
+# replicas=1 だと maxUnavailable が 0 に丸められるため旧 Pod を落とせない。
+# 一方 GPU は 1 枚しか無いので新 Pod は Insufficient nvidia.com/gpu で Pending になり、
+# 新旧どちらも Ready にならないデッドロックに陥る(実機で発生)。
+# 全 GPU 数が必要数の 2 倍に満たない場合は、更新ではなく作り直す。
+#
+# 変更が無ければ問い合わせ自体が不要なので、比較の後に実行する。
+- name: "Check total cluster GPUs for rollout strategy ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+  register: _rollout_gpus
+  changed_when: false
+  when:
+    - _existing_lis.resources | length > 0
+    - _lis_spec_changed | default(false) | bool
+
+- name: "Set the total cluster GPU count ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _rollout_gpu_total: >-
+      {{ _rollout_gpus.stdout_lines | default([]) | select('ne', '') | map('int') | sum }}
+  when:
+    - _existing_lis.resources | length > 0
+    - _lis_spec_changed | default(false) | bool
+
+# GPU 数が取れないまま先に進むと、合計 0 として「作り直し」と判定され、
+# 稼働中のモデルを削除してしまう。削除は不可逆なので、判定材料が無い場合は
+# 削除せずにここで止める(fail closed)。
+- name: "Fail when the cluster GPU count cannot be determined ({{ _model_name }})"
+  ansible.builtin.fail:
+    msg: >-
+      クラスタの GPU 数を取得できませんでした。この値が無いと
+      「ローリング更新で足りるか / 作り直しが必要か」を判定できず、
+      稼働中の {{ _model_name }} を誤って削除する恐れがあるため停止します。
+      次が通るか確認してください:
+      oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+  when:
+    - _existing_lis.resources | length > 0
+    - _lis_spec_changed | default(false) | bool
+    - (_rollout_gpu_total | default(0) | int) <= 0
+
+- name: "Decide whether an in-place update can roll ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _needs_recreate: >-
+      {{ _existing_lis.resources | length > 0
+         and (_lis_spec_changed | default(false) | bool)
+         and ((_rollout_gpu_total | default(0) | int) < ((_model_cfg.gpu_count | int) * 2)) }}
+
+- name: "Report the update strategy ({{ _model_name }})"
+  ansible.builtin.debug:
+    msg: >-
+      {{ '変更なし。LLMInferenceService はそのまま'
+         if _existing_lis.resources | length > 0
+            and not (_lis_spec_changed | default(false) | bool)
+         else ('GPU に余裕が無いため削除してから再作成する'
+               if _needs_recreate | bool
+               else 'そのまま適用する(新規作成、またはローリング更新が可能)') }}
+
+- name: "Delete LLMInferenceService before re-creating ({{ _model_name }})"
+  kubernetes.core.k8s:
+    state: absent
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    name: "{{ _model_name }}"
+    namespace: "{{ _model_cfg.namespace }}"
+  when: _needs_recreate | bool
+
+- name: "Wait for GPU release before re-creating ({{ _model_name }})"
+  ansible.builtin.command: >-
+    oc get pods -n {{ _model_cfg.namespace }}
+    -l app.kubernetes.io/name={{ _model_name }}
+    --no-headers --ignore-not-found
+  register: _recreate_pods
+  until: _recreate_pods.stdout_lines | length == 0
+  retries: 60
+  delay: 5
+  changed_when: false
+  failed_when: false
+  when: _needs_recreate | bool
+
 - name: "Apply LLMInferenceService for {{ _model_name }}"
   kubernetes.core.k8s:
     state: present

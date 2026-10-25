@@ -48,4 +48,4 @@ spec:
       modelsAsAService:
         managementState: "{{ 'Managed' if install_maas_resources else 'Removed' }}"
     nemoguardrails:
-      managementState: "{{ 'Managed' if install_guardrails else 'Removed' }}"
+      managementState: "{{ 'Managed' if install_guardrails | default(false) else 'Removed' }}"

@@ -58,16 +58,30 @@
   loop_control:
     label: "{{ item.username }}"
 
-- name: Ensure .credentials directory exists
+# パスワード台帳は inventory 単位で分ける。
+# 以前は {{ ansible_root }}/.credentials 直下にユーザー名だけで置いていたため、
+# 同じユーザー名を持つ別環境（例: testuser1）でファイルが共有され、
+# 片方の環境のパスワードがもう片方に設定されてしまっていた。
+#
+# 分離前のフラット配置を引き継ぐかは inventory ごとの明示的な opt-in にする。
+# 無条件にフォールバックすると、同名ユーザー(例: testuser1)を持つ別環境でも
+# 同じフラットファイルを読んでしまい、直そうとしたパスワード共有が再発する。
+# 旧台帳の持ち主である inventory だけで credentials_adopt_legacy: true を設定する。
+- name: Set the credentials directory for this inventory
+  ansible.builtin.set_fact:
+    _cred_dir: "{{ ansible_root }}/.credentials/{{ inventory_dir | basename }}"
+    _cred_dir_legacy: "{{ ansible_root }}/.credentials"
+
+- name: Ensure the credentials directory exists
   ansible.builtin.file:
-    path: "{{ ansible_root }}/.credentials"
+    path: "{{ _cred_dir }}"
     state: directory
     mode: "0700"
   delegate_to: localhost
 
 - name: Check existing password files for new users
   ansible.builtin.stat:
-    path: "{{ ansible_root }}/.credentials/{{ item.item.username }}.password"
+    path: "{{ _cred_dir }}/{{ item.item.username }}.password"
   register: _pw_file_check
   delegate_to: localhost
   loop: "{{ _user_check.results }}"
@@ -75,15 +89,54 @@
     label: "{{ item.item.username }}"
   when: item.json | length == 0
 
+- name: Check legacy (flat) password files
+  ansible.builtin.stat:
+    path: "{{ _cred_dir_legacy }}/{{ item.item.item.username }}.password"
+  register: _pw_file_legacy
+  delegate_to: localhost
+  loop: "{{ _pw_file_check.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.username | default('skip') }}"
+  when:
+    - credentials_adopt_legacy | default(false) | bool
+    - item.stat is defined
+    - not item.stat.exists
+
 - name: Load existing passwords from files
   ansible.builtin.set_fact:
     _new_user_passwords: >-
       {{ _new_user_passwords | default({}) | combine({
-        item.item.item.username: lookup('file', ansible_root ~ '/.credentials/' ~ item.item.item.username ~ '.password')
+        item.item.item.username: lookup('file', _cred_dir ~ '/' ~ item.item.item.username ~ '.password')
       }) }}
   loop: "{{ _pw_file_check.results | default([]) }}"
   loop_control:
     label: "{{ item.item.item.username | default('skip') }}"
+  when:
+    - item.stat is defined
+    - item.stat.exists
+
+# credentials_adopt_legacy を立てた inventory でだけ、フラット配置から引き継ぐ
+- name: Load existing passwords from the legacy flat layout
+  ansible.builtin.set_fact:
+    _new_user_passwords: >-
+      {{ _new_user_passwords | default({}) | combine({
+        item.item.item.item.username: lookup('file', _cred_dir_legacy ~ '/' ~ item.item.item.item.username ~ '.password')
+      }) }}
+  loop: "{{ _pw_file_legacy.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.item.username | default('skip') }}"
+  when:
+    - item.stat is defined
+    - item.stat.exists
+
+- name: Report adopted legacy passwords
+  ansible.builtin.debug:
+    msg: >-
+      分離前の台帳 {{ _cred_dir_legacy }}/{{ item.item.item.item.username }}.password
+      を引き継ぎました。以後は {{ _cred_dir }}/ 配下に保存されます。
+  loop: "{{ _pw_file_legacy.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item.item.item.username | default('skip') }}"
   when:
     - item.stat is defined
     - item.stat.exists
@@ -131,7 +184,7 @@
 - name: Save user password locally
   ansible.builtin.copy:
     content: "{{ _new_user_passwords[item.item.username] }}"
-    dest: "{{ ansible_root }}/.credentials/{{ item.item.username }}.password"
+    dest: "{{ _cred_dir }}/{{ item.item.username }}.password"
     mode: "0600"
   delegate_to: localhost
   loop: "{{ _user_check.results }}"
@@ -247,8 +300,12 @@
     label: "{{ item.0.item.item.username }} -x- {{ item.1.name }}"
   when:
     - keycloak_prune_group_membership | bool
+    # groups を書いていないユーザーは「所属ゼロ」ではなく「管理対象外」とみなす。
+    # default([]) で空リスト扱いにすると、groups の書き忘れだけで
+    # そのユーザーの所属が全部消える。
+    - item.0.item.item.groups is defined
     - item.1.name in (keycloak_groups | default({}))
-    - item.1.name not in (item.0.item.item.groups | default([]))
+    - item.1.name not in item.0.item.item.groups
   failed_when: false
 
 # ==================== MaaS Policies ====================
@@ -276,6 +333,53 @@
     oc apply --server-side --force-conflicts -f {{ ansible_root }}/.maas-policies-generated.yaml
   register: _maas_policy_apply
   changed_when: "'configured' in _maas_policy_apply.stdout or 'created' in _maas_policy_apply.stdout"
+
+# absent にしたモデルを参照する AuthPolicy / Subscription はテンプレートから
+# 消えるが、oc apply は manifest に無いリソースを削除しないので、
+# 古い modelRefs を持ったまま Failed 状態で残り続ける（実機で発生）。
+# 生成物に含まれないものを削除して追従させる。
+- name: Collect names of generated MaaS policies
+  ansible.builtin.set_fact:
+    _generated_maas_policies: >-
+      {{ (lookup('file', ansible_root ~ '/.maas-policies-generated.yaml')
+          | from_yaml_all | list)
+         | selectattr('kind', 'defined')
+         | selectattr('kind', 'in', ['MaaSAuthPolicy', 'MaaSSubscription'])
+         | map(attribute='metadata.name') | list }}
+
+# 削除対象は「この role が作ったもの」だけに限定する。
+# ラベルで絞らないと、operator が作ったものや運用者が手で作ったものまで
+# 毎回消してしまう。ラベルは maas-policies.yml.j2 が付与している。
+#
+# 注: このラベル導入より前に作られたポリシーにはラベルが無いため、
+# ここでは拾えない。その世代の残骸は一度だけ手で削除する:
+#   oc get maasauthpolicy,maassubscription -n models-as-a-service
+#   oc delete <kind>/<name> -n models-as-a-service
+- name: Find existing MaaS policies managed by this role
+  kubernetes.core.k8s_info:
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: "{{ item }}"
+    namespace: models-as-a-service
+    label_selectors:
+      - "app.kubernetes.io/managed-by=ansible-maas-access"
+  loop:
+    - MaaSAuthPolicy
+    - MaaSSubscription
+  register: _existing_maas_policies
+
+- name: Delete MaaS policies that are no longer generated
+  kubernetes.core.k8s:
+    state: absent
+    api_version: maas.opendatahub.io/v1alpha1
+    kind: "{{ item.0.item }}"
+    name: "{{ item.1.metadata.name }}"
+    namespace: models-as-a-service
+  loop: >-
+    {{ _existing_maas_policies.results | default([])
+       | subelements('resources', skip_missing=true) }}
+  loop_control:
+    label: "{{ item.0.item }}/{{ item.1.metadata.name }}"
+  when: item.1.metadata.name not in _generated_maas_policies
 
 - name: Sync complete
   ansible.builtin.debug:

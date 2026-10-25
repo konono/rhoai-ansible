@@ -1,0 +1,243 @@
+---
+# roles/llm_serving/tasks/verify_inference_maas.yml
+# MaaS Gateway を通した end-to-end 検証。API キー発行 → 推論 → キー失効まで行う。
+#
+# 外部 DNS (Route53 等) を前提にしない。Gateway Service の ClusterIP に対して
+# curl --resolve でリスナー hostname を解決させるため、TLS の SNI も
+# ルーティングも本番と同じ経路を通りつつ、クラスタ内から完結する。
+
+- name: "Resolve cluster domain"
+  ansible.builtin.command: >-
+    oc get ingresses.config.openshift.io cluster -o jsonpath={.spec.domain}
+  register: _vi_domain
+  changed_when: false
+  when: cluster_domain is not defined
+
+- name: "Set cluster_domain"
+  ansible.builtin.set_fact:
+    cluster_domain: "{{ _vi_domain.stdout }}"
+  when: cluster_domain is not defined
+
+- name: "Get MaaS Gateway Service ClusterIP"
+  kubernetes.core.k8s_info:
+    kind: Service
+    namespace: openshift-ingress
+    label_selectors:
+      - "gateway.networking.k8s.io/gateway-name=maas-default-gateway"
+  register: _vi_gw_svc
+
+- name: "Fail when the MaaS Gateway Service is missing"
+  ansible.builtin.fail:
+    msg: >-
+      maas-default-gateway の Service が openshift-ingress に見つかりません。
+      `verify.yml --tags rhoai` で Gateway が Programmed か確認してください。
+  when: _vi_gw_svc.resources | default([]) | length == 0
+
+- name: "Set MaaS endpoint facts"
+  ansible.builtin.set_fact:
+    _vi_gw_ip: "{{ _vi_gw_svc.resources[0].spec.clusterIP }}"
+    _vi_maas_host: "maas.{{ cluster_domain }}"
+
+- name: "Get maas-api Pod name"
+  ansible.builtin.command: >-
+    oc get pods -n redhat-ai-gateway-infra
+    -l app.kubernetes.io/name=maas-api
+    -o jsonpath={.items[0].metadata.name}
+  register: _vi_maas_pod
+  changed_when: false
+  failed_when: _vi_maas_pod.stdout | length == 0
+
+# キーに載せるグループは inventory の keycloak_users から引く。
+# 固定値にすると、一般ユーザー向けのキーに管理者グループが付いてしまう。
+- name: "Resolve the requesting user and groups"
+  ansible.builtin.set_fact:
+    _vi_user: "{{ maas_api_user if maas_api_user | length > 0
+                  else (keycloak_users | default([]) | map(attribute='username') | first | default('')) }}"
+
+- name: "Fail when no Keycloak user is available"
+  ansible.builtin.fail:
+    msg: >-
+      MaaS 経由の検証には Keycloak ユーザーが必要です。
+      `-e maas_api_user=<username>` で指定するか、inventory の
+      keycloak_users にユーザーを定義してください。
+  when: _vi_user | length == 0
+
+- name: "Look up the user's groups"
+  ansible.builtin.set_fact:
+    _vi_groups: >-
+      {{ keycloak_users | default([])
+         | selectattr('username', 'equalto', _vi_user)
+         | map(attribute='groups') | first | default([]) }}
+
+- name: "Fail when the user is not defined in the inventory"
+  ansible.builtin.fail:
+    msg: >-
+      ユーザー {{ _vi_user }} が inventory の keycloak_users にいないため、
+      所属グループを決められません。未登録ユーザーに管理者グループの
+      キーを発行しないよう、ここで停止します。
+  when: _vi_groups | length == 0
+
+# RHOAI 3.5 の Gateway は 2 通りのルーティングを提供する。両方を検証する。
+#
+#   body-based (推奨): POST /v1/chat/completions
+#     Gateway がリクエストボディの "model" を見て宛先を決める。URL にモデル名が
+#     出ないので、モデルを切り替えてもクライアント側の URL を変えなくてよい。
+#     ただし model は完全修飾名 publishers/<namespace>/models/<model> が必要。
+#     短縮名 (qwen3-5-9b) だと 404 になる（実機で確認）。KServe は vLLM に
+#     --served-model-name で両方を登録するが、Gateway のルーティングキーは
+#     完全修飾名の方。X-Gateway-Model-Name を手で付けても body が優先される。
+#
+#   path-based (従来): POST /<namespace>/<model>/v1/chat/completions
+#     HTTPRoute 上は namespace 付きのパス。/llm/<model>/... ではない。
+#     こちらは model に短縮名を使う。
+- name: "Build the routes to verify ({{ _model_name }})"
+  ansible.builtin.set_fact:
+    _vi_routes: >-
+      {{ ([{'name': 'body-based',
+            'path': '/v1/chat/completions',
+            'model': 'publishers/' ~ _namespace ~ '/models/' ~ _model_name}]
+          if 'body' in (maas_routes | default(['body', 'path'])) else [])
+       + ([{'name': 'path-based',
+            'path': '/' ~ _namespace ~ '/' ~ _model_name ~ '/v1/chat/completions',
+            'model': _model_name}]
+          if 'path' in (maas_routes | default(['body', 'path'])) else []) }}
+
+- name: "Fail when no route is selected"
+  ansible.builtin.fail:
+    msg: "maas_routes には body / path のいずれかを指定してください"
+  when: _vi_routes | length == 0
+
+- name: "MaaS end-to-end inference"
+  block:
+    - name: "Issue a verification API key for {{ _vi_user }}"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - redhat-ai-gateway-infra
+          - "{{ _vi_maas_pod.stdout }}"
+          - --
+          - curl
+          - -skfS
+          - -X
+          - POST
+          - https://localhost:8443/v1/api-keys
+          - -H
+          - "X-MaaS-Username: {{ _vi_user }}"
+          - -H
+          - "X-MaaS-Group: {{ _vi_groups | to_json }}"
+          - -H
+          - "Content-Type: application/json"
+          - -d
+          - '{"name": "verify-inference"}'
+      register: _vi_key
+      changed_when: true
+      no_log: true
+
+    - name: "Send inference requests through the Gateway ({{ _model_name }})"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - redhat-ai-gateway-infra
+          - "{{ _vi_maas_pod.stdout }}"
+          - --
+          - curl
+          - -skfS
+          - --resolve
+          - "{{ _vi_maas_host }}:443:{{ _vi_gw_ip }}"
+          - -X
+          - POST
+          - "https://{{ _vi_maas_host }}{{ item.0.path }}"
+          - -H
+          - "Authorization: Bearer {{ (_vi_key.stdout | from_json).key }}"
+          - -H
+          - "Content-Type: application/json"
+          - -w
+          - '\n__TIMING__ ttfb=%{time_starttransfer} total=%{time_total}'
+          - -d
+          - >-
+            {"model": {{ item.0.model | to_json }},
+             "messages": [{"role": "user", "content": {{ inference_prompt | trim | to_json }}}],
+             "max_tokens": {{ inference_max_tokens | int }},
+             "temperature": 0
+             {{ ', "chat_template_kwargs": ' ~ (inference_chat_template_kwargs | to_json)
+                if inference_chat_template_kwargs | length > 0 else '' }}}
+      register: _vi_calls
+      changed_when: false
+      # argv に発行済み API キーが含まれる。-v や失敗時にそのまま出力されるため
+      # このタスク自体はログに出さない。register した結果は no_log でも残るので、
+      # 後続の timing / レスポンス表示タスクには影響しない。
+      no_log: true
+      failed_when: false
+      loop: "{{ _vi_routes | product(range(inference_requests | int)) | list }}"
+      loop_control:
+        label: "{{ _model_name }} [{{ item.0.name }}] #{{ item.1 + 1 }}"
+
+    - name: "Per-request result ({{ _model_name }})"
+      ansible.builtin.debug:
+        msg: >-
+          [{{ item.item.0.name }}] #{{ item.item.1 + 1 }}
+          {{ 'OK ' ~ (item.stdout | regex_search('__TIMING__ (.*)$', '\1', multiline=True)
+                      | default([], true) | first | default(''))
+             if item.rc == 0
+             else 'NG rc=' ~ item.rc ~ ' ' ~ (item.stderr | default('') | trim | truncate(160)) }}
+      loop: "{{ _vi_calls.results }}"
+      loop_control:
+        label: "{{ item.item.0.name }} #{{ item.item.1 + 1 }}"
+
+    - name: "Assert every route answered ({{ _model_name }})"
+      ansible.builtin.assert:
+        that:
+          - _vi_failed_routes | length == 0
+        fail_msg: >-
+          次の経路で推論に失敗しました: {{ _vi_failed_routes | join(', ') }}。
+          body-based は POST /v1/chat/completions で、ボディの model に
+          publishers/{{ _namespace }}/models/{{ _model_name }} を指定する方式。
+          path-based は POST /{{ _namespace }}/{{ _model_name }}/v1/chat/completions。
+          HTTPRoute に該当パスがあるか確認してください:
+          oc get httproute {{ _model_name }}-kserve-route -n {{ _namespace }} -o yaml
+        quiet: true
+      vars:
+        _vi_failed_routes: >-
+          {{ _vi_calls.results | rejectattr('rc', 'equalto', 0)
+             | map(attribute='item.0.name') | unique | list }}
+
+    - name: "Show the first response ({{ _model_name }})"
+      ansible.builtin.include_tasks: verify_inference_report.yml
+
+  always:
+    - name: "Revoke the verification API key"
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - redhat-ai-gateway-infra
+          - "{{ _vi_maas_pod.stdout }}"
+          - --
+          - curl
+          - -sk
+          - -o
+          - /dev/null
+          - -w
+          - '%{http_code}'
+          - -X
+          - DELETE
+          - "https://localhost:8443/v1/api-keys/{{ (_vi_key.stdout | from_json).id }}"
+          - -H
+          - "X-MaaS-Username: {{ _vi_user }}"
+          - -H
+          - "X-MaaS-Group: {{ _vi_groups | to_json }}"
+      register: _vi_key_revoke
+      changed_when: true
+      # argv に API キー ID と所属グループが含まれる
+      no_log: true
+      failed_when: _vi_key_revoke.stdout not in ['200', '204']
+      when:
+        - _vi_key is defined
+        - _vi_key.rc | default(1) == 0
+        - (_vi_key.stdout | default('')).startswith('{')
+        - (_vi_key.stdout | from_json).id is defined

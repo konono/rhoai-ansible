@@ -110,7 +110,12 @@ models:
   #     requests: {cpu: "500m", memory: 4Gi}
   #     limits:   {cpu: "2",    memory: 8Gi}
   #   shm_size: ""                     # tensor parallel 時は 16Gi 等 (NCCL 共有メモリ)
-  #   chat_template_configmap: ""      # 空ならモデル同梱の chat template を使う
+  #   custom_chat_template: ""         # 既定は空 = モデル同梱の chat template を使う。
+  #                                    # 差し替えたい場合だけ名前を書く。実体は
+  #                                    #   inventory/<env>/chat_templates/<名前>.jinja
+  #                                    # 例) custom_chat_template: qwen3
+  #   chat_template_configmap: ""      # 作成する ConfigMap 名の上書き
+  #                                    # (既定: <モデル名>-chat-template)
   #   startup_probe_failure_threshold: 120   # x periodSeconds 秒まで起動を待つ
   #   purge: false                     # state: absent 時に PVC のデータも消すか
 
@@ -121,11 +126,20 @@ keycloak_realm: maas
 
 # ユーザーは宣言的に管理される。
 # 新規ユーザーには 12 文字のパスワードが自動発行され、
-# .credentials/<username>.password (0600) に保存される。
+# .credentials/<この inventory のディレクトリ名>/<username>.password (0600) に保存される。
+# 台帳は inventory ごとに分かれるため、同名ユーザーを別環境で使っても
+# パスワードは共有されない。
 # 既存ユーザーのパスワードは変更されない (リセットは docs/daily-operations.md 2.3 を参照)。
+
+# 分離前は .credentials/<username>.password のようにフラットに置いていた。
+# その台帳を引き継ぐ inventory でだけ true にする (既定 false)。
+# 無条件に引き継ぐと同名ユーザーで環境間のパスワード共有が再発するため。
+# credentials_adopt_legacy: false
 # groups からグループ名を外すと Keycloak 側の所属も解除される
 # (解除対象は keycloak_groups に定義済みのグループのみ。
 #  止めたい場合は -e keycloak_prune_group_membership=false)。
+# groups 自体を書かないユーザーは解除対象外（管理対象外の扱い）。
+# 所属を全部外すときは groups: [] と明示する。
 keycloak_users:
   - username: admin1
     email: admin1@example.com
@@ -179,7 +193,13 @@ install_llm_serving: true
 install_maas_resources: true
 install_mlflow: true
 install_ogx: true
-install_guardrails: true
+# NeMo Guardrails は既知の未解決問題があるため既定で無効。
+# rail に引っかからない通常の質問が完了せず、vLLM の同時実行枠
+# (--max-num-seqs) を占有し続けて本体モデルの応答性能を食い潰す。
+# 詳細と確認手順: docs/daily-operations.md「NeMo Guardrails の既知の問題」
+# Issue: https://github.com/konono/rhoai-ansible/issues/15
+# 有効にする場合は tools/test-guardrails.sh で機能確認すること。
+install_guardrails: false
 install_observability: true
 
 # ---- Integration 有効/無効 ----

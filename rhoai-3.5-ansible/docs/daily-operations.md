@@ -6,6 +6,7 @@ RHOAI / MaaS 環境の管理者が日々行う作業の手順。
 
 - デプロイ後の一般的な運用操作: [operations.md](operations.md)
 - 障害時の切り分け: [troubleshooting.md](troubleshooting.md)
+- オフライン実行環境の構築・移行: [offline-environment.md](offline-environment.md)
 
 ---
 
@@ -88,12 +89,12 @@ uv run ansible-playbook playbooks/manage_maas_access.yml -i inventory/<env>
 **Step 3.** 発行されたパスワードを確認して本人に渡す。
 
 ```bash
-cat .credentials/ta-suzuki.password
+cat .credentials/<inventory名>/ta-suzuki.password
 ```
 
 **仕組み**（`roles/keycloak/tasks/manage_maas_access.yml`）:
 - Keycloak に同名ユーザーが**存在しない場合のみ**、12文字の英数字パスワードを生成してユーザーを作成する
-- 生成したパスワードを `.credentials/<username>.password`（パーミッション 0600）に保存する
+- 生成したパスワードを `.credentials/<inventory名>/<username>.password`（パーミッション 0600）に保存する
 - `temporary: false` で作成するため、初回ログイン時のパスワード変更は要求されない
 - 既に存在するユーザーには**一切触れない**（パスワードは再生成されない）
 - グループ割当は差分のみ適用する（既に所属していればスキップ）
@@ -103,25 +104,30 @@ cat .credentials/ta-suzuki.password
 > Keycloak 上で手動作成した管理外のグループには触れない。
 > 解除を止めたい場合は `-e keycloak_prune_group_membership=false` を付ける。
 >
+> **`groups` を書いていないユーザーは解除対象外**（「所属ゼロ」ではなく「管理対象外」の扱い）。
+> 所属を全部外したい場合は `groups: []` と明示する。書き忘れで全解除されるのを避けるため。
+>
 > **ユーザー自体は inventory から削除しても消えない。** 削除は [2.4](#24-ユーザーを無効化削除する) を参照。
 
 ### 2.2 発行済みパスワードを確認する
 
 ```bash
 # 個別
-cat .credentials/<username>.password
+cat .credentials/<inventory名>/<username>.password
 
 # 一覧
-ls -l .credentials/
-for f in .credentials/*.password; do
+ls -l .credentials/<inventory名>/
+for f in .credentials/<inventory名>/*.password; do
   printf "%-20s %s\n" "$(basename "$f" .password)" "$(cat "$f")"
 done
 ```
 
 `playbooks/verify.yml` の環境サマリーにも、保存済み資格情報の一覧が `cat` コマンド付きで表示される。
 
-> `.credentials/` に無いユーザーは、**この playbook 以外の経路で作られた**か、
-> **別の作業ディレクトリで作成された**。後者の場合は旧ディレクトリの `.credentials/` を探す。
+> `.credentials/<inventory名>/` に無いユーザーは、**この playbook 以外の経路で
+> 作られた**か、**別の作業ディレクトリ・別 inventory で作成された**。
+> 分離前のフラット配置 `.credentials/<username>.password` にある場合もあるので
+> そちらも確認する。
 
 ### 2.3 既存ユーザーのパスワードをリセットする
 
@@ -159,6 +165,7 @@ TOKEN=$(curl -sk -X POST "${KC_URL}/realms/master/protocol/openid-connect/token"
 
 # 対象ユーザーの ID を引く
 TARGET=ta-suzuki
+INVENTORY=inventory/<env>     # 台帳の保存先を決めるのに使う
 UID=$(curl -sk -H "Authorization: Bearer ${TOKEN}" \
   "${KC_URL}/admin/realms/maas/users?username=${TARGET}&exact=true" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin)[0]["id"])')
@@ -170,11 +177,19 @@ curl -sk -X PUT -H "Authorization: Bearer ${TOKEN}" -H 'Content-Type: applicatio
   -d "{\"type\":\"password\",\"value\":\"${NEWPASS}\",\"temporary\":false}"
 
 # ローカルの記録も更新しておく（playbook の出力と整合させるため）
-umask 077 && printf '%s' "$NEWPASS" > ".credentials/${TARGET}.password"
+# 台帳は inventory ごとに分かれている。対象環境のディレクトリへ書くこと。
+INV_NAME=$(basename "$INVENTORY")
+mkdir -p ".credentials/${INV_NAME}"
+chmod 700 ".credentials/${INV_NAME}"
+umask 077 && printf '%s' "$NEWPASS" > ".credentials/${INV_NAME}/${TARGET}.password"
 echo "new password: $NEWPASS"
 ```
 
 > 最後の `.credentials/` 更新を忘れると、次に誰かが `cat` したときに古いパスワードを渡してしまう。必ず更新する。
+>
+> 分離前のフラット配置 (`.credentials/<user>.password`) が残っている場合、
+> そちらが古い値のままだと混乱する。環境別ディレクトリへ書いたあと、
+> どの環境のものか判明しているなら旧ファイルは削除してよい。
 
 ### 2.4 ユーザーを無効化・削除する
 
@@ -193,7 +208,7 @@ curl -sk -X DELETE -H "Authorization: Bearer ${TOKEN}" \
 ```
 
 あわせて `components.yml` の `keycloak_users` から該当エントリを削除し、
-`.credentials/<username>.password` も削除しておく（inventory と実態を合わせるため）。
+`.credentials/<inventory名>/<username>.password` も削除しておく（inventory と実態を合わせるため）。
 
 ---
 
@@ -387,7 +402,8 @@ models:
     state: present
 
     # vLLM 引数はここに生の文字列で書く。
-    # role が自動付与するのは --served-model-name と --chat-template だけなので、
+    # role が自動付与するのは --chat-template だけ
+    # (custom_chat_template を指定したモデルのみ) なので、
     # vLLM のバージョンアップでフラグが増減してもここを直すだけでよい。
     # 使えるフラグの確認:
     #   oc run -it --rm vllm-help --image=vllm/vllm-openai:v0.28.0 -- vllm serve --help
@@ -561,7 +577,7 @@ bash scripts/vllm-args.sh qwen3-8-27b -i inventory/<env>
 ```
 
 1. 稼働中の LLMInferenceService から現在の引数を取得する
-2. `--served-model-name` と `--chat-template`（role が自動付与する2つ）を除いた一覧を `$EDITOR` で開く
+2. `--chat-template`（role が自動付与する唯一の引数）を除いた一覧を `$EDITOR` で開く
 3. 保存して閉じると適用され、Pod が再作成される
 4. Ready を待ち、**inventory に貼るスニペット**を表示する
 
@@ -864,29 +880,224 @@ for p in d['items']:
 | MaaSModelRef が Pending のまま | MaaSAuthPolicy / MaaSSubscription が未適用 | `playbooks/manage_maas_access.yml` を実行する |
 | transformers の `... is part of ...InitKwargs, but not documented` | 単なる警告（stderr に出るだけ） | 無視してよい |
 
-### Qwen3.8-27B-FP8 の MTP 診断 (B1、読み取り専用)
+### 7.z NeMo Guardrails の既知の問題（reasoning モデル使用時）
 
-クラスタにログインした端末で実行します。デフォルトは `llm-serving/qwen3-8-27b-fp8` です。
+`verify.yml` は NemoGuardrails CR が Ready かしか見ないため、以下は検出できない。
+`tools/test-guardrails.sh` で機能確認すること。
 
-```bash
-python3 scripts/diagnose-mtp.py
-# 名前や namespace が異なる場合:
-python3 scripts/diagnose-mtp.py <model-key> --namespace <namespace>
+**判定 rail が reasoning モデルだと機能しない（対処済み）**
+
+`self check input` / `self check output` は「Yes か No で答えよ」という判定
+プロンプトを LLM に投げる。Qwen3 系はこれにも思考を返すため、小さい
+`max_tokens` を思考だけで使い切り **content が空**で返る。判定できないまま
+1 リクエストで input/output 2 つの rail + 本体生成が走り、応答が返らなくなる。
+
+```
+thinking あり: completion_tokens 256 / reasoning 256 / content "" / 33 秒
+thinking なし: completion_tokens   2 / reasoning   0 / content "Yes" / 即答
 ```
 
-全 Pod を個別に調べ、① `speculative-config` が Pod の `args` に JSON として
-渡ったか、②末尾 500 行の起動ログに関連エラーがあるか、③ Pod 内の
-`localhost:8000/metrics` に HTTPS (失敗時は HTTP) で到達でき、
-`spec_decode` の draft/accepted token 累積カウンタが正の値かを表示します。
-ログ本文、環境変数、Secret、metrics のラベルは表示しません。
+role 側で `extra_body.chat_template_kwargs.enable_thinking: false` を既定にした。
+思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
 
-①が正常でも vLLM が受理したとは限りません。②の関連行が 0 件でも
-起動ログが末尾 500 行から外れた可能性があります。③のカウンタが 0 なら
-リクエストを送った後に再実行し、前後の値を比較します。このスクリプトは
-1 回の測定値を表示し、増加自体は判定しません。HTTP/HTTPS の取得失敗や Pod が 0 件の場合は
-「MTP 無効」と判断せず、接続・Pod 状態を先に確認してください。
+**通常の推論が完了せず GPU を占有し続ける（未解決: [#15](https://github.com/konono/rhoai-ansible/issues/15)）**
+
+この問題のため `install_guardrails` の既定は `false` になっている。
+有効にする場合は本項を踏まえた上で `tools/test-guardrails.sh` で機能確認すること。
+
+上記の対処でブロック経路は即答するようになったが、**rail に引っかからない
+通常の質問は 10 分待っても完了しない**。このとき vLLM 側は次の状態が続く。
+
+```
+Running: 4 reqs, Avg generation throughput: 132 tokens/s   ← 止まらない
+```
+
+Guardrails が LLM 呼び出しをループしており、`--max-num-seqs` の枠を
+占有し続ける。**本体モデルの応答性能を食い潰す**ため、Guardrails を
+使わない環境では無効化を推奨する。
+
+```yaml
+# components.yml
+install_guardrails: false
+```
+
+既に動いてしまっている場合の止め方:
+
+`oc scale deploy/nemo-guardrails --replicas=0` は**効かない**。operator が
+CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を 0 にするのも
+`spec.replicas in body should be greater than or equal to 1` で拒否される。
+
+**`install_guardrails: false` にするだけでは既に動いている CR は消えない。**
+false にすると guardrails role 自体がスキップされるため、CR を削除する
+uninstall タスクが実行されないまま残り続ける。DataScienceCluster の
+`nemoguardrails: Removed` は operator の管理を外すだけで、作成済みの CR の
+削除までは確認できていない。
+
+止めるには uninstall を明示的に実行する。
+
+```bash
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> \
+  --tags guardrails -e '{"uninstall_guardrails": true}'
+```
+
+そのうえで、次回以降作られないよう inventory でも無効にしておく。
+
+```yaml
+# inventory/<env>/group_vars/all/components.yml
+install_guardrails: false
+```
+
+playbook を使わずその場で止める場合は CR を直接削除する
+（`install_guardrails: true` のままだと次回の playbook 実行で作り直される）。
+
+```bash
+oc delete nemoguardrails nemo-guardrails -n redhat-ods-applications
+```
+
+いずれの場合も、vLLM 側で `Running: 0 reqs` に戻ることを確認する。
+
+```bash
+oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running
+```
+
+原因は Colang の intent 生成が収束しないことと見られる（Pod ログに
+`generate_user_intent` のプロンプト構築が繰り返し現れる）。
+小型の非 reasoning モデルを判定用に別途割り当てる構成が本筋だが未検証。
+調査の経緯と再現手順は [#15](https://github.com/konono/rhoai-ansible/issues/15) にまとめてある。
+
+### 7.y MaaS Gateway のルーティング方式
+
+RHOAI 3.5 の Gateway は 2 通りのルーティングを提供する。
+`llm_verify_inference.yml` は `inference_via=maas` のとき**両方**を検証する。
+
+| 方式 | エンドポイント | ボディの `model` |
+|---|---|---|
+| body-based（推奨） | `POST https://maas.<domain>/v1/chat/completions` | `publishers/<namespace>/models/<model>` |
+| path-based（従来） | `POST https://maas.<domain>/<namespace>/<model>/v1/chat/completions` | `<model>` |
+
+**body-based では完全修飾名が必要。** 短縮名だと 404 になる（実機で確認）。
+
+```
+model: "qwen3-5-9b"                               → 404
+model: "publishers/llm-serving/models/qwen3-5-9b" → 200
+```
+
+KServe は vLLM に `--served-model-name <model> publishers/<ns>/models/<model>` と
+両方を登録するが、Gateway のルーティングキーは完全修飾名の方。
+`X-Gateway-Model-Name` ヘッダを手で付けてもボディの内容が優先されるため、
+ヘッダでの回避はできない。
+
+path-based のパスは `/<namespace>/<model>/...` であって `/llm/<model>/...` ではない。
+実際のパスは HTTPRoute で確認できる。
+
+```bash
+oc get httproute <model>-kserve-route -n <namespace> \
+  -o jsonpath='{range .spec.rules[*].matches[*]}{.path.value}{"\n"}{end}'
+```
+
+片方だけ確認したい場合:
+
+```bash
+uv run ansible-playbook playbooks/llm_verify_inference.yml -i inventory/<env> \
+  -e inference_via=maas -e '{"maas_routes": ["body"]}'
+```
+
+### 7.x 推論の疎通と MTP の動作確認
+
+`playbooks/verify.yml` は「リソースが Ready か」しか見ないため、
+**Ready なのに推論が返らない**、**speculative decoding を設定したのに効いていない**
+は検出できません。実際にリクエストを流して確認する専用 playbook を使います。
+
+```bash
+# present な全モデルに推論を投げ、MTP の受理率まで出す
+uv run ansible-playbook playbooks/llm_verify_inference.yml -i inventory/<env>
+
+# モデルを指定
+... -e model=qwen3-5-9b
+
+# MaaS Gateway 経由で認証込みの end-to-end を確認する
+... -e inference_via=maas -e maas_api_user=admin1
+
+# 受理率の測定精度を上げる
+... -e inference_requests=10 -e inference_max_tokens=1024
+```
+
+出力例:
+
+```
+model            : qwen3-5-9b (llm-serving)
+requests         : 3 x 512 tokens (via direct)
+generated tokens : 1536
+draft tokens     : 828
+accepted tokens  : 708
+acceptance rate  : 0.855
+MTP: 有効 (ドラフトが生成され検証されています)
+```
+
+判定のしかた:
+
+| 結果 | 意味 |
+|---|---|
+| `draft tokens` が 0 | MTP が効いていない。`--speculative-config` が vLLM に届いていない |
+| `acceptance rate` が極端に低い | ドラフトがほぼ棄却されている。`num_speculative_tokens` を見直す |
+| `generated tokens` が 0 | 推論自体が返っていない。Pod のログを見る |
+
+CI や定期確認で閾値を割ったら落としたい場合は `-e inference_min_acceptance_rate=0.3`
+のように指定します（既定 0 = 判定しない）。
+
+**経路の違い**
+
+- `inference_via=direct` (既定): Pod 内から `localhost:8000` を叩く。外部 DNS も
+  API キーも不要なので、Route53 未設定の検証クラスタでも動く。MaaS の認可は通らない
+- `inference_via=maas`: API キー発行 → Gateway 経由で推論 → キー失効まで実施する。
+  Gateway Service の ClusterIP に `curl --resolve` で当てるため、外部 DNS 不要で
+  本番と同じ TLS SNI / ルーティングを通る
+
+**reasoning モデルでの注意**
+
+Qwen3 系は既定で思考に数百トークン使うため、`max_tokens` が小さいと
+`finish_reason=length` のまま `content` が空で返ります。この playbook は既定で
+`chat_template_kwargs={"enable_thinking": false}` を送って短く確定的に応答させます。
+thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を指定します。
 
 ---
+
+### 【移行時の注意】パスワード台帳が inventory 単位になりました
+
+以前は `.credentials/<username>.password` のように環境を区別せず置いていたため、
+**同じユーザー名を複数の環境で使っていると台帳が共有**されていました。
+たとえば `testuser1` を検証環境と本番の両方に定義していると、後から作った方に
+先に作った方と同じパスワードが設定されます。
+
+`.credentials/<inventory名>/<username>.password` に分離しました。
+
+```
+.credentials/
+├── nict/
+│   └── testuser1.password
+└── aws-sno-ipi/
+    └── testuser1.password     ← 別物として扱われる
+```
+
+**既存の台帳は消さずにそのまま残してください。** 既に Keycloak に存在する
+ユーザーについては読み書きしないため、そのままでも動作に支障はありません。
+
+分離前のフラット配置を引き継ぐかは **inventory ごとの opt-in** です。
+無条件に引き継ぐと、同名ユーザーを持つ別環境でも同じファイルを読んでしまい、
+分離した意味がなくなるためです。旧台帳の持ち主である inventory にだけ設定します。
+
+```yaml
+# inventory/<旧台帳の持ち主>/group_vars/all/components.yml
+credentials_adopt_legacy: true
+```
+
+これを設定した inventory でユーザーを作り直すと、環境別ディレクトリに
+ファイルが無い場合にフラット配置から引き継ぎ、以後は環境別の方へ保存します。
+引き継いだ際は、どのファイルをどこへ移したかが実行ログに出ます。
+
+設定していない inventory（既定）では旧台帳を読まず、新しいパスワードを
+生成します。どの環境のものか分かっている旧ファイルは、手で
+`.credentials/<inventory名>/` へ移しておくと台帳が整理されます。
 
 ## 8. 秘密情報の保管場所
 
@@ -895,7 +1106,7 @@ python3 scripts/diagnose-mtp.py <model-key> --namespace <namespace>
 | パス | 内容 | 失うとどうなるか |
 |---|---|---|
 | `.generated-passwords.yml` | maas / ogx / keycloak の DB パスワード、OIDC クライアントシークレット、group_sync_password | **playbook 実行時に再生成され、MaaS と OGX が認証エラーになる** |
-| `.credentials/<user>.password` | playbook が発行したユーザーの初期パスワード | 個別にリセットが必要（[2.3](#23-既存ユーザーのパスワードをリセットする)） |
+| `.credentials/<inventory名>/<user>.password` | playbook が発行したユーザーの初期パスワード（台帳は inventory ごと） | 個別にリセットが必要（[2.3](#23-既存ユーザーのパスワードをリセットする)） |
 | `.kube/config` | kubeconfig | 再取得すればよい |
 | `inventory/<env>/group_vars/all/vault.yml` | `hf_token` | HuggingFace から再取得 |
 | `.vllm-token` | 運用用の API キー（任意） | 再発行すればよい |
@@ -964,6 +1175,6 @@ uv run ansible-playbook playbooks/recover_keycloak_admin.yml -i inventory/<env> 
   -e keycloak_admin_recovery=true
 
 # パスワード確認
-cat .credentials/<user>.password
+cat .credentials/<inventory名>/<user>.password
 oc get secret keycloak-initial-admin -n keycloak -o jsonpath='{.data.password}' | base64 -d; echo
 ```
