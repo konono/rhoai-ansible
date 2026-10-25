@@ -65,7 +65,7 @@
     loop_var: _dep
   vars:
     _parent: guardrails
-  when: install_guardrails | default(true)
+  when: install_guardrails | default(false)
 
 - name: Check and auto-enable dependencies for observability
   ansible.builtin.include_tasks: _resolve_one.yml

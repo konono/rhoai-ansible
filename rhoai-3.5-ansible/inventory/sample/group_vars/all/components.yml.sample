@@ -193,7 +193,13 @@ install_llm_serving: true
 install_maas_resources: true
 install_mlflow: true
 install_ogx: true
-install_guardrails: true
+# NeMo Guardrails は既知の未解決問題があるため既定で無効。
+# rail に引っかからない通常の質問が完了せず、vLLM の同時実行枠
+# (--max-num-seqs) を占有し続けて本体モデルの応答性能を食い潰す。
+# 詳細と確認手順: docs/daily-operations.md「NeMo Guardrails の既知の問題」
+# Issue: https://github.com/konono/rhoai-ansible/issues/15
+# 有効にする場合は tools/test-guardrails.sh で機能確認すること。
+install_guardrails: false
 install_observability: true
 
 # ---- Integration 有効/無効 ----

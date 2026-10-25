@@ -186,5 +186,5 @@
          (['maas_resources'] if install_maas_resources | default(true) else []) +
          (['mlflow'] if install_mlflow | default(true) else []) +
          (['ogx'] if install_ogx | default(true) else []) +
-         (['guardrails'] if install_guardrails | default(true) else []) +
+         (['guardrails'] if install_guardrails | default(false) else []) +
          (['observability'] if install_observability | default(true) else []) }}

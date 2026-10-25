@@ -703,7 +703,7 @@ class ManifestRenderer:
             "install_ogx": self.cfg.get("install_ogx", True),
             "install_mlflow": self.cfg.get("install_mlflow", True),
             "install_maas_resources": self.cfg.get("install_maas_resources", True),
-            "install_guardrails": self.cfg.get("install_guardrails", True),
+            "install_guardrails": self.cfg.get("install_guardrails", False),
         }
 
         # Operator

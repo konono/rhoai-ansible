@@ -900,7 +900,10 @@ thinking なし: completion_tokens   2 / reasoning   0 / content "Yes" / 即答
 role 側で `extra_body.chat_template_kwargs.enable_thinking: false` を既定にした。
 思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
 
-**通常の推論が完了せず GPU を占有し続ける（未解決）**
+**通常の推論が完了せず GPU を占有し続ける（未解決: [#15](https://github.com/konono/rhoai-ansible/issues/15)）**
+
+この問題のため `install_guardrails` の既定は `false` になっている。
+有効にする場合は本項を踏まえた上で `tools/test-guardrails.sh` で機能確認すること。
 
 上記の対処でブロック経路は即答するようになったが、**rail に引っかからない
 通常の質問は 10 分待っても完了しない**。このとき vLLM 側は次の状態が続く。
@@ -1085,7 +1088,7 @@ credentials_adopt_legacy: true
 | パス | 内容 | 失うとどうなるか |
 |---|---|---|
 | `.generated-passwords.yml` | maas / ogx / keycloak の DB パスワード、OIDC クライアントシークレット、group_sync_password | **playbook 実行時に再生成され、MaaS と OGX が認証エラーになる** |
-| `.credentials/<user>.password` | playbook が発行したユーザーの初期パスワード | 個別にリセットが必要（[2.3](#23-既存ユーザーのパスワードをリセットする)） |
+| `.credentials/<inventory名>/<user>.password` | playbook が発行したユーザーの初期パスワード（台帳は inventory ごと） | 個別にリセットが必要（[2.3](#23-既存ユーザーのパスワードをリセットする)） |
 | `.kube/config` | kubeconfig | 再取得すればよい |
 | `inventory/<env>/group_vars/all/vault.yml` | `hf_token` | HuggingFace から再取得 |
 | `.vllm-token` | 運用用の API キー（任意） | 再発行すればよい |
@@ -1154,6 +1157,6 @@ uv run ansible-playbook playbooks/recover_keycloak_admin.yml -i inventory/<env> 
   -e keycloak_admin_recovery=true
 
 # パスワード確認
-cat .credentials/<user>.password
+cat .credentials/<inventory名>/<user>.password
 oc get secret keycloak-initial-admin -n keycloak -o jsonpath='{.data.password}' | base64 -d; echo
 ```

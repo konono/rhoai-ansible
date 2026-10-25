@@ -453,7 +453,7 @@
       failed_when: >-
         _guardrails.resources | length == 0 or
         _guardrails.resources[0].status.phase | default('') != 'Ready'
-      when: install_guardrails | default(true)
+      when: install_guardrails | default(false)
       tags: [workload, guardrails]
 
     # ==================== Health: Routes ====================
