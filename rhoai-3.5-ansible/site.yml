@@ -156,7 +156,7 @@
     - name: NeMo Guardrails
       ansible.builtin.import_role:
         name: guardrails
-      when: install_guardrails
+      when: install_guardrails | default(false)
       tags: [workload, guardrails]
 
     - name: RHOAI Observability

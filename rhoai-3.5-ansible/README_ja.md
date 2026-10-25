@@ -453,7 +453,7 @@ models:
 | `install_maas_resources` | MaaS リソース | `true` | 通常変更不要（llm_serving の依存） |
 | `install_mlflow` | MLflow | `true` | 実験管理が不要なら `false` |
 | `install_ogx` | OGX Server | `true` | OGX が不要なら `false` |
-| `install_guardrails` | NeMo Guardrails | `true` | Guardrails が不要なら `false` |
+| `install_guardrails` | NeMo Guardrails | `false` | 既知の問題のため既定で無効 ([#15](https://github.com/konono/rhoai-ansible/issues/15))。有効にする前に docs/daily-operations.md を参照 |
 | `install_observability` | Observability | `true` | 監視が不要なら `false` |
 
 > **依存関係の自動解決**: 親 Role を有効にすると、依存 Role が自動的に有効化されます。例えば `install_rhoai: true` にすると `cert_manager`, `servicemesh`, `rhcl`, `kueue`, `jobset`, `leaderworkerset`, `nfd`, `gpu_operator` が自動的に有効になります。また `storage_class: lvms-*` の場合、`install_lvm` が自動的に有効化されます。

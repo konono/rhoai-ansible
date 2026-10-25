@@ -927,25 +927,43 @@ install_guardrails: false
 CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を 0 にするのも
 `spec.replicas in body should be greater than or equal to 1` で拒否される。
 
-恒久対処は inventory で無効化する。
+**`install_guardrails: false` にするだけでは既に動いている CR は消えない。**
+false にすると guardrails role 自体がスキップされるため、CR を削除する
+uninstall タスクが実行されないまま残り続ける。DataScienceCluster の
+`nemoguardrails: Removed` は operator の管理を外すだけで、作成済みの CR の
+削除までは確認できていない。
+
+止めるには uninstall を明示的に実行する。
 
 ```bash
-# components.yml で install_guardrails: false にしてから
-uv run ansible-playbook site.yml -i inventory/<env> --tags platform,rhoai,guardrails
+uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> \
+  --tags guardrails -e '{"uninstall_guardrails": true}'
 ```
 
-今すぐ止めたい場合は CR を削除する（次回 playbook 実行で作り直される）。
+そのうえで、次回以降作られないよう inventory でも無効にしておく。
+
+```yaml
+# inventory/<env>/group_vars/all/components.yml
+install_guardrails: false
+```
+
+playbook を使わずその場で止める場合は CR を直接削除する
+（`install_guardrails: true` のままだと次回の playbook 実行で作り直される）。
 
 ```bash
 oc delete nemoguardrails nemo-guardrails -n redhat-ods-applications
+```
 
-# vLLM 側で Running: 0 reqs に戻ることを確認する
+いずれの場合も、vLLM 側で `Running: 0 reqs` に戻ることを確認する。
+
+```bash
 oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running
 ```
 
 原因は Colang の intent 生成が収束しないことと見られる（Pod ログに
 `generate_user_intent` のプロンプト構築が繰り返し現れる）。
 小型の非 reasoning モデルを判定用に別途割り当てる構成が本筋だが未検証。
+調査の経緯と再現手順は [#15](https://github.com/konono/rhoai-ansible/issues/15) にまとめてある。
 
 ### 7.y MaaS Gateway のルーティング方式
 

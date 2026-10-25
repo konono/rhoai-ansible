@@ -455,7 +455,7 @@ models:
 | `install_maas_resources` | MaaS resources | `true` | Usually no change needed (llm_serving dependency) |
 | `install_mlflow` | MLflow | `true` | Set to `false` if experiment tracking is not needed |
 | `install_ogx` | OGX Server | `true` | Set to `false` if OGX is not needed |
-| `install_guardrails` | NeMo Guardrails | `true` | Set to `false` if Guardrails is not needed |
+| `install_guardrails` | NeMo Guardrails | `false` | Disabled by default due to a known issue ([#15](https://github.com/konono/rhoai-ansible/issues/15)). See docs/daily-operations.md before enabling |
 | `install_observability` | Observability | `true` | Set to `false` if monitoring is not needed |
 
 > **Automatic dependency resolution**: Enabling a parent role automatically enables its dependencies. For example, setting `install_rhoai: true` automatically enables `cert_manager`, `servicemesh`, `rhcl`, `kueue`, `jobset`, `leaderworkerset`, `nfd`, and `gpu_operator`. Additionally, `install_lvm` is automatically enabled when `storage_class: lvms-*`.
