@@ -158,7 +158,19 @@ NORMAL_RAW=$(ng_curl -X POST "${NG_URL}/v1/chat/completions" \
 NORMAL_RC=$(rc_of "${NORMAL_RAW}")
 NORMAL=$(body_of "${NORMAL_RAW}")
 NORMAL_MSG=$(printf '%s' "${NORMAL}" | content_of)
-if [[ -n "${NORMAL_MSG}" ]]; then
+if printf '%s' "${NORMAL_MSG}" | grep -qiE "${BLOCK_PATTERN}"; then
+    # 応答が返ってきても、それが拒否文なら素通しできていない。
+    # 「空でなければ OK」だけ見ていると、rail が通常の質問まで
+    # ブロックしている状態を見逃す (#15 の修正過程で実際に見逃した)。
+    ng "通常の質問がブロックされました: ${NORMAL_MSG:0:120}"
+    echo "    rail に引っかからないはずの質問が拒否されています。"
+    echo "    出力 rail が空の応答を受け取って誤判定している可能性があります:"
+    echo "      oc logs -n ${NS} ${POD} -c nemo-guardrails --tail=200 | grep -E 'LLM Completion|BotMessage'"
+    echo "    本体生成が空で返る場合、思考 (reasoning) が max_tokens を"
+    echo "    使い切っていないか確認してください。models[].parameters の"
+    echo "    chat_template_kwargs は extra_body でネストせず直下に置くこと"
+    echo "    (nemoguardrails 0.23+ は未知のキーをそのまま HTTP ボディに転送する)。"
+elif [[ -n "${NORMAL_MSG}" ]]; then
     ok "通常推論: ${NORMAL_MSG:0:100}"
 elif [[ "${NORMAL_RC}" -eq 28 ]]; then
     ng "通常推論が ${TIMEOUT}s でタイムアウトしました"

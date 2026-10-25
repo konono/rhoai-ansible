@@ -880,48 +880,87 @@ for p in d['items']:
 | MaaSModelRef が Pending のまま | MaaSAuthPolicy / MaaSSubscription が未適用 | `playbooks/manage_maas_access.yml` を実行する |
 | transformers の `... is part of ...InitKwargs, but not documented` | 単なる警告（stderr に出るだけ） | 無視してよい |
 
-### 7.z NeMo Guardrails の既知の問題（reasoning モデル使用時）
+### 7.z NeMo Guardrails のハマりどころ（reasoning モデル使用時）
 
 `verify.yml` は NemoGuardrails CR が Ready かしか見ないため、以下は検出できない。
 `tools/test-guardrails.sh` で機能確認すること。
 
-**判定 rail が reasoning モデルだと機能しない（対処済み）**
+#### 通常の推論が完了せず GPU を占有し続ける（[#15](https://github.com/konono/rhoai-ansible/issues/15)、2026-10-26 解決）
 
-`self check input` / `self check output` は「Yes か No で答えよ」という判定
-プロンプトを LLM に投げる。Qwen3 系はこれにも思考を返すため、小さい
-`max_tokens` を思考だけで使い切り **content が空**で返る。判定できないまま
-1 リクエストで input/output 2 つの rail + 本体生成が走り、応答が返らなくなる。
+**症状**: CR は Ready、input rail のブロックも効くのに、rail に引っかからない
+通常の質問だけが返ってこない。vLLM 側は `Running: N reqs` が張り付いたまま
+生成を続け、`--max-num-seqs` の枠を占有して本体モデルの応答性能を食い潰す。
 
-```
-thinking あり: completion_tokens 256 / reasoning 256 / content "" / 33 秒
-thinking なし: completion_tokens   2 / reasoning   0 / content "Yes" / 即答
-```
+原因は独立した 2 つで、**両方直さないと直らない**。
 
-role 側で `extra_body.chat_template_kwargs.enable_thinking: false` を既定にした。
-思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
+**原因 1: 参照されていない `define user` が dialog rail を起動していた**
 
-**通常の推論が完了せず GPU を占有し続ける（未解決: [#15](https://github.com/konono/rhoai-ansible/issues/15)）**
+`rails.co` に `define user ask about harmful topics` があったが、どの flow からも
+参照されていない死に設定だった。しかし nemoguardrails は user canonical form が
+1 つでも定義されていると passthrough をやめ、**dialog rail モード**に入る
+(`actions/llm/generation.py` の `generate_user_intent`)。
 
-この問題のため `install_guardrails` の既定は `false` になっている。
-有効にする場合は本項を踏まえた上で `tools/test-guardrails.sh` で機能確認すること。
-
-上記の対処でブロック経路は即答するようになったが、**rail に引っかからない
-通常の質問は 10 分待っても完了しない**。このとき vLLM 側は次の状態が続く。
-
-```
-Running: 4 reqs, Avg generation throughput: 132 tokens/s   ← 止まらない
+```python
+if self.config.user_messages:   # intent 生成 + flow 解決（複数回 LLM 呼び出し）
+else:                           # Task.GENERAL を 1 回だけ呼んで返す
 ```
 
-Guardrails が LLM 呼び出しをループしており、`--max-num-seqs` の枠を
-占有し続ける。**本体モデルの応答性能を食い潰す**ため、Guardrails を
-使わない環境では無効化を推奨する。
+`config.user_messages` は `define user ...` だけから作られる。intent 候補が
+1 件しかない few-shot 補完プロンプトに対してモデルが停止せず生成し続け、
+リクエストが終わらなくなっていた。実機ログ:
+
+```
+Executing action generate_user_intent
+Phase 1 Generating user intent
+# Choose intent from this list: ask about harmful topics
+User intent: ask about harmful topics      <- 延々と続く
+```
+
+有害プロンプトのブロックは input rail (`self check input`) が担当しており
+canonical form は不要なので、定義ごと削除した。
+**`rails.co` に `define user ...` を足すと再発する。**
+
+**原因 2: `extra_body:` のネストで思考が切れていなかった**
+
+nemoguardrails **0.23 以降**、`models[].parameters` の未知のキーは
+**そのまま HTTP ボディに転送される**（`_compat/langchain_kwargs.py` の docstring:
+"After 0.23 any unrecognized parameter is forwarded verbatim to the
+OpenAI-compatible HTTP client"）。
+
+つまり `extra_body: {chat_template_kwargs: ...}` と書くと、vLLM には
+`chat_template_kwargs` ではなく **`extra_body` という未知のフィールド**が送られ、
+黙って無視される。200 OK が返るのでエラーにもならない。
+
+vLLM が見るのはボディ直下の `chat_template_kwargs` なので、`parameters` 直下に置く。
 
 ```yaml
-# components.yml
-install_guardrails: false
+parameters:
+  base_url: "..."
+  api_key: "dummy"
+  chat_template_kwargs:        # extra_body: でネストしないこと
+    enable_thinking: false
 ```
 
-既に動いてしまっている場合の止め方:
+思考が切れていないと本体生成が `max_tokens` を思考だけで使い切って
+**content が空**で返り、出力 rail がそれを拒否扱いにして
+「I'm sorry, I cannot help with that request」を返す。実測:
+
+```
+thinking あり / max_tokens 64: completion_tokens 64 (全部 reasoning) / content ""
+thinking なし:                 completion_tokens  4 / content "Tokyo."
+```
+
+思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
+
+**修正後の実測**（AWS SNO g6.8xlarge / L4 / Qwen3.5-9B）:
+
+```
+Step 2 ブロック:   即答
+Step 3 通常推論:   2.3-2.5 秒で "Paris" / "Tokyo"
+vLLM:              Running: 0 reqs （GPU を掴みっぱなしにしない）
+```
+
+#### 止め方（GPU を掴んだまま戻らない場合）
 
 `oc scale deploy/nemo-guardrails --replicas=0` は**効かない**。operator が
 CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を 0 にするのも
@@ -929,25 +968,14 @@ CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を
 
 **`install_guardrails: false` にするだけでは既に動いている CR は消えない。**
 false にすると guardrails role 自体がスキップされるため、CR を削除する
-uninstall タスクが実行されないまま残り続ける。DataScienceCluster の
-`nemoguardrails: Removed` は operator の管理を外すだけで、作成済みの CR の
-削除までは確認できていない。
-
-止めるには uninstall を明示的に実行する。
+uninstall タスクが実行されないまま残り続ける。
 
 ```bash
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> \
   --tags guardrails -e '{"uninstall_guardrails": true}'
 ```
 
-そのうえで、次回以降作られないよう inventory でも無効にしておく。
-
-```yaml
-# inventory/<env>/group_vars/all/components.yml
-install_guardrails: false
-```
-
-playbook を使わずその場で止める場合は CR を直接削除する
+その場で止めるなら CR を直接削除する
 （`install_guardrails: true` のままだと次回の playbook 実行で作り直される）。
 
 ```bash
@@ -959,11 +987,6 @@ oc delete nemoguardrails nemo-guardrails -n redhat-ods-applications
 ```bash
 oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running
 ```
-
-原因は Colang の intent 生成が収束しないことと見られる（Pod ログに
-`generate_user_intent` のプロンプト構築が繰り返し現れる）。
-小型の非 reasoning モデルを判定用に別途割り当てる構成が本筋だが未検証。
-調査の経緯と再現手順は [#15](https://github.com/konono/rhoai-ansible/issues/15) にまとめてある。
 
 ### 7.y MaaS Gateway のルーティング方式
 
