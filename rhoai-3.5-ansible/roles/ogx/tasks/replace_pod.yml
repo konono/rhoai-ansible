@@ -1,0 +1,105 @@
+---
+# roles/ogx/tasks/replace_pod.yml
+# Deployment の Pod を 1 つ入れ替えて Ready を待つ。
+# playbooks/recover_ogx.yml から Deployment 名 (_deploy) を渡して呼ぶ。
+#
+# oc rollout restart は使わない。これらの Deployment は OLM
+# (ClusterServiceVersion) が所有しており spec を差し戻すため Pod が
+# 入れ替わらない。それでいて rollout status は "successfully rolled out" を
+# 返すので偽の成功になる（実機で確認）。
+# Pod を直接削除し、名前が変わったことで入れ替わりを確認する。
+#
+# セレクタは Deployment ごとに異なるので、決め打ちせず spec から引く。
+
+- name: "Get the deployment ({{ _deploy }})"
+  kubernetes.core.k8s_info:
+    api_version: apps/v1
+    kind: Deployment
+    name: "{{ _deploy }}"
+    namespace: "{{ ogx_namespace }}"
+  register: _rp_deploy
+
+- name: "Skip when the deployment is absent ({{ _deploy }})"
+  ansible.builtin.debug:
+    msg: "{{ _deploy }} が {{ ogx_namespace }} にありません。スキップします。"
+  when: _rp_deploy.resources | default([]) | length == 0
+
+- name: "Replace the pods ({{ _deploy }})"
+  when: _rp_deploy.resources | default([]) | length > 0
+  block:
+    - name: "Build the label selector ({{ _deploy }})"
+      ansible.builtin.set_fact:
+        _rp_selector: >-
+          {{ _rp_deploy.resources[0].spec.selector.matchLabels
+             | dict2items | map(attribute='key') | zip(
+                 _rp_deploy.resources[0].spec.selector.matchLabels
+                 | dict2items | map(attribute='value'))
+             | map('join', '=') | list }}
+
+    - name: "List the current pods ({{ _deploy }})"
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ ogx_namespace }}"
+        label_selectors: "{{ _rp_selector }}"
+      register: _rp_before
+
+    - name: "Record the pod names before replacement ({{ _deploy }})"
+      ansible.builtin.set_fact:
+        _rp_names_before: >-
+          {{ _rp_before.resources | default([]) | map(attribute='metadata.name') | list }}
+
+    - name: "Delete the pods ({{ _deploy }})"
+      kubernetes.core.k8s:
+        state: absent
+        kind: Pod
+        namespace: "{{ ogx_namespace }}"
+        name: "{{ item }}"
+        wait: true
+        wait_timeout: 180
+      loop: "{{ _rp_names_before }}"
+
+    - name: "Wait for a new pod to become Ready ({{ _deploy }})"
+      kubernetes.core.k8s_info:
+        kind: Pod
+        namespace: "{{ ogx_namespace }}"
+        label_selectors: "{{ _rp_selector }}"
+        field_selectors:
+          - status.phase=Running
+      register: _rp_after
+      until: >-
+        (_rp_after.resources | default([])
+         | rejectattr('metadata.name', 'in', _rp_names_before)
+         | selectattr('status.conditions', 'defined')
+         | list | length) > 0
+        and (_rp_after.resources | default([])
+             | rejectattr('metadata.name', 'in', _rp_names_before)
+             | map(attribute='status.conditions') | flatten
+             | selectattr('type', 'equalto', 'Ready')
+             | selectattr('status', 'equalto', 'True')
+             | list | length) > 0
+      retries: 36
+      delay: 5
+
+    # rollout status の偽の成功に引っかからないよう、名前が変わったことを見る
+    - name: "Confirm the pods were actually replaced ({{ _deploy }})"
+      ansible.builtin.assert:
+        that:
+          - _rp_new_names | length > 0
+        fail_msg: >-
+          {{ _deploy }} の Pod が入れ替わっていません。
+          OLM が spec を差し戻している可能性があります。
+          oc get pods -n {{ ogx_namespace }} -l {{ _rp_selector | join(',') }}
+          で startTime を確認してください。
+        quiet: true
+      vars:
+        _rp_new_names: >-
+          {{ _rp_after.resources | default([])
+             | map(attribute='metadata.name')
+             | reject('in', _rp_names_before) | list }}
+
+    - name: "Replaced ({{ _deploy }})"
+      ansible.builtin.debug:
+        msg: >-
+          {{ _deploy }}: {{ _rp_names_before | join(', ') | default('(なし)', true) }}
+          -> {{ _rp_after.resources | default([]) | map(attribute='metadata.name')
+                | reject('in', _rp_names_before) | join(', ') }}

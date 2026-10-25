@@ -1,0 +1,152 @@
+---
+# OGX の Degraded 取り残しを解消する
+#
+# EC2 インスタンスの停止 -> 起動後、クラスタが復帰しても
+# DataScienceCluster が Ready=False / phase=Not Ready のまま残ることがある。
+# メッセージは "Some modules are degraded: ogx"。
+#
+# 原因は条件の取り残し。起動直後（OGX がまだ立ち上がり途中）に
+#   ogxs.components.platform.opendatahub.io/default-ogx
+# へ Degraded=True reason=UnhealthyOGXServers が付く。その後 OGXServer 側は
+# 再評価されて DeploymentReady / StorageReady / ServiceReady / HealthCheck が
+# すべて True になるが、default-ogx の Degraded=True だけが更新されずに残る。
+# DSC はこれを集約するため Ready=False のままになる。実体は健全で推論も動く。
+#
+# OGX の Pod を入れ替えると Degraded が再評価されて Healthy に落ちる。
+#
+# 注意: oc rollout restart deploy/... は使わない。これらの Deployment は OLM
+# (ClusterServiceVersion) が所有しており spec を差し戻すため Pod が入れ替わらない。
+# それでいて rollout status は "successfully rolled out" を返すので偽の成功になる。
+# Pod を直接削除して、名前が変わったことで入れ替わりを確認する。
+#
+# ogx-postgres は StatefulSet の DB なので触らない。
+#
+# Usage:
+#   uv run ansible-playbook playbooks/recover_ogx.yml -i inventory/<env>
+#
+#   # DSC が Not Ready でなくても強制的に回す
+#   ... -e force_ogx_recovery=true
+#
+- hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  vars:
+    ogx_namespace: redhat-ods-applications
+    # 入れ替え対象。ogx-postgres (StatefulSet) は含めない。
+    ogx_deployments:
+      - ogx-server
+      - opendatahub-ogx-operator
+      - ogx-k8s-operator-controller-manager
+  tasks:
+    - name: Verify oc login
+      ansible.builtin.command: oc whoami
+      changed_when: false
+
+    - name: Get the DataScienceCluster
+      kubernetes.core.k8s_info:
+        api_version: datasciencecluster.opendatahub.io/v2
+        kind: DataScienceCluster
+        name: default-dsc
+      register: _dsc
+
+    - name: Get the ogx component
+      kubernetes.core.k8s_info:
+        api_version: components.platform.opendatahub.io/v1alpha1
+        kind: OGX
+        name: default-ogx
+      register: _ogx_component
+
+    - name: Get the OGXServer
+      kubernetes.core.k8s_info:
+        api_version: ogx.io/v1beta1
+        kind: OGXServer
+        name: ogx-server
+        namespace: "{{ ogx_namespace }}"
+      register: _ogx_server
+
+    - name: Summarize the current state
+      ansible.builtin.debug:
+        msg:
+          - "DSC phase       : {{ _dsc_phase }}"
+          - "ogx Degraded    : {{ _ogx_degraded }}"
+          - "OGXServer phase : {{ _ogx_server_phase }}"
+          - "{{ '取り残しパターンに一致します（実体は健全なのに Degraded だけ残っている）'
+               if _is_stale else '取り残しパターンには一致しません' }}"
+      vars: &ogx_facts
+        _dsc_phase: "{{ _dsc.resources[0].status.phase | default('不明') }}"
+        _ogx_degraded: >-
+          {{ (_ogx_component.resources[0].status.conditions | default([])
+              | selectattr('type', 'equalto', 'Degraded') | list | first
+              | default({})).status | default('不明') }}
+        _ogx_server_phase: "{{ _ogx_server.resources[0].status.phase | default('不明') }}"
+        # OGXServer には ConfigGenerated=False reason=ConfigGenerationInactive が
+        # 常時付く。これは設定上の状態で障害ではないので、条件を一律に True 判定
+        # すると誤検知する。実体の健全性は phase と個別条件で見る。
+        _ogx_server_healthy: >-
+          {{ _ogx_server.resources[0].status.phase | default('') == 'Ready'
+             and (_ogx_server.resources[0].status.conditions | default([])
+                  | selectattr('type', 'in', ['DeploymentReady', 'ServiceReady', 'HealthCheck'])
+                  | rejectattr('status', 'equalto', 'True') | list | length == 0) }}
+        _is_stale: >-
+          {{ _dsc_phase != 'Ready' and _ogx_degraded == 'True' and _ogx_server_healthy }}
+
+    - name: Nothing to do
+      ansible.builtin.meta: end_play
+      when:
+        - not (force_ogx_recovery | default(false) | bool)
+        - _dsc.resources[0].status.phase | default('') == 'Ready'
+
+    # OLM が spec を差し戻すため rollout restart は効かない。Pod を直接消す。
+    # セレクタは Deployment ごとに違うので replace_pod.yml 側で spec から引く。
+    - name: Replace the OGX pods one at a time
+      ansible.builtin.include_tasks: ../roles/ogx/tasks/replace_pod.yml
+      loop: "{{ ogx_deployments }}"
+      loop_control:
+        loop_var: _deploy
+
+    - name: Wait for the ogx component to stop being Degraded
+      kubernetes.core.k8s_info:
+        api_version: components.platform.opendatahub.io/v1alpha1
+        kind: OGX
+        name: default-ogx
+      register: _ogx_after
+      until: >-
+        (_ogx_after.resources[0].status.conditions | default([])
+         | selectattr('type', 'equalto', 'Degraded') | list | first
+         | default({})).status | default('True') == 'False'
+      retries: 24
+      delay: 5
+      failed_when: false
+
+    - name: Wait for the DataScienceCluster to become Ready
+      kubernetes.core.k8s_info:
+        api_version: datasciencecluster.opendatahub.io/v2
+        kind: DataScienceCluster
+        name: default-dsc
+      register: _dsc_after
+      until: _dsc_after.resources[0].status.phase | default('') == 'Ready'
+      retries: 24
+      delay: 5
+      failed_when: false
+
+    - name: Report the result
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'DSC が Ready になりました' if _dsc_ok
+             else 'DSC がまだ Ready になりません (phase=' ~ _phase ~ ')。'
+                  ~ 'OGX 以外の module が degraded になっていないか確認してください: '
+                  ~ 'oc get dsc default-dsc -o jsonpath=\'{.status.conditions}\'' }}
+      vars:
+        _dsc_ok: "{{ _dsc_after.resources[0].status.phase | default('') == 'Ready' }}"
+        _phase: "{{ _dsc_after.resources[0].status.phase | default('不明') }}"
+
+    - name: Fail when the DataScienceCluster is still not Ready
+      ansible.builtin.fail:
+        msg: >-
+          OGX の Pod を入れ替えても DSC が Ready になりませんでした。
+          取り残しとは別の原因が考えられます。
+          oc get dsc default-dsc -o yaml で conditions を確認してください。
+      when: _dsc_after.resources[0].status.phase | default('') != 'Ready'

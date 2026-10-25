@@ -1,24 +1,72 @@
 ---
 # Uninstall: integration_keycloak_oauth
+#
+# 順序が重要。IdP エントリを先に消してから、それが参照する Secret /
+# ConfigMap を消す。逆順や、IdP 削除が失敗したまま先に進むと
+# oauth-openshift が参照先をマウントできず Pod が起動しなくなり、
+# クラスタの認証が落ちる（実機で発生）。
+#
+# 以前は
+#   oc get oauth cluster -o json | python3 ... | oc apply -f - 2>/dev/null || true
+#   failed_when: false / changed_when: true
+# としていたため、apply が失敗しても常に「changed」で成功扱いになり、
+# IdP が残ったまま Secret と ConfigMap だけ消えて認証が壊れた。
 
 - block:
-    - name: Remove keycloak IdP from OAuth
-      ansible.builtin.shell: >-
-        oc get oauth cluster -o json |
-        python3 -c "
-        import sys, json
-        data = json.load(sys.stdin)
-        idps = data.get('spec', {}).get('identityProviders', [])
-        new_idps = [i for i in idps if i.get('name') != 'keycloak']
-        if len(new_idps) != len(idps):
-            data['spec']['identityProviders'] = new_idps
-            print(json.dumps(data))
-        else:
-            sys.exit(1)
-        " | oc apply -f - 2>/dev/null || true
-      failed_when: false
-      changed_when: true
+    - name: Get the OAuth config
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: OAuth
+        name: cluster
+      register: _oauth
 
+    - name: Remove the keycloak IdP from OAuth
+      kubernetes.core.k8s:
+        state: patched
+        api_version: config.openshift.io/v1
+        kind: OAuth
+        name: cluster
+        definition:
+          spec:
+            identityProviders: >-
+              {{ _oauth.resources[0].spec.identityProviders | default([])
+                 | rejectattr('name', 'equalto', keycloak_oauth_idp_name | default('keycloak'))
+                 | list }}
+      when:
+        - _oauth.resources | default([]) | length > 0
+        - _oauth.resources[0].spec.identityProviders | default([])
+          | selectattr('name', 'equalto', keycloak_oauth_idp_name | default('keycloak'))
+          | list | length > 0
+
+    # 参照先を消す前に、IdP が本当に消えたことを確かめる。
+    # ここを飛ばすと、残った IdP が存在しない Secret を参照して認証が落ちる。
+    - name: Verify the keycloak IdP is gone
+      kubernetes.core.k8s_info:
+        api_version: config.openshift.io/v1
+        kind: OAuth
+        name: cluster
+      register: _oauth_after
+      until: >-
+        _oauth_after.resources[0].spec.identityProviders | default([])
+        | selectattr('name', 'equalto', keycloak_oauth_idp_name | default('keycloak'))
+        | list | length == 0
+      retries: 12
+      delay: 5
+
+    - name: Fail when the keycloak IdP still exists
+      ansible.builtin.fail:
+        msg: >-
+          OAuth から keycloak IdP を削除できませんでした。
+          このまま参照先の Secret / ConfigMap を消すと oauth-openshift が
+          起動できなくなり、クラスタの認証が落ちます。中断します。
+          oc get oauth cluster -o jsonpath='{.spec.identityProviders}' で
+          状態を確認してください。
+      when: >-
+        _oauth_after.resources[0].spec.identityProviders | default([])
+        | selectattr('name', 'equalto', keycloak_oauth_idp_name | default('keycloak'))
+        | list | length > 0
+
+    # IdP が消えた後なら、参照先が無くなっても oauth-openshift は起動できる
     - name: Delete keycloak-oidc-client-secret
       kubernetes.core.k8s:
         state: absent
@@ -37,8 +85,37 @@
         namespace: openshift-config
       failed_when: false
 
+    # IdP を外すと oauth-openshift が作り直される。認証が戻るまで見届ける。
+    - name: Wait for the authentication ClusterOperator to settle
+      ansible.builtin.command: >-
+        oc get clusteroperator authentication
+        -o jsonpath={range .status.conditions[*]}{.type}={.status}{" "}{end}
+      register: _auth_co
+      until: >-
+        'Available=True' in _auth_co.stdout
+        and 'Degraded=False' in _auth_co.stdout
+      retries: 36
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Warn when authentication has not recovered
+      ansible.builtin.debug:
+        msg: >-
+          authentication ClusterOperator がまだ復帰していません
+          ({{ _auth_co.stdout | default('取得失敗') | trim }})。
+          oc get pods -n openshift-authentication で確認してください。
+          IdP の削除自体は完了しています。
+      when: >-
+        'Available=True' not in (_auth_co.stdout | default(''))
+        or 'Degraded=False' not in (_auth_co.stdout | default(''))
+
   rescue:
     - ansible.builtin.fail:
         msg: |
           Keycloak → OpenShift OAuth のアンインストールに失敗しました。
+          OAuth に keycloak IdP が残っている場合、参照先の Secret /
+          ConfigMap を消すと認証が落ちます。先に IdP を確認してください。
+            oc get oauth cluster -o jsonpath='{.spec.identityProviders}'
+            oc get pods -n openshift-authentication
           再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags integration,keycloak_oauth
