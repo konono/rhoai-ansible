@@ -1,5 +1,9 @@
 ---
 # Uninstall: guardrails
+#
+# この経路は「GPU 枠を占有し続ける Guardrails を止める」手順としても使う
+# (docs/daily-operations.md / Issue #15)。削除に失敗したまま成功を返すと、
+# 止めたつもりで動き続けるため、CR の削除は失敗を握りつぶさない。
 
 - block:
     - name: Delete NemoGuardrails CR
@@ -9,8 +13,33 @@
         kind: NemoGuardrails
         name: nemo-guardrails
         namespace: redhat-ods-applications
-      failed_when: false
+        wait: true
+        wait_timeout: 120
 
+    # operator が作り直す可能性があるため、消えたことを確認してから終わる。
+    # ここを飛ばすと、削除 API が 200 を返しても CR が残るケースを見逃す。
+    - name: Verify the NemoGuardrails CR is gone
+      kubernetes.core.k8s_info:
+        api_version: trustyai.opendatahub.io/v1alpha1
+        kind: NemoGuardrails
+        name: nemo-guardrails
+        namespace: redhat-ods-applications
+      register: _ng_left
+      until: _ng_left.resources | default([]) | length == 0
+      retries: 12
+      delay: 5
+
+    - name: Fail when the NemoGuardrails CR still exists
+      ansible.builtin.fail:
+        msg: >-
+          NemoGuardrails CR が削除されていません。Guardrails は動いたままで、
+          vLLM の同時実行枠を占有し続ける可能性があります (Issue #15)。
+          oc get nemoguardrails -n redhat-ods-applications で状態を確認し、
+          削除できない原因 (権限 / finalizer / operator による再作成) を
+          取り除いてください。
+      when: _ng_left.resources | default([]) | length > 0
+
+    # ConfigMap は残っても害が無いので、ここだけは失敗を許容する。
     - name: Delete guardrails config ConfigMap
       kubernetes.core.k8s:
         state: absent
@@ -24,4 +53,8 @@
     - ansible.builtin.fail:
         msg: |
           NeMo Guardrails のアンインストールに失敗しました。
+          CR が残っている場合、Guardrails は動作し続けます。
+          状態確認:
+            oc get nemoguardrails -n redhat-ods-applications
+            oc get pods -n redhat-ods-applications | grep nemo-guardrails
           再実行: uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> --tags guardrails -e '{"uninstall_guardrails": true}'
