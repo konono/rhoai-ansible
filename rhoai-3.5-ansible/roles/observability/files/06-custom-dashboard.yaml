@@ -12,25 +12,15 @@ spec:
       enabled: true
 
 ---
-apiVersion: monitoring.coreos.com/v1
-kind: PodMonitor
-metadata:
-  name: maas-gateway-istio-metrics
-  namespace: openshift-ingress
-  labels:
-    app: maas-gateway
-  annotations:
-    argocd.argoproj.io/sync-wave: "3"
-spec:
-  selector:
-    matchLabels:
-      gateway.networking.k8s.io/gateway-name: maas-default-gateway
-  podMetricsEndpoints:
-    - port: http-envoy-prom
-      path: /stats/prometheus
-      interval: 15s
+# NOTE: ここには以前 PodMonitor "maas-gateway-istio-metrics" を置いていたが削除した。
+# odh-model-controller が Gateway の子として PodMonitor
+# "maas-default-gateway-metrics" を openshift-ingress に既に作っており、
+# 同じ Pod の同じ :15090/stats/prometheus を二重スクレイプしていた。
+# ラベルが job 以外同一の系列が 2 本できるため、
+# sum(rate(istio_requests_total{...})) が常に実測の 2 倍になっていた
+# (実測: count by (job) (istio_requests_total) が 2 job x 1 系列)。
+# Gateway 由来のメトリクスは operator 管理の PodMonitor 1 本に任せる。
 
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -191,7 +181,7 @@ spec:
                 plugin:
                   kind: PrometheusTimeSeriesQuery
                   spec:
-                    query: 'sum(rate(istio_requests_total{destination_service=~".*maas.*"}[5m]))'
+                    query: 'sum(rate(istio_requests_total{source_workload=~"maas-default-gateway.*",reporter="source"}[5m]))'
       stat-error-rate:
         kind: Panel
         spec:
@@ -217,10 +207,13 @@ spec:
                 plugin:
                   kind: PrometheusTimeSeriesQuery
                   spec:
+                    # 無トラフィック時に分子が空集合になると結果ごと消えて
+                    # パネルが "No data" 表示になる (実測)。
+                    # 分子は or vector(0)、分母は 0 のとき 1 に落として 0 を返す。
                     query: >-
-                      sum(rate(istio_requests_total{destination_service=~".*maas.*",response_code!~"2.."}[5m]))
+                      (sum(rate(istio_requests_total{source_workload=~"maas-default-gateway.*",reporter="source",response_code!~"2.."}[5m])) or vector(0))
                       /
-                      sum(rate(istio_requests_total{destination_service=~".*maas.*"}[5m]))
+                      ((sum(rate(istio_requests_total{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) > 0) or vector(1))
       stat-p95-latency:
         kind: Panel
         spec:
@@ -242,10 +235,13 @@ spec:
                 plugin:
                   kind: PrometheusTimeSeriesQuery
                   spec:
+                    # 観測ゼロだと histogram_quantile は NaN を返し、
+                    # StatChart の milliseconds フォーマッタが "NaNns" と描画する (実測)。
+                    # "> 0" で NaN を落として (NaN との比較は常に false) 0 を出す。
                     query: >-
                       histogram_quantile(0.95,
-                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
-                      )
+                        sum(rate(istio_request_duration_milliseconds_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
+                      ) > 0 or vector(0)
       stat-rate-limited:
         kind: Panel
         spec:
@@ -289,7 +285,7 @@ spec:
                   spec:
                     query: >-
                       sum by (destination_service_name) (
-                        rate(istio_requests_total{destination_service=~".*maas.*"}[5m])
+                        rate(istio_requests_total{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])
                       )
                     seriesNameFormat: '{{destination_service_name}}'
       latency-by-model:
@@ -313,7 +309,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.50,
-                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_request_duration_milliseconds_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p50'
             - kind: TimeSeriesQuery
@@ -323,7 +319,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.95,
-                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_request_duration_milliseconds_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p95'
             - kind: TimeSeriesQuery
@@ -333,7 +329,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.99,
-                        sum(rate(istio_request_duration_milliseconds_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_request_duration_milliseconds_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p99'
       errors-by-code:
@@ -357,7 +353,7 @@ spec:
                   spec:
                     query: >-
                       sum by (response_code) (
-                        rate(istio_requests_total{destination_service=~".*maas.*",response_code!~"2.."}[5m])
+                        rate(istio_requests_total{source_workload=~"maas-default-gateway.*",reporter="source",response_code!~"2.."}[5m])
                       )
                     seriesNameFormat: 'HTTP {{response_code}}'
       rate-limit-status:
@@ -409,7 +405,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.50,
-                        sum(rate(istio_request_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_request_bytes_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p50'
             - kind: TimeSeriesQuery
@@ -419,7 +415,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.95,
-                        sum(rate(istio_request_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_request_bytes_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p95'
       response-size:
@@ -441,7 +437,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.50,
-                        sum(rate(istio_response_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_response_bytes_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p50'
             - kind: TimeSeriesQuery
@@ -451,7 +447,7 @@ spec:
                   spec:
                     query: >-
                       histogram_quantile(0.95,
-                        sum(rate(istio_response_bytes_bucket{destination_service=~".*maas.*"}[5m])) by (le)
+                        sum(rate(istio_response_bytes_bucket{source_workload=~"maas-default-gateway.*",reporter="source"}[5m])) by (le)
                       )
                     seriesNameFormat: 'p95'
 

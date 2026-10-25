@@ -1062,6 +1062,55 @@ thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を�
 
 ---
 
+### 7.w Perses ダッシュボードが空・NaN になる場合（修正済み、2026-10-26）
+
+`モニタリング > Dashboards (Perses)` の `MaaS Gateway *` ダッシュボードで、
+全パネルが 0 / `No data` / `NaNns` になる不具合が 4 件あった。いずれも
+playbook 側に取り込み済みなので、**再適用すれば直る**。
+
+```bash
+uv run ansible-playbook site.yml -i inventory/<env> --tags deps,gpu,workload,observability
+```
+
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| GPU 系 8 パネルが全て 0 | DCGM exporter に ServiceMonitor が無く `DCGM_FI_DEV_*` が誰にもスクレイプされていなかった | `gpu_operator` role の ClusterPolicy に `dcgmExporter.serviceMonitor` を追加 |
+| `vllm:*` メトリクスが全欠落 | UWM 未有効。KServe が `llm-serving` に作る PodMonitor を見る Prometheus が存在しなかった | `observability` role で `cluster-monitoring-config` の `enableUserWorkload` を有効化 |
+| `P95 Latency` が `NaNns` | 観測ゼロだと `histogram_quantile` が NaN を返し、`milliseconds` フォーマッタがそのまま描画する | クエリ末尾に `> 0 or vector(0)` |
+| `Error Rate` が `No data` | 分子が空集合だと除算結果ごと消える | 分子 `or vector(0)` / 分母 `> 0 or vector(1)` |
+| `Req/Sec by Model` にモデルが出ない | `destination_service=~".*maas.*"` は `maas-api` にしか一致せず、実体の `<model>-kserve-workload-svc` を除外していた | `source_workload=~"maas-default-gateway.*",reporter="source"` に変更 |
+| istio 系の値が実測の 2 倍 | odh-model-controller が作る `maas-default-gateway-metrics` と自前 PodMonitor の二重スクレイプ | 自前 PodMonitor を削除（role が既存実体も消す） |
+
+**GPU ダッシュボードが依然 0 のとき**は ServiceMonitor の有無を見る。
+
+```bash
+oc get servicemonitor -n nvidia-gpu-operator        # nvidia-dcgm-exporter があること
+oc get clusterpolicy gpu-cluster-policy -o jsonpath='{.spec.dcgmExporter}'
+```
+
+`observability` role の `05-gpu-utilization.yaml` にも同じ ClusterPolicy 設定が
+あるが、**ClusterPolicy が未作成のときしか適用されない**。site.yml では
+`gpu_operator` が先に走って必ず CR を作るため、あちらは常に skip される。
+設定は `gpu_operator` role 側が唯一の有効な置き場所になっている。
+
+**二重スクレイプの確認方法**（1 job だけ出れば正常）。
+
+```bash
+# Thanos で job ごとの系列数を見る
+count by (job) (istio_requests_total{source_workload=~"maas-default-gateway.*"})
+```
+
+PodMonitor を消しても Prometheus の設定リロードに 2〜3 分かかる。
+ターゲットが消えたかは次で確認する。
+
+```bash
+oc exec -n openshift-monitoring prometheus-k8s-0 -c prometheus -- \
+  curl -s 'http://localhost:9090/api/v1/targets?state=active' \
+  | python3 -c 'import json,sys; print([t["labels"]["job"] for t in json.load(sys.stdin)["data"]["activeTargets"] if "gateway" in t["labels"].get("job","")])'
+```
+
+---
+
 ### 【移行時の注意】パスワード台帳が inventory 単位になりました
 
 以前は `.credentials/<username>.password` のように環境を区別せず置いていたため、
