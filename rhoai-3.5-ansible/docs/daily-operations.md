@@ -1085,6 +1085,61 @@ thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を�
 
 ---
 
+### 7.v ノード再起動後に DataScienceCluster が Not Ready のままになる
+
+SNO のノードを停止→起動すると、ワークロードは復旧しているのに
+`DataScienceCluster` が `Ready=False` のまま戻らないことがある。
+
+```
+DSC    Ready=False / ModulesReady=False   "Some modules are degraded: ogx"
+OGX    Ready=True (AllDependentsHealthy) / phase=Ready
+       Degraded=True (UnhealthyOGXServers) severity=Info
+       message: "Unhealthy OGXServer instances: redhat-ods-applications/ogx-server"
+OGXServer  phase=Ready / HealthCheck=True / availableReplicas=1
+```
+
+**OGXServer 自身は健全なのに親の `Degraded` が落ちない**のが特徴。
+再起動直後は vLLM がモデル（10 GiB 超）を再ロード中で、ogx-server の
+5 分おきの疎通に失敗する。
+
+```
+ERROR  list_provider_model_ids() failed
+WARN   Model refresh failed  error=Connection error. provider_id=vllm-inference
+```
+
+その後ポーリングは成功に戻る（`list_provider_model_ids() returned models count=N`）が、
+**`Degraded` フラグが片方向にラッチされたまま再評価されない**。
+
+#### 対処
+
+`rhods-operator` の再起動では**直らない**（実機で 5 分観察して変化なし）。
+OGX モジュール側の operator を再起動する。
+
+```bash
+oc rollout restart deploy/opendatahub-ogx-operator -n redhat-ods-applications
+oc rollout status  deploy/opendatahub-ogx-operator -n redhat-ods-applications
+```
+
+10 秒ほどで `Degraded=False` → `DSC Ready=True` に戻る。
+
+#### 併せて掃除するもの
+
+ノード再起動では、再起動前に動いていた Pod が `ContainerStatusUnknown` の
+まま残骸として残る。置き換えの Pod は別途起動しているので削除してよい。
+`verify.yml` の「unhealthy pod なし」チェックはこれを拾って落ちる。
+
+```bash
+oc get pods -A --no-headers \
+  | awk '$4!="Running" && $4!="Completed" {print $1, $2, $4}'
+oc delete pod <name> -n <ns>
+```
+
+なお `openshift-kube-apiserver` の `installer-N-...` が `Error` で残るのは
+OpenShift の通常動作（失敗したリビジョンの Pod を調査用に保持する）。
+`oc get co kube-apiserver` が Available かつ not Degraded なら放置してよい。
+
+---
+
 ### 7.w Perses ダッシュボードが空・NaN になる場合（修正済み、2026-10-26）
 
 `モニタリング > Dashboards (Perses)` の `MaaS Gateway *` ダッシュボードで、
@@ -1103,6 +1158,19 @@ uv run ansible-playbook site.yml -i inventory/<env> --tags deps,gpu,workload,obs
 | `Error Rate` が `No data` | 分子が空集合だと除算結果ごと消える | 分子 `or vector(0)` / 分母 `> 0 or vector(1)` |
 | `Req/Sec by Model` にモデルが出ない | `destination_service=~".*maas.*"` は `maas-api` にしか一致せず、実体の `<model>-kserve-workload-svc` を除外していた | `source_workload=~"maas-default-gateway.*",reporter="source"` に変更 |
 | istio 系の値が実測の 2 倍 | odh-model-controller が作る `maas-default-gateway-metrics` と自前 PodMonitor の二重スクレイプ | 自前 PodMonitor を削除（role が既存実体も消す） |
+| `Rate Limited` / `Rate Limit Decisions` が常に空 | limitador は `openshift-rhcl` に居るが、同 ns に `openshift.io/cluster-monitoring` ラベルが無く platform Prometheus が見ない。UWM は `openshift-*` を対象外にする仕様なので UWM でも取れず、収集経路が無かった | ns にラベル付与 + platform 用 PodMonitor (`07-limitador-platform-scrape.yaml`) + NetworkPolicy に `openshift-monitoring` → 8080 を追加 |
+
+**`limited_calls` について**: limitador はレート制限が実際に 1 度でも発動する
+まで `limited_calls` を export しない（カウンタが遅延生成される）。未発動の間は
+`authorized_calls` のみが存在する。ダッシュボードのクエリは `or vector(0)` で
+受けているので 0 と表示される（正常）。収集できているかは次で確認する。
+
+```bash
+# Thanos で確認（authorized_calls が出れば収集経路は生きている）
+authorized_calls
+authorized_calls_total      # 03-recordingrule.yaml が評価されていれば出る
+limitador_up
+```
 
 **GPU ダッシュボードが依然 0 のとき**は ServiceMonitor の有無を見る。
 

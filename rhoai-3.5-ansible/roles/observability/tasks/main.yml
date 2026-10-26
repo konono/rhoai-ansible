@@ -73,6 +73,21 @@
                       requests:
                         storage: 40Gi
 
+    # Perses は Thanos Querier = platform Prometheus を見ている。
+    # platform Prometheus が namespace 内の PodMonitor を拾うには
+    # このラベルが要る。これが無いと limitador の authorized_calls /
+    # limited_calls が収集されず、Rate Limit 系パネルが恒久的に空になる。
+    # UWM は openshift-* を対象外にする仕様なので UWM では代替できない。
+    - name: Label openshift-rhcl for platform monitoring
+      kubernetes.core.k8s:
+        state: patched
+        kind: Namespace
+        name: openshift-rhcl
+        definition:
+          metadata:
+            labels:
+              openshift.io/cluster-monitoring: "true"
+
     - name: Check existing ClusterPolicy
       kubernetes.core.k8s_info:
         api_version: nvidia.com/v1

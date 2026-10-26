@@ -2080,11 +2080,12 @@ class ManifestRenderer:
             "type": "Opaque",
             "data": {"POSTGRES_DB": b64("ogx"), "POSTGRES_USER": b64("ogx"), "POSTGRES_PASSWORD": b64(ogx_db_pw)},
         }
-        pvc = {
-            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-            "metadata": {"name": "ogx-postgres-data", "namespace": "redhat-ods-applications"},
-            "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": self.storage_class, "resources": {"requests": {"storage": "10Gi"}}},
-        }
+        # 単体 PVC "ogx-postgres-data" はかつてここで出していたが削除した。
+        # 下の StatefulSet は volumeClaimTemplates (name: data) を使うので
+        # 実際にマウントされるのは data-ogx-postgres-0。
+        # ogx-postgres-data は誰からも参照されず、gp3-csi が
+        # WaitForFirstConsumer のため永久に Pending で残るだけだった。
+        # roles/ogx/tasks/main.yml と同じく出力しない。
         sts = {
             "apiVersion": "apps/v1", "kind": "StatefulSet",
             "metadata": {"name": "ogx-postgres", "namespace": "redhat-ods-applications"},
@@ -2132,7 +2133,7 @@ class ManifestRenderer:
             "spec": {"generateBucketName": "ogx", "storageClassName": "openshift-storage.noobaa.io", "additionalConfig": {"bucketclass": "ogx-bucket-class"}},
         }
 
-        self._write_manifests("11-ogx", "01-postgres.yml", [pg_creds, pvc, sts, svc])
+        self._write_manifests("11-ogx", "01-postgres.yml", [pg_creds, sts, svc])
         self._write_manifests("11-ogx", "02-noobaa-storage.yml", [bs, bc, obc])
 
         model_name = self.llm_model_name or "unknown"
