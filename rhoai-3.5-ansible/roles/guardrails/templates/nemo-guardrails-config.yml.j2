@@ -19,15 +19,25 @@ data:
           #   thinking なし:                 4 tokens で "Tokyo."、即答
           #
           # 【重要】ここは extra_body: でネストしてはいけない。
-          # nemoguardrails 0.23 以降、models[].parameters の未知のキーは
-          # **そのまま HTTP ボディに転送される**（_compat/langchain_kwargs.py の
-          # docstring: "After 0.23 any unrecognized parameter is forwarded
-          # verbatim to the OpenAI-compatible HTTP client"）。
+          # nemoguardrails の OpenAI 互換クライアント経路では、
+          # models[].parameters の未知のキーは **そのまま HTTP ボディに転送される**。
           # つまり extra_body: と書くと、vLLM には chat_template_kwargs ではなく
           # 「extra_body」という未知のフィールドが送られ、黙って無視される
           # = 思考が切れないまま 200 OK が返る。
-          # vLLM が見るのはボディ直下の chat_template_kwargs なので、
-          # parameters 直下に置く。
+          # vLLM が見るのはボディ直下の chat_template_kwargs なので parameters 直下に置く。
+          #
+          # 【適用バージョン】RHOAI 3.5 同梱の 0.24 系で実機確認済み。
+          # この直下形式が正しいのは default framework の OpenAI 互換クライアント
+          # 経路を通る 0.22 以降。**0.21 以前は LangChain 経路**で、そちらでは
+          # 直下に置くと SDK が TypeError になり、extra_body ネストが正しい形になる。
+          # 古い nemoguardrails を積む環境へ移植する場合はここを戻すこと。
+          # (_compat/langchain_kwargs.py の docstring にある "After 0.23 ..." は
+          #  互換シムを削除する時期の話であって、転送が始まる版の話ではない)
+          #
+          # 【前提】base_url は下で内部 vLLM サービスに固定している。
+          # chat_template_kwargs は vLLM 固有の拡張で、未知フィールドを拒否する
+          # 他の OpenAI 互換サーバへ向けた場合は 400 になりうる。
+          # 任意のサーバ対応は本テンプレートの範囲外。
           chat_template_kwargs:
             enable_thinking: {{ guardrails_enable_thinking | default(false) | lower }}
 

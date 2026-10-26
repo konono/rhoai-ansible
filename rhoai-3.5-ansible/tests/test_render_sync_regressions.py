@@ -249,11 +249,21 @@ class TestObservabilityGuideCoverage(RenderSyncBase):
         """roles/observability/files/*.yaml が手順書で必ず適用されること。
 
         過去、適用ループが `0[1-4]*.yaml` + `06*.yaml` の決め打ちだったため
-        07-limitador-platform-scrape.yaml が漏れた。ファイル名を増やしたときに
-        気づけるよう、実ファイルを列挙して手順書側の網羅性を見る。
+        07-limitador-platform-scrape.yaml が漏れた。
+
+        期待集合は **role の元ファイル** から作る。レンダリング結果から作ると、
+        renderer がファイルを出力しなくなった変異を検出できない
+        (出力が減れば期待も減るので常に通ってしまう)。
         """
+        expected = sorted(p.name for p in OBS_FILES.glob("*.yaml")
+                          if p.name != "kustomization.yaml")
+        self.assertTrue(expected, "roles/observability/files に静的ファイルが無い")
+
         rendered = sorted(p.name for p in (self.manifests / "13-observability").glob("*.yaml"))
-        self.assertTrue(rendered, "observability の静的ファイルが 1 つも出ていない")
+        missing = [n for n in expected if n not in rendered]
+        self.assertEqual(
+            [], missing,
+            f"role に在る静的ファイルが render.py の出力に無い: {missing}")
 
         # 手順書が一括適用に使っている glob を取り出す
         globs = re.findall(rf"for f in (?:{re.escape(OBS_MANIFEST_DIR)}/\S+\s*)+;", self.guide)
@@ -263,7 +273,7 @@ class TestObservabilityGuideCoverage(RenderSyncBase):
                     for p in re.findall(rf"{re.escape(OBS_MANIFEST_DIR)}/(\S+)", globs[0])]
 
         import fnmatch
-        for name in rendered:
+        for name in expected:
             if name in CONDITIONAL_OBS_FILES:
                 self.assertIn(name, self.guide,
                               f"{name} は条件付き適用だが手順書に一切登場しない")
@@ -321,6 +331,147 @@ class TestObservabilitySideEffectsInGuide(RenderSyncBase):
                       "role 側に UWM 有効化のタスクが無い")
 
 
+class TestUwmMergeShell(RenderSyncBase):
+    """生成された UWM 有効化シェルを模擬 oc で実行し、既存設定を壊さないか見る。
+
+    テキスト処理で済ませていた旧実装は、末尾改行の無い既存値に対して
+    `retention: 15denableUserWorkload: true` という壊れた YAML を書き戻し、
+    しかも終了コード 0 で成功に見えていた (レビュー指摘)。
+    """
+
+    #: 壊しやすい既存設定のバリエーション
+    CASES = {
+        "no_trailing_newline": 'prometheus:\n  retention: 15d',
+        "flow_style": '{prometheus: {retention: 15d}}\n',
+        "already_true": 'enableUserWorkload: true\nprometheus:\n  retention: 15d\n',
+        "already_false": 'enableUserWorkload: false\nprometheus:\n  retention: 15d\n',
+    }
+
+    def _extract_snippet(self) -> str:
+        """手順書から UWM 有効化のブロックだけ取り出す。"""
+        start = self.guide.index("if oc get cm cluster-monitoring-config")
+        end = self.guide.index("oc apply -f manifests/13-observability/02-uwm.yml", start)
+        return self.guide[start:end]
+
+    def _run_with_mock_oc(self, existing: str, with_pyyaml: bool):
+        """模擬 oc を PATH に置いて生成シェルを実行し、書き戻された内容を返す。
+
+        PyYAML の有無で実装が分岐するので、両方を実行できるよう python3 も
+        差し替える。bastion に PyYAML が無いことは実際にあり
+        (本開発機の system python3 がまさにそうだった)、フォールバック側が
+        壊れていても気づけない。
+        """
+        work = Path(tempfile.mkdtemp(prefix="uwm-"))
+        try:
+            (work / "current").write_text(existing, encoding="utf-8")
+            written = work / "written"
+            mock = work / "bin"
+            mock.mkdir()
+
+            oc = mock / "oc"
+            oc.write_text(
+                "#!/usr/bin/env bash\n"
+                "# 模擬 oc。jsonpath は解釈せず、保存しておいた既存値をそのまま返す。\n"
+                f'WORK="{work}"\n'
+                'if [ "$1" = "get" ] && [ "$2" = "cm" ]; then\n'
+                '  for a in "$@"; do case "$a" in -o) HAS_O=1;; jsonpath=*) HAS_JP=1;; esac; done\n'
+                '  if [ -n "${HAS_JP:-}" ]; then cat "$WORK/current"; fi\n'
+                '  exit 0\n'
+                'fi\n'
+                'if [ "$1" = "set" ] && [ "$2" = "data" ]; then\n'
+                '  for a in "$@"; do\n'
+                '    case "$a" in --from-file=config.yaml=*)\n'
+                '      src="${a#--from-file=config.yaml=}"\n'
+                '      [ -f "$src" ] || { echo "mock oc: missing $src" >&2; exit 1; }\n'
+                '      cp "$src" "$WORK/written" ;;\n'
+                '    esac\n'
+                '  done\n'
+                '  exit 0\n'
+                'fi\n'
+                'exit 0\n', encoding="utf-8")
+            oc.chmod(0o755)
+
+            py = mock / "python3"
+            if with_pyyaml:
+                # PyYAML を持つインタプリタ (このテストを動かしている処理系) へ委譲
+                py.write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n',
+                              encoding="utf-8")
+            else:
+                # import yaml だけ失敗させ、他はそのまま通す
+                py.write_text(
+                    "#!/usr/bin/env bash\n"
+                    'if [ "$1" = "-c" ] && [ "$2" = "import yaml" ]; then exit 1; fi\n'
+                    f'exec "{sys.executable}" "$@"\n', encoding="utf-8")
+            py.chmod(0o755)
+
+            env = dict(os.environ, PATH=f"{mock}:{os.environ['PATH']}")
+            proc = subprocess.run(["bash", "-c", self._extract_snippet()],
+                                  capture_output=True, text=True, env=env)
+            out = written.read_text(encoding="utf-8") if written.exists() else None
+            return proc, out
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_existing_config_is_preserved_and_flag_is_set(self):
+        for with_yaml in (True, False):
+            for name, existing in self.CASES.items():
+                if name == "flow_style" and not with_yaml:
+                    continue  # フォールバックは flow style を扱えない (別テストで検証)
+                with self.subTest(case=name, pyyaml=with_yaml):
+                    proc, written = self._run_with_mock_oc(existing, with_yaml)
+                    self.assertEqual(0, proc.returncode,
+                                     f"{name}: 生成シェルが失敗した\n{proc.stderr[-500:]}")
+                    self.assertIsNotNone(written, f"{name}: 書き戻しが発生していない")
+
+                    parsed = yaml.safe_load(written)
+                    self.assertIsInstance(
+                        parsed, dict,
+                        f"{name}: 書き戻した内容が YAML として読めない\n---\n{written}\n---")
+                    self.assertIs(parsed.get("enableUserWorkload"), True,
+                                  f"{name}: enableUserWorkload が true になっていない")
+
+                    original = yaml.safe_load(existing) or {}
+                    for key, value in original.items():
+                        if key == "enableUserWorkload":
+                            continue
+                        self.assertEqual(
+                            value, parsed.get(key),
+                            f"{name}: 既存の '{key}' が失われた / 変化した")
+
+    def test_no_trailing_newline_does_not_concatenate(self):
+        """旧実装はここで 'retention: 15denableUserWorkload: true' を作っていた。"""
+        for with_yaml in (True, False):
+            with self.subTest(pyyaml=with_yaml):
+                _, written = self._run_with_mock_oc(
+                    self.CASES["no_trailing_newline"], with_yaml)
+                self.assertIsNotNone(written)
+                self.assertNotIn("15denableUserWorkload", written,
+                                 "末尾改行の無い既存値と連結して壊れた YAML になっている")
+
+    def test_fallback_refuses_flow_style_instead_of_corrupting(self):
+        """PyYAML が無く flow style のときは、壊すより中止すること。"""
+        proc, written = self._run_with_mock_oc(self.CASES["flow_style"], with_pyyaml=False)
+        self.assertNotEqual(0, proc.returncode,
+                            "flow style を扱えないのに成功扱いになっている")
+        self.assertIsNone(written, "中止すべき場面で書き戻しが発生している")
+
+    def test_merge_failure_never_writes_back(self):
+        """マージ段階で失敗したら oc set data に進まないこと。
+
+        実機で、PyYAML が無く python が落ちたのに処理が続行し、
+        前回の残骸 /tmp/cmo-new.yaml を書き戻そうとした (admission webhook が
+        拒否して事なきを得た)。固定パスをやめ、失敗時は必ず止める。
+        """
+        snippet = self._extract_snippet()
+        self.assertNotIn("/tmp/cmo-new.yaml", snippet,
+                         "固定の /tmp パスを使っている。前回の残骸を掴む危険がある")
+        self.assertNotIn("/tmp/cmo-current.yaml", snippet,
+                         "固定の /tmp パスを使っている。前回の残骸を掴む危険がある")
+        self.assertIn("mktemp", snippet, "一時ファイルが mktemp になっていない")
+        self.assertIn('-s "$CMO_NEW"', snippet,
+                      "書き戻し前にマージ結果の非空チェックが無い")
+
+
 class TestOgxOrphanPvc(RenderSyncBase):
     """誰からも参照されない PVC を両経路とも作らないこと。"""
 
@@ -345,17 +496,65 @@ class TestOgxOrphanPvc(RenderSyncBase):
         self.assertEqual([], role_orphans,
                          "role が参照されない PVC ogx-postgres-data を作っている")
 
-    def test_both_paths_clean_up_the_orphan(self):
-        """既存クラスタに残った実体を、データが無いときだけ消すこと。"""
-        self.assertIn("oc delete pvc ogx-postgres-data", self.guide,
-                      "手順書に孤児 PVC の掃除が無い")
-        self.assertIn('"$PHASE" = "Pending"', self.guide,
-                      "手順書の掃除が Pending 限定のガード付きになっていない")
+    def _delete_task(self):
+        """role の PVC 削除タスクを YAML 構造として取り出す。
 
-        ogx_tasks = (ANSIBLE_DIR / "roles" / "ogx" / "tasks" / "main.yml").read_text()
-        self.assertIn("ogx-postgres-data", ogx_tasks)
-        self.assertIn("Pending", ogx_tasks,
-                      "role 側の掃除が Pending 限定のガード付きになっていない")
+        生テキストの `assertIn` で済ませてはいけない。ガードを削っても
+        コメント中の文字列で成立してしまい、テストが素通りする
+        (実際にレビューでその穴を指摘された)。
+        """
+        doc = yaml.safe_load(
+            (ANSIBLE_DIR / "roles" / "ogx" / "tasks" / "main.yml").read_text(encoding="utf-8"))
+        tasks = [n for n in _walk(doc)
+                 if isinstance(n, dict)
+                 and isinstance(n.get("kubernetes.core.k8s"), dict)
+                 and n["kubernetes.core.k8s"].get("state") == "absent"
+                 and n["kubernetes.core.k8s"].get("name") == "ogx-postgres-data"]
+        self.assertEqual(1, len(tasks),
+                         "role に ogx-postgres-data を削除するタスクがちょうど 1 つ必要")
+        return tasks[0]
+
+    def test_role_delete_is_guarded_by_when_conditions(self):
+        """when: が「Pending」かつ「volumeName 空」かつ「参照 Pod 無し」であること。"""
+        task = self._delete_task()
+        conds = task.get("when")
+        self.assertIsInstance(conds, list, "削除タスクに when: のリストが無い")
+        joined = " ".join(str(c) for c in conds)
+        self.assertIn("Pending", joined, "when: に Pending 判定が無い")
+        self.assertIn("volumeName", joined,
+                      "when: に volumeName 空の判定が無い "
+                      "(Pending だけでは『データが無い』証明にならない)")
+        self.assertIn("claimName", joined,
+                      "when: に参照 Pod の検査が無い")
+
+    def test_role_delete_sends_uid_and_resource_version_preconditions(self):
+        """確認から削除までの間に Bound へ変わったら API 側で弾かせること。"""
+        task = self._delete_task()
+        pre = (task["kubernetes.core.k8s"].get("delete_options") or {}).get("preconditions")
+        self.assertIsInstance(
+            pre, dict,
+            "delete_options.preconditions が無い。読み取りと削除の間に状態が"
+            " 変わっても気づけず、Bound になった PVC を消しうる (TOCTOU)")
+        for key in ("uid", "resourceVersion"):
+            self.assertIn(key, pre, f"preconditions に {key} が無い")
+            self.assertIn("_ogx_pvc", str(pre[key]),
+                          f"preconditions.{key} が、直前に読み取った値を参照していない")
+
+    def test_guide_delete_uses_preconditions_and_full_guard(self):
+        """手順書側も同じ安全性を持つこと。
+
+        oc delete は precondition を送れないため API を直接叩く形になっている。
+        """
+        self.assertIn("preconditions", self.guide,
+                      "手順書の削除が precondition 無しで実行されている")
+        for token in ('\\"uid\\"', '\\"resourceVersion\\"'):
+            self.assertIn(token, self.guide, f"手順書の precondition に {token} が無い")
+        self.assertIn("volumeName", self.guide,
+                      "手順書のガードに volumeName 空の判定が無い")
+        self.assertIn("INUSE", self.guide,
+                      "手順書のガードに参照 Pod の検査が無い")
+        self.assertNotIn("oc delete pvc ogx-postgres-data", self.guide,
+                         "precondition を送れない素の oc delete が残っている")
 
 
 if __name__ == "__main__":

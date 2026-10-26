@@ -922,16 +922,28 @@ canonical form は不要なので、定義ごと削除した。
 
 **原因 2: `extra_body:` のネストで思考が切れていなかった**
 
-nemoguardrails **0.23 以降**、`models[].parameters` の未知のキーは
-**そのまま HTTP ボディに転送される**（`_compat/langchain_kwargs.py` の docstring:
-"After 0.23 any unrecognized parameter is forwarded verbatim to the
-OpenAI-compatible HTTP client"）。
+nemoguardrails の **OpenAI 互換クライアント経路**では、`models[].parameters` の
+未知のキーは**そのまま HTTP ボディに転送される**。
 
 つまり `extra_body: {chat_template_kwargs: ...}` と書くと、vLLM には
 `chat_template_kwargs` ではなく **`extra_body` という未知のフィールド**が送られ、
 黙って無視される。200 OK が返るのでエラーにもならない。
 
 vLLM が見るのはボディ直下の `chat_template_kwargs` なので、`parameters` 直下に置く。
+
+**適用バージョン**: RHOAI 3.5 同梱の **0.24 系で実機確認済み**。直下形式が正しいのは
+OpenAI 互換クライアント経路を通る **0.22 以降**。**0.21 以前は LangChain 経路**で、
+直下に置くと SDK が `TypeError` になり、`extra_body` ネストの方が正しい形になる。
+古い nemoguardrails を積む環境へ移植する場合は戻すこと。
+
+> `_compat/langchain_kwargs.py` の docstring にある "After 0.23 any unrecognized
+> parameter is forwarded verbatim ..." は、**互換シムを削除する時期**の説明であって
+> 転送が始まるバージョンの話ではない。0.22 の default framework には既に同じ
+> 転送実装がある。当初これを「0.23 から転送される」と読み違えていた。
+
+**前提**: 本 role の `base_url` は内部 vLLM サービスに固定している。
+`chat_template_kwargs` は vLLM 固有の拡張なので、未知フィールドを拒否する他の
+OpenAI 互換サーバへ向けた場合は 400 になりうる。任意のサーバ対応は range 外。
 
 ```yaml
 parameters:

@@ -101,9 +101,18 @@
     # ogx-postgres-data は誰からも参照されず、gp3-csi が
     # WaitForFirstConsumer のため永久に Pending のまま残っていた。
     #
-    # 既存クラスタに残った残骸を収束させる。Bound になったことが無い
-    # (= Pending のまま = データが乗っていない) ものだけを消す。
-    # 万一 Bound なものがあれば触らない。
+    # 既存クラスタに残った残骸を収束させる。
+    #
+    # 「phase が Pending」だけを根拠にしてはいけない。
+    #   - phase は PV バインドの途中段階でも Pending のことがある。
+    #     Pending は「データが無いことの証明」にならない
+    #   - 読み取りから削除までの間に Bound へ変わりうる (TOCTOU)
+    # そのため
+    #   (1) phase == Pending かつ spec.volumeName が空 (PV が一度も割り当てられて
+    #       いない = 中身が存在しえない) ことを条件にし、
+    #   (2) 読み取った uid / resourceVersion を delete の precondition に渡して、
+    #       その間に 1 bit でも変化していたら API 側で弾かせる。
+    # これで「確認したその版」以外は絶対に消えない。
     - name: Check for obsolete standalone OGX PostgreSQL PVC
       kubernetes.core.k8s_info:
         api_version: v1
@@ -112,16 +121,35 @@
         namespace: redhat-ods-applications
       register: _ogx_pvc
 
-    - name: Remove obsolete standalone OGX PostgreSQL PVC (unbound only)
+    - name: Check whether the obsolete PVC is referenced by any pod
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Pod
+        namespace: redhat-ods-applications
+      register: _ogx_pods
+      when: _ogx_pvc.resources | length > 0
+
+    - name: Remove obsolete standalone OGX PostgreSQL PVC (never-bound only)
       kubernetes.core.k8s:
         state: absent
         api_version: v1
         kind: PersistentVolumeClaim
         name: ogx-postgres-data
         namespace: redhat-ods-applications
+        delete_options:
+          preconditions:
+            uid: "{{ _ogx_pvc.resources[0].metadata.uid }}"
+            resourceVersion: "{{ _ogx_pvc.resources[0].metadata.resourceVersion }}"
       when:
         - _ogx_pvc.resources | length > 0
         - _ogx_pvc.resources[0].status.phase | default('') == 'Pending'
+        - (_ogx_pvc.resources[0].spec.volumeName | default('')) == ''
+        - >-
+          _ogx_pods.resources | default([])
+          | map(attribute='spec.volumes', default=[]) | flatten
+          | selectattr('persistentVolumeClaim', 'defined')
+          | map(attribute='persistentVolumeClaim.claimName')
+          | select('equalto', 'ogx-postgres-data') | list | length == 0
 
     # --- OGX PostgreSQL StatefulSet + Service ---
     - name: Check if OGX PostgreSQL StatefulSet exists

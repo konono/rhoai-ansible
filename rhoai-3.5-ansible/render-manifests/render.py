@@ -2150,14 +2150,42 @@ class ManifestRenderer:
             "# 2b. 旧版が作っていた単体 PVC ogx-postgres-data の掃除。\n"
             "# StatefulSet は volumeClaimTemplates (name: data) を使うので実際に\n"
             "# マウントされるのは data-ogx-postgres-0。ogx-postgres-data は誰からも\n"
-            "# 参照されず、gp3-csi が WaitForFirstConsumer のため永久に Pending で残る。\n"
-            "# 一度も Bound していない (= データが乗っていない) ものだけ消す。\n"
-            "PHASE=$(oc get pvc ogx-postgres-data -n redhat-ods-applications \\\n"
-            "          -o jsonpath='{.status.phase}' 2>/dev/null || true)\n"
-            "if [ \"$PHASE\" = \"Pending\" ]; then\n"
-            "  oc delete pvc ogx-postgres-data -n redhat-ods-applications\n"
-            "elif [ -n \"$PHASE\" ]; then\n"
-            "  echo \"ogx-postgres-data は $PHASE です。データが乗っている可能性があるため削除しません\"\n"
+            "# 参照されず、WaitForFirstConsumer の StorageClass では永久に Pending で残る。\n"
+            "#\n"
+            "# phase == Pending だけを根拠に消してはいけない。phase はバインド途中でも\n"
+            "# Pending でありうるし、確認から削除までの間に Bound へ変わりうる。\n"
+            "#   (1) phase == Pending かつ spec.volumeName が空 (PV が一度も割り当て\n"
+            "#       られていない = 中身が存在しえない)、かつ参照する Pod が無いこと\n"
+            "#   (2) 読み取った uid / resourceVersion を DELETE の precondition に渡し、\n"
+            "#       その間に変化していたら API 側で 409 にさせる\n"
+            "# oc delete は precondition を送れないため API を直接叩く。\n"
+            "# oc proxy 経由にしてトークンを argv に載せない。\n"
+            "PVC_JSON=$(oc get pvc ogx-postgres-data -n redhat-ods-applications -o json 2>/dev/null || true)\n"
+            "if [ -z \"$PVC_JSON\" ]; then\n"
+            "  echo 'ogx-postgres-data は存在しません (掃除不要)'\n"
+            "else\n"
+            "  PHASE=$(printf '%s' \"$PVC_JSON\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"status\"].get(\"phase\",\"\"))')\n"
+            "  VOLNAME=$(printf '%s' \"$PVC_JSON\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"spec\"].get(\"volumeName\",\"\"))')\n"
+            "  UID_=$(printf '%s' \"$PVC_JSON\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"metadata\"][\"uid\"])')\n"
+            "  RV=$(printf '%s' \"$PVC_JSON\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"metadata\"][\"resourceVersion\"])')\n"
+            "  INUSE=$(oc get pods -n redhat-ods-applications -o json \\\n"
+            "    | python3 -c 'import json,sys; print(sum(1 for p in json.load(sys.stdin)[\"items\"] for v in (p[\"spec\"].get(\"volumes\") or []) if (v.get(\"persistentVolumeClaim\") or {}).get(\"claimName\")==\"ogx-postgres-data\"))')\n"
+            "  if [ \"$PHASE\" != \"Pending\" ] || [ -n \"$VOLNAME\" ] || [ \"$INUSE\" != \"0\" ]; then\n"
+            "    echo \"ogx-postgres-data: phase=$PHASE volumeName='$VOLNAME' 参照Pod=$INUSE のため削除しません\"\n"
+            "  else\n"
+            "    oc proxy --port=18001 >/dev/null 2>&1 &\n"
+            "    OC_PROXY_PID=$!\n"
+            "    trap 'kill $OC_PROXY_PID 2>/dev/null' EXIT\n"
+            "    for _ in $(seq 1 20); do\n"
+            "      curl -sf http://127.0.0.1:18001/api >/dev/null 2>&1 && break; sleep 0.5\n"
+            "    done\n"
+            "    curl -sS -X DELETE -o /dev/null -w 'DELETE -> HTTP %{http_code}\\n' \\\n"
+            "      -H 'Content-Type: application/json' \\\n"
+            "      --data \"{\\\"preconditions\\\":{\\\"uid\\\":\\\"$UID_\\\",\\\"resourceVersion\\\":\\\"$RV\\\"}}\" \\\n"
+            "      \"http://127.0.0.1:18001/api/v1/namespaces/redhat-ods-applications/persistentvolumeclaims/ogx-postgres-data\"\n"
+            "    kill $OC_PROXY_PID 2>/dev/null; trap - EXIT\n"
+            "    # 409 なら確認後に状態が変わったということ。意図どおり消していない。\n"
+            "  fi\n"
             "fi\n\n"
             "# 3. NooBaa storage\n"
             "oc apply -f manifests/11-ogx/02-noobaa-storage.yml\n"
@@ -2234,12 +2262,17 @@ class ManifestRenderer:
       #   thinking なし:                 4 tokens で "Tokyo."、即答
       #
       # 【重要】ここは extra_body: でネストしてはいけない。
-      # nemoguardrails 0.23 以降、models[].parameters の未知のキーは
-      # **そのまま HTTP ボディに転送される**（_compat/langchain_kwargs.py の
-      # docstring: "After 0.23 any unrecognized parameter is forwarded verbatim
-      # to the OpenAI-compatible HTTP client"）。extra_body: と書くと vLLM には
-      # 「extra_body」という未知フィールドが送られ黙って無視される（#15）。
+      # nemoguardrails の OpenAI 互換クライアント経路では、models[].parameters の
+      # 未知のキーは **そのまま HTTP ボディに転送される**。extra_body: と書くと
+      # vLLM には「extra_body」という未知フィールドが送られ黙って無視される（#15）。
       # vLLM が見るのはボディ直下の chat_template_kwargs。
+      #
+      # 【適用バージョン】RHOAI 3.5 同梱の 0.24 系で実機確認済み。直下形式が正しいのは
+      # OpenAI 互換クライアント経路を通る 0.22 以降。0.21 以前は LangChain 経路で、
+      # 直下だと SDK が TypeError になり extra_body ネストが正しい形になる。
+      #
+      # 【前提】base_url は内部 vLLM サービス固定。chat_template_kwargs は vLLM 固有の
+      # 拡張で、未知フィールドを拒否する他の OpenAI 互換サーバでは 400 になりうる。
       # roles/guardrails/templates/nemo-guardrails-config.yml.j2 と同じ設定にすること。
       chat_template_kwargs:
         enable_thinking: {guardrails_thinking}
@@ -2393,16 +2426,50 @@ define flow self check output
                               "oc get csv -n openshift-opentelemetry-operator -w")
             + "\n```bash\n"
             "# user workload monitoring を有効化する。\n"
-            "# cluster-monitoring-config は他の設定が入っていることがあるので、\n"
-            "# 既存があれば apply で上書きせず enableUserWorkload だけ patch する。\n"
+            "# cluster-monitoring-config には他の設定が入っていることがあるため、\n"
+            "# 既存があれば apply で丸ごと上書きせず enableUserWorkload だけ足す。\n"
+            "#\n"
+            "# テキスト処理 (grep/sed/echo 追記) でやってはいけない。既存値の末尾に\n"
+            "# 改行が無いと 'retention: 15denableUserWorkload: true' と連結されて\n"
+            "# 壊れた YAML を書き戻すうえ、終了コードは 0 で成功に見える。\n"
+            "# flow style ({retention: 15d}) でも壊れる。YAML として読んで書く。\n"
+            "# python3 + PyYAML が要る (render.py 自体の前提と同じ)。\n"
             "if oc get cm cluster-monitoring-config -n openshift-monitoring >/dev/null 2>&1; then\n"
+            "  # 固定の /tmp パスを使わない。前回の残骸を掴んで書き戻す事故を防ぐ。\n"
+            "  CMO_CUR=$(mktemp); CMO_NEW=$(mktemp)\n"
+            "  trap 'rm -f \"$CMO_CUR\" \"$CMO_NEW\"' EXIT\n"
             "  oc get cm cluster-monitoring-config -n openshift-monitoring \\\n"
-            "    -o jsonpath='{.data.config\\.yaml}' > /tmp/cmo.yaml\n"
-            "  grep -q '^enableUserWorkload:' /tmp/cmo.yaml \\\n"
-            "    && sed -i 's/^enableUserWorkload:.*/enableUserWorkload: true/' /tmp/cmo.yaml \\\n"
-            "    || echo 'enableUserWorkload: true' >> /tmp/cmo.yaml\n"
+            "    -o jsonpath='{.data.config\\.yaml}' > \"$CMO_CUR\"\n"
+            "  if python3 -c 'import yaml' >/dev/null 2>&1; then\n"
+            "    python3 - \"$CMO_CUR\" \"$CMO_NEW\" <<'PY' || { echo 'ERROR: merge failed' >&2; exit 1; }\n"
+            "import sys, yaml\n"
+            "cfg = yaml.safe_load(open(sys.argv[1])) or {}\n"
+            "if not isinstance(cfg, dict):\n"
+            "    sys.exit('unexpected cluster-monitoring-config content: %r' % (cfg,))\n"
+            "cfg['enableUserWorkload'] = True\n"
+            "with open(sys.argv[2], 'w') as f:\n"
+            "    yaml.safe_dump(cfg, f, default_flow_style=False, allow_unicode=True)\n"
+            "PY\n"
+            "  else\n"
+            "    # PyYAML が無い環境向けのフォールバック。\n"
+            "    # flow style ({prometheus: ...}) は行追記では壊れるので中止する。\n"
+            "    if [ \"$(sed -e 's/^[[:space:]]*//' -e '/^#/d' -e '/^$/d' \"$CMO_CUR\" | head -c 1)\" = '{' ]; then\n"
+            "      echo 'ERROR: config.yaml が flow style です。PyYAML を入れて再実行してください' >&2\n"
+            "      exit 1\n"
+            "    fi\n"
+            "    # grep は行末を正規化するので、既存値に末尾改行が無くても連結されない。\n"
+            "    # 先頭列の enableUserWorkload だけ落としてから付け直す (キー重複防止)。\n"
+            "    { grep -v '^enableUserWorkload:' \"$CMO_CUR\" || true; \\\n"
+            "      echo 'enableUserWorkload: true'; } > \"$CMO_NEW\"\n"
+            "  fi\n"
+            "  # マージに失敗していたら絶対に書き戻さない\n"
+            "  if [ ! -s \"$CMO_NEW\" ]; then\n"
+            "    echo 'ERROR: マージ結果が空です。cluster-monitoring-config は変更していません' >&2\n"
+            "    exit 1\n"
+            "  fi\n"
             "  oc set data cm/cluster-monitoring-config -n openshift-monitoring \\\n"
-            "    --from-file=config.yaml=/tmp/cmo.yaml\n"
+            "    --from-file=config.yaml=\"$CMO_NEW\"\n"
+            "  rm -f \"$CMO_CUR\" \"$CMO_NEW\"; trap - EXIT\n"
             "else\n"
             "  oc apply -f manifests/13-observability/00-enable-uwm.yml\n"
             "fi\n\n"
