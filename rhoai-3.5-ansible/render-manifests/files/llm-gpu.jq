@@ -1,16 +1,21 @@
 # Runtime counterpart of check_gpu_capacity.yml, check_gpu_available.yml and
 # serve_model.yml. Tests compare these decisions with the real Ansible expressions.
 def main_container: [.spec.template.containers[]? | select(.name == "main")][0] // {};
+def allocatable($resource):
+  .metadata.name as $node |
+  (.status.allocatable[$resource] // "0") as $value |
+  try ($value | tonumber)
+  catch error("Invalid GPU allocatable: node=\($node) resource=\($resource) value=\($value | tojson)");
 def selected($cfg):
   (.metadata.labels // {}) as $labels |
   (.spec.unschedulable != true) and
   all(($cfg.node_selector // {} | to_entries)[]; $labels[.key] == .value);
 def capacity($cfg):
   [.items[] | select(selected($cfg)) |
-   ((.status.allocatable[$cfg.gpu_resource] // "0") | tonumber)] | add // 0;
+   allocatable($cfg.gpu_resource)] | add // 0;
 def slots($cfg):
   [.items[] | select(selected($cfg)) |
-   (((.status.allocatable[$cfg.gpu_resource] // "0") | tonumber) / ($cfg.gpu_count | tonumber) | floor)] | add // 0;
+   (allocatable($cfg.gpu_resource) / ($cfg.gpu_count | tonumber) | floor)] | add // 0;
 def normalized_spec:
   . as $lis | main_container as $c |
   {image: ($c.image // ""), args: ($c.args // []), env: ($c.env // []),
@@ -35,7 +40,7 @@ def availability($cfg; $pods):
              .status.phase != "Succeeded" and .status.phase != "Failed") |
       {pod: (.metadata.namespace + "/" + .metadata.name), count: reserved($cfg.gpu_resource)}
     ] as $used |
-    {slots: (([0, (((.status.allocatable[$cfg.gpu_resource] // "0") | tonumber)
+    {slots: (([0, (allocatable($cfg.gpu_resource)
                  - ([$used[].count] | add // 0))] | max) / ($cfg.gpu_count | tonumber) | floor),
      pods: [$used[] | select(.count > 0) | .pod]}
   ] | {slots: ([.[].slots] | add // 0), pods: [.[].pods[]]};

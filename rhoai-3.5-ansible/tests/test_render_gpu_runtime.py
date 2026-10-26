@@ -2,11 +2,14 @@
 import copy
 import json
 import os
+import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import yaml
 from tests.test_mig_playbook import render
 from tests.test_mixed_gpu import ROOT, TASKS, MIG, LARGE, node, pod
@@ -31,7 +34,7 @@ if args[0] == 'create':
  if mode == 'list-output': emit('manifest')
  else:
   for obj in json.loads((p/'manifest.json').read_text())['items']: print(json.dumps(obj))
-elif args[:2] == ['get', 'llminferenceservice']:
+elif args[:2] == ['get', 'llminferenceservices.v1alpha2.serving.kserve.io']:
  if mode == 'get-error': sys.exit(1)
  if (p/'live.json').exists(): emit('live')
 elif args[:2] == ['get', 'nodes']:
@@ -49,11 +52,14 @@ elif args[:2] == ['get', 'endpoints']:
  if mode == 'webhook-error': sys.exit(1)
  print('10.0.0.1')
 elif args[0] == 'delete':
+ assert args[1] == 'llminferenceservices.v1alpha2.serving.kserve.io'
+ if mode == 'delete-notfound' and '--ignore-not-found' not in args: sys.exit(1)
  if mode == 'delete-error': sys.exit(1)
  (p/'deleted').touch()
 elif args[0] == 'apply':
  if mode == 'apply-error': sys.exit(1)
 elif args[0] == 'wait':
+ assert any(x.startswith('llminferenceservices.v1alpha2.serving.kserve.io/') for x in args)
  if mode == 'ready-error': sys.exit(1)
 else: sys.exit('unexpected command: '+repr(args))
 '''
@@ -73,6 +79,7 @@ class RenderGpuRuntime(unittest.TestCase):
         out = cls.root/'out'
         parity.TestRenderParity()._render_with_render_py_dir(inv, out)
         cls.runtime = out/'manifests/09-llm-serving'
+        cls.guide = (out/'manual-deploy-guide.md').read_text()
         cls.manifest = cls.runtime/'model-small-deploy.yml'
         cls.docs = list(yaml.safe_load_all(cls.manifest.read_text()))
         cls.desired = next(d for d in cls.docs if d['kind'] == 'LLMInferenceService')
@@ -103,11 +110,77 @@ class RenderGpuRuntime(unittest.TestCase):
             sleep = path/'sleep'; sleep.write_text('#!/bin/sh\nexit 0\n'); sleep.chmod(0o755)
             cmd = ['bash', str(self.runtime/'llm-deploy.sh'), operation]
             if operation == 'deploy': cmd.append(str(self.manifest))
-            result = subprocess.run(cmd, env={**os.environ, 'PATH': str(path)+':'+os.environ['PATH'],
-                                    'CASE_DIR': tmp, 'MOCK_MODE': mode}, text=True,
-                                    capture_output=True, timeout=30)
-            calls = [json.loads(line) for line in (path/'calls').read_text().splitlines()]
+            result = None
+            error = None
+            try:
+                result = subprocess.run(cmd, env={**os.environ, 'PATH': str(path)+':'+os.environ['PATH'],
+                                        'CASE_DIR': tmp, 'MOCK_MODE': mode}, text=True,
+                                        capture_output=True, timeout=30)
+            except Exception as exc:
+                error = exc
+                raise
+            finally:
+                calls = [json.loads(line) for line in (path/'calls').read_text().splitlines()] if (path/'calls').exists() else []
+                if os.environ.get('GPU_RUNTIME_TEST_LOG_DIR'):
+                    def output(field):
+                        value = getattr(result if result is not None else error, field, None)
+                        return value.decode(errors='replace') if isinstance(value, bytes) else value
+                    logdir = Path(os.environ['GPU_RUNTIME_TEST_LOG_DIR'])
+                    logdir.mkdir(parents=True, exist_ok=True)
+                    (logdir/(path.name+'.json')).write_text(json.dumps({
+                        'test': self.id(), 'mode': mode, 'operation': operation,
+                        'returncode': output('returncode'), 'stdout': output('stdout'),
+                        'stderr': output('stderr'), 'error': repr(error) if error else None, 'calls': calls,
+                        'nodes': nodes, 'pods': pods, 'live': live}, indent=2))
             return result, calls
+
+    def test_diagnostics_survive_timeout_and_failure_before_first_oc(self):
+        for timeout in (True, False):
+            with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'GPU_RUNTIME_TEST_LOG_DIR': tmp}):
+                if timeout:
+                    error = subprocess.TimeoutExpired('bash', 30, output=b'partial', stderr=b'timed out')
+                    with patch('subprocess.run', side_effect=error), self.assertRaises(subprocess.TimeoutExpired):
+                        self.run_script()
+                else:
+                    with patch('subprocess.run', return_value=subprocess.CompletedProcess('bash', 127, '', 'missing jq')):
+                        result, calls = self.run_script()
+                    self.assertEqual(result.returncode, 127)
+                    self.assertEqual(calls, [])
+                logs = list(Path(tmp).glob('*.json'))
+                self.assertEqual(len(logs), 1)
+                record = json.loads(logs[0].read_text())
+                self.assertEqual(record['calls'], [])
+                self.assertEqual(record['stderr'], 'timed out' if timeout else 'missing jq')
+                if timeout:
+                    self.assertIn('TimeoutExpired', record['error'])
+                    self.assertEqual(record['stdout'], 'partial')
+
+    def test_guide_proxy_failure_and_no_downloads_are_tolerated(self):
+        section = self.guide.split(': LLM Serving\n', 1)[1].split('\n## Step ', 1)[0]
+        block = re.findall(r'```bash\n(.*?)```', section, flags=re.S)[0]
+        for proxy_missing in (True, False):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runtime = root/'manifests/09-llm-serving'
+                shutil.copytree(self.runtime, runtime)
+                (runtime/'gpu-models.json').write_text('[]')
+                for download in runtime.glob('model-*-download.yml'): download.unlink()
+                oc = root/'oc'
+                oc.write_text('#!/bin/sh\n'
+                              'printf "%s\\n" "$*" >> "$GUIDE_CALLS"\n'
+                              'case "$1 $2" in\n'
+                              ' "get nodes") echo \'{"items":[]}\';;\n'
+                              ' "get proxy") '+('exit 1' if proxy_missing else 'echo http://proxy')+';;\n'
+                              ' "set env") exit 9;;\n'
+                              'esac\n')
+                oc.chmod(0o755)
+                result = subprocess.run(['bash', '-c', block], cwd=root, text=True, capture_output=True,
+                    env={**os.environ, 'PATH': tmp+':'+os.environ['PATH'], 'GUIDE_CALLS': str(root/'calls')})
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                calls = (root/'calls').read_text()
+                self.assertNotIn('set env', calls)
+                self.assertIn('create configmap small-chat-template', calls)
+                if proxy_missing: self.assertIn('No proxy configured', result.stdout)
 
     def changed(self):
         live = copy.deepcopy(self.desired)
@@ -185,8 +258,38 @@ class RenderGpuRuntime(unittest.TestCase):
             self.assertEqual(len(deletes), 1 if count == 1 else 0)
             if deletes:
                 delete = deletes[0]; apply = next(i for i,c in enumerate(calls) if c[0] == 'apply')
-                self.assertEqual(calls[delete][1:3], ['llminferenceservice', 'small'])
+                self.assertEqual(calls[delete][1:3], ['llminferenceservices.v1alpha2.serving.kserve.io', 'small'])
                 self.assertTrue(any(c[:2] == ['get', 'pods'] for c in calls[delete+1:apply]))
+
+    def test_disappeared_lis_delete_is_idempotent(self):
+        p, calls = self.run_script(live=self.changed(), nodes=[node(resources={MIG: '1'})],
+                                   mode='delete-notfound')
+        self.assertEqual(p.returncode, 0, p.stdout+p.stderr)
+        self.assertTrue(any(c[0] == 'apply' for c in calls))
+        self.assertIn('--ignore-not-found', next(c for c in calls if c[0] == 'delete'))
+
+    def test_invalid_allocatable_has_context_and_never_mutates(self):
+        for operation in ('preflight', 'deploy'):
+            p, calls = self.run_script(live=self.changed(), nodes=[node(resources={MIG: '4k'})],
+                                       operation=operation)
+            self.assertNotEqual(p.returncode, 0, p.stdout)
+            for message in ('Invalid GPU allocatable', 'node=mig', 'resource='+MIG, '4k'):
+                self.assertIn(message, p.stderr)
+            self.assertFalse(any(c[0] in ('delete', 'apply') for c in calls))
+
+    def test_guide_blocks_fail_without_exiting_parent_shell(self):
+        section = self.guide.split(': LLM Serving\n', 1)[1].split('\n## Step ', 1)[0]
+        blocks = re.findall(r'```bash\n(.*?)```', section, flags=re.S)
+        self.assertGreaterEqual(len(blocks), 3)
+        with tempfile.TemporaryDirectory() as tmp:
+            oc = Path(tmp)/'oc'
+            oc.write_text('#!/bin/sh\nexit 1\n'); oc.chmod(0o755)
+            for block in blocks:
+                p = subprocess.run(['bash', '-c', block+'\nrc=$?; echo PARENT_ALIVE:$rc'],
+                                   cwd=self.runtime.parent.parent, text=True, capture_output=True,
+                                   env={**os.environ, 'PATH': tmp+':'+os.environ['PATH']}, timeout=10)
+                self.assertEqual(p.returncode, 0, p.stdout+p.stderr)
+                self.assertIn('PARENT_ALIVE:1', p.stdout, p.stdout+p.stderr)
 
     def test_errors_never_reach_apply(self):
         for mode in ('get-error', 'nodes-error', 'delete-error', 'release-error', 'release-malformed', 'release-busy'):

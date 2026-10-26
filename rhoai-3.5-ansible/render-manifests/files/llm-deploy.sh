@@ -23,7 +23,9 @@ deploy) [[ $# == 2 ]] || fail 'Usage: llm-deploy.sh deploy MODEL-deploy.yml' ;;
 *) fail 'Usage: llm-deploy.sh preflight | deploy MODEL-deploy.yml' ;;
 esac
 manifest=$2
+lis_resource=llminferenceservices.v1alpha2.serving.kserve.io
 # Let oc parse the exact YAML that will be applied. --dry-run=client does not write.
+# It still requires a configured cluster and discovery for both manifest CRDs.
 oc create --dry-run=client --validate=false -f "$manifest" -o json > "$work/manifest.json"
 # oc prints a JSON stream for multi-document YAML, not necessarily a List.
 query -se '[.[] | if .kind == "List" then .items[] else . end |
@@ -34,7 +36,7 @@ name=$(query -er '.metadata.name | select(type == "string" and length > 0)' "$wo
 namespace=$(query -er '.metadata.namespace | select(type == "string" and length > 0)' "$work/desired.json")
 query -e 'include "llm-gpu"; config' "$work/desired.json" > "$work/config.json"
 # --ignore-not-found suppresses only NotFound. Authorization/transport failures stop.
-oc get llminferenceservice "$name" -n "$namespace" --ignore-not-found -o json > "$work/live.json"
+oc get "$lis_resource" "$name" -n "$namespace" --ignore-not-found -o json > "$work/live.json"
 if [[ ! -s "$work/live.json" ]]; then printf 'null\n' > "$work/live.json"; fi
 query -e ' . == null or (.kind == "LLMInferenceService" and (.spec | type) == "object")' \
     "$work/live.json" > /dev/null
@@ -73,7 +75,7 @@ if ! query -e 'any(.status.conditions[]?; .type == "Ready" and .status == "True"
     [[ "$webhook_ready" == true ]] || fail 'LLMInferenceService webhook is not ready'
 fi
 if [[ "$action" == recreate ]]; then
-    oc delete llminferenceservice "$name" -n "$namespace"
+    oc delete "$lis_resource" "$name" -n "$namespace" --ignore-not-found
     released=false
     for ((attempt=0; attempt<=60; attempt++)); do
         # Read errors and remaining Pods both retry, then fail closed after 300 s.
@@ -87,4 +89,4 @@ if [[ "$action" == recreate ]]; then
     [[ "$released" == true ]] || fail "GPU release wait failed for $namespace/$name; no recreation was applied. Resolve remaining Pods/read errors and rerun."
 fi
 oc apply -f "$manifest"
-oc wait --for=condition=Ready "llminferenceservice/$name" -n "$namespace" --timeout=1200s
+oc wait --for=condition=Ready "$lis_resource/$name" -n "$namespace" --timeout=1200s
