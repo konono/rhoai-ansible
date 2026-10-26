@@ -26,6 +26,7 @@ import argparse
 import base64
 import shlex
 import os
+import json
 import re
 import secrets
 import string
@@ -1775,6 +1776,18 @@ class ManifestRenderer:
         chat_template_dir = self.inventory_dir / "chat_templates"
 
         # Per-model manifests
+        # Ship the bash/jq runtime with the output so the manual update path has
+        # the same capacity, reservation and recreation decisions as the role.
+        runtime_dir = Path(__file__).resolve().parent / "files"
+        for filename in ("llm-deploy.sh", "llm-gpu.jq"):
+            self._write_file("09-llm-serving", filename, (runtime_dir / filename).read_text())
+        gpu_models = []
+        for name, raw in self.models.items():
+            resolved = self._merge_model_cfg(raw)
+            if resolved.get("state", "present") == "present":
+                gpu_models.append({"name": name, **{key: resolved[key] for key in
+                    ("gpu_resource", "gpu_count", "replicas", "node_selector")}})
+        self._write_file("09-llm-serving", "gpu-models.json", json.dumps(gpu_models, indent=2) + "\n")
         model_steps = []
         absent_steps = []
         cm_names_created: set[tuple[str, str]] = set()
@@ -1950,35 +1963,16 @@ class ManifestRenderer:
                 self._write_file("09-llm-serving", f"chat_template-{custom_ct}.jinja", src.read_text())
                 cm_names_created.add((cm_name, custom_ct))
 
-            gpu_selector = ",".join(f"{k}={v}" for k, v in model_cfg["node_selector"].items())
-            gpu_query = (
-                'oc get nodes -o json'
-                + (f" -l {shlex.quote(gpu_selector)}" if gpu_selector else "")
-            )
-            # jq reads the literal resource key (dots and slash are not a JSON path).
-            gpu_check = (
-                f"gpu_nodes=$({gpu_query}) || exit 1\n"
-                f"printf '%s' \"$gpu_nodes\" | jq -e --arg r {shlex.quote(model_cfg['gpu_resource'])} "
-                f"--argjson count {model_cfg['gpu_count']} --argjson replicas {model_cfg['replicas']} "
-                "'[.items[] | select(.spec.unschedulable != true) | "
-                "((.status.allocatable[$r] // \"0\" | tonumber) / $count | floor)] | "
-                "(add // 0) >= $replicas' >/dev/null || { echo 'GPU capacity insufficient'; exit 1; }\n"
-            )
             model_steps.append(
                 f"### モデル: {model_name} ({model_cfg['hf_repo']})\n\n"
                 f"```bash\n"
                 f"# ダウンロード Job\n"
-                f"oc apply -f manifests/09-llm-serving/model-{model_name}-download.yml\n"
-                f"oc wait --for=condition=complete job/download-{model_name} -n {model_cfg['namespace']} --timeout=3600s\n\n"
-                f"# 選択ノードの {model_cfg['gpu_resource']} 容量確認 (jq 必須)\n"
-                + gpu_check
-                + f"# 使用中の Pod も確認し、空き容量が不足する場合はここで停止してください。\n"
-                f"oc get pods -A -o wide\n"
-                f"# LLMInferenceService デプロイ\n"
-                f"oc apply -f manifests/09-llm-serving/model-{model_name}-deploy.yml\n"
+                f"oc apply -f manifests/09-llm-serving/model-{model_name}-download.yml || exit 1\n"
+                f"oc wait --for=condition=complete job/download-{model_name} -n {model_cfg['namespace']} --timeout=3600s || exit 1\n\n"
+                f"# GPU 空き確認・変更判定・必要時の再作成・Ready 待機 (bash/oc/jq)\n"
+                f"bash manifests/09-llm-serving/llm-deploy.sh deploy "
+                f"manifests/09-llm-serving/model-{model_name}-deploy.yml || exit 1\n"
                 f"```\n\n"
-                + self._wait_step(f"{model_name} Ready 待機",
-                                  f"oc wait --for=condition=Ready llminferenceservice/{model_name} -n {model_cfg['namespace']} --timeout=900s")
                 + f"\n\n**MaaSModelRef の確認**\n\n"
                 f"```bash\n"
                 f"oc get maasmodelref {model_name} -n {model_cfg['namespace']} -o jsonpath='{{.status.phase}}{{\"\\n\"}}'\n"
@@ -2015,7 +2009,17 @@ class ManifestRenderer:
             present_section = "### Phase 2: モデルデプロイ (state: present)\n\n" + "\n".join(model_steps)
 
         self._step("LLM Serving", (
+            "GPU の判定・適用は同梱の `llm-deploy.sh` と `llm-gpu.jq` で行います。\n"
+            "Ansible と同じく、全 present モデルの資源別合計・選択ノード容量を先に検査し、\n"
+            "新規モデルは使用中 Pod（bound Pending・init/sidecar を含む）を差し引きます。\n"
+            "既存モデルは変更されたフィールド・GPU 種別・nodeSelector・容量から更新方法を判定します。\n"
+            "再作成時は対象モデルだけを削除し、旧 Pod の消滅を最大 300 秒待ちます。\n"
+            "取得失敗・待機期限超過・apply 失敗は中止します。別 workload を自動停止しません。\n"
+            "既存モデルの再作成前の予約込み空き容量や、複数モデルの selector 競合の事前検出は、\n"
+            "Ansible と同じ制約が残ります。GPU の MIG 分割自体は先に専用 playbook で設定してください。\n\n"
             "```bash\n"
+            "# workload を変更する前の全モデル GPU 容量検査\n"
+            "bash manifests/09-llm-serving/llm-deploy.sh preflight || exit 1\n\n"
             "# Base リソース\n"
             "oc apply -f manifests/09-llm-serving/01-base.yml\n\n"
             "# ClusterStorageContainer CRD 待機\n"

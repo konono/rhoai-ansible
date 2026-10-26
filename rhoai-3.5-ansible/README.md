@@ -1320,7 +1320,16 @@ models:
 配置先変更前に対象ノードの空きを確認してください。複数モデルが同じ selector に
 集中する場合の合計要求も、事前のモデル別容量確認だけでは検出できません。
 共有 PVC は従来どおり RWO のため、異なるノードへ配置する場合は PVC の制約にも注意してください。
-手動手順書は `jq` で選択ノードの容量を確認しますが、使用中 Pod の確認は手動です。
+生成手順書にも同じ GPU 判定を行う `llm-deploy.sh` / `llm-gpu.jq` を同梱します
+（実行環境は Bash・`oc`・`jq`）。全モデルの資源別合計・選択ノード容量を事前確認し、
+新規モデルでは bound Pending を含む Pod と init/sidecar の予約量を差し引きます。
+既存モデルでは image・args・env・resources・mount/probe・volumes・replicas・model URI・
+nodeSelector の変更を比較し、GPU 種別・配置先変更またはローリング更新の容量不足なら
+対象モデルだけを再作成します。変更なしでは削除しません。
+旧 Pod の終了待ちは最大 300 秒で、取得エラー・期限超過なら適用へ進まず失敗します。
+原因解消後に同じ手順を再実行してください。適用失敗・Ready 待機失敗も成功扱いにしません。
+上記の再作成前の空き容量・selector 競合・RWO の制約は生成手順書にも共通です。
+GPU の MIG 有効化・無効化は専用 Ansible playbook で行い、生成手順書は構成済み GPU を使います。
 異なるサイズを同じ GPU に混在させる例は
 [`playbooks/examples/mig-mixed-rtx-pro-6000.yml`](playbooks/examples/mig-mixed-rtx-pro-6000.yml)
 を参照してください。RTX PRO 6000 の `all-balanced` は 24 GB × 2 と 48 GB × 1 です。
