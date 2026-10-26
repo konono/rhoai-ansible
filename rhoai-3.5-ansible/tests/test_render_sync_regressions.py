@@ -360,7 +360,8 @@ class TestUwmMergeShell(RenderSyncBase):
 
     def _run_with_mock_oc(self, existing: str, with_pyyaml: bool,
                           fail_get: bool = False, fail_set: bool = False,
-                          silent_empty_merge: bool = False):
+                          silent_empty_merge: bool = False,
+                          not_found: bool = False, fail_apply: bool = False):
         """模擬 oc を PATH に置いて生成シェルを実行し、書き戻された内容を返す。
 
         PyYAML の有無で実装が分岐するので、両方を実行できるよう python3 も
@@ -387,11 +388,22 @@ class TestUwmMergeShell(RenderSyncBase):
                 f'WORK="{work}"\n'
                 f'FAIL_GET={"1" if fail_get else "0"}\n'
                 f'FAIL_SET={"1" if fail_set else "0"}\n'
+                f'NOT_FOUND={"1" if not_found else "0"}\n'
+                f'FAIL_APPLY={"1" if fail_apply else "0"}\n'
                 'if [ "$1" = "get" ] && [ "$2" = "cm" ]; then\n'
                 '  if [ "$FAIL_GET" = "1" ]; then\n'
                 '    echo "Error from server: etcdserver: request timed out" >&2; exit 1\n'
                 '  fi\n'
+                '  if [ "$NOT_FOUND" = "1" ]; then\n'
+                '    echo \'Error from server (NotFound): configmaps "x" not found\' >&2; exit 1\n'
+                '  fi\n'
                 '  cat "$WORK/cm.json"; exit 0\n'
+                'fi\n'
+                'if [ "$1" = "apply" ]; then\n'
+                '  if [ "$FAIL_APPLY" = "1" ]; then\n'
+                '    echo "Error from server: apply denied" >&2; exit 1\n'
+                '  fi\n'
+                '  touch "$WORK/applied"; exit 0\n'
                 'fi\n'
                 'if [ "$1" = "set" ] && [ "$2" = "data" ]; then\n'
                 '  if [ "$FAIL_SET" = "1" ]; then\n'
@@ -434,6 +446,7 @@ class TestUwmMergeShell(RenderSyncBase):
             proc = subprocess.run(["bash", "-c", self._extract_snippet()],
                                   capture_output=True, text=True, env=env)
             out = written.read_text(encoding="utf-8") if written.exists() else None
+            self._applied = (work / "applied").exists()
             return proc, out
         finally:
             shutil.rmtree(work, ignore_errors=True)
@@ -516,6 +529,22 @@ class TestUwmMergeShell(RenderSyncBase):
         self.assertNotEqual(0, proc.returncode,
                             "空のマージ結果が成功扱いになっている")
         self.assertIsNone(written, "空のマージ結果を書き戻している")
+
+    def test_notfound_creates_the_configmap(self):
+        """ConfigMap が無い場合は manifest から新規作成する経路を通ること。"""
+        proc, written = self._run_with_mock_oc(
+            self.CASES["already_false"], with_pyyaml=True, not_found=True)
+        self.assertEqual(0, proc.returncode, f"NotFound で失敗している\n{proc.stderr}")
+        self.assertIsNone(written, "新規作成の経路なのに set data が走っている")
+        self.assertTrue(self._applied, "oc apply による新規作成が行われていない")
+
+    def test_create_failure_is_not_masked(self):
+        """新規作成が失敗したら成功扱いにしないこと。"""
+        proc, _ = self._run_with_mock_oc(
+            self.CASES["already_false"], with_pyyaml=True,
+            not_found=True, fail_apply=True)
+        self.assertNotEqual(0, proc.returncode,
+                            "oc apply の失敗が握りつぶされている")
 
     def test_no_fixed_tmp_paths(self):
         """固定 /tmp パスは前回の残骸を掴む。実機でまさにそれが起きた。"""
@@ -682,7 +711,11 @@ class TestOgxOrphanPvc(RenderSyncBase):
                 'fi\n'
                 'if [ "$1" = "get" ] && [ "$2" = "pods" ]; then cat "$WORK/pods.json"; exit 0; fi\n'
                 'if [ "$1" = "delete" ]; then\n'
-                '  cat >/dev/null\n'
+                '  # body を捨てずに保存する。捨てると preconditions の配線ミス\n'
+                '  # (uid/rv を取り違える等) をテストが素通りしてしまう。\n'
+                '  cat > "$WORK/delete-body"\n'
+                '  for a in "$@"; do case "$a" in --raw=*) printf "%s" "${a#--raw=}" '
+                '> "$WORK/delete-uri" ;; esac; done\n'
                 f'  if [ "$DELETE_RC" != "0" ]; then echo {delete_err!r} >&2; exit "$DELETE_RC"; fi\n'
                 '  touch "$WORK/deleted"; exit 0\n'
                 'fi\n'
@@ -691,26 +724,31 @@ class TestOgxOrphanPvc(RenderSyncBase):
             env = dict(os.environ, PATH=f"{mock}:{os.environ['PATH']}")
             proc = subprocess.run(["bash", "-c", self._pvc_snippet()],
                                   capture_output=True, text=True, env=env)
-            return proc, (work / "deleted").exists()
+            body_f, uri_f = work / "delete-body", work / "delete-uri"
+            sent = {
+                "body": body_f.read_text(encoding="utf-8") if body_f.exists() else None,
+                "uri": uri_f.read_text(encoding="utf-8") if uri_f.exists() else None,
+            }
+            return proc, (work / "deleted").exists(), sent
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
     def test_guide_pvc_get_failure_stops(self):
         """取得エラーを『存在しない』と取り違えないこと。"""
-        proc, deleted = self._run_pvc_snippet(
+        proc, deleted, _sent = self._run_pvc_snippet(
             get_rc=1, get_err="Error from server: etcdserver: request timed out")
         self.assertNotEqual(0, proc.returncode, "取得失敗が成功扱いになっている")
         self.assertFalse(deleted)
 
     def test_guide_pvc_notfound_is_a_clean_noop(self):
-        proc, deleted = self._run_pvc_snippet(
+        proc, deleted, _sent = self._run_pvc_snippet(
             get_rc=1, get_err='Error from server (NotFound): pvc "x" not found')
         self.assertEqual(0, proc.returncode, f"NotFound は無害な no-op のはず\n{proc.stderr}")
         self.assertFalse(deleted)
 
     def test_guide_pvc_conflict_is_tolerated_without_deleting(self):
         """409 は『確認後に変化した』。消さずに続行するのが正しい。"""
-        proc, deleted = self._run_pvc_snippet(
+        proc, deleted, _sent = self._run_pvc_snippet(
             delete_rc=1,
             delete_err="Error from server (Conflict): Operation cannot be fulfilled")
         self.assertEqual(0, proc.returncode, f"409 で異常終了している\n{proc.stderr}")
@@ -718,18 +756,40 @@ class TestOgxOrphanPvc(RenderSyncBase):
 
     def test_guide_pvc_unexpected_delete_failure_stops(self):
         """500 などの予期しない失敗は握りつぶさないこと。"""
-        proc, _ = self._run_pvc_snippet(
+        proc, _deleted, _sent = self._run_pvc_snippet(
             delete_rc=1, delete_err="Error from server (InternalError): 500")
         self.assertNotEqual(0, proc.returncode,
                             "予期しない削除失敗が成功扱いになっている")
 
     def test_guide_pvc_happy_path_deletes(self):
-        proc, deleted = self._run_pvc_snippet()
+        proc, deleted, _sent = self._run_pvc_snippet()
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertTrue(deleted, "削除してよい条件なのに削除されていない")
 
+    def test_guide_pvc_delete_sends_exact_uid_and_resource_version(self):
+        """DELETE の body と URI を実際に捕捉して照合する。
+
+        body を捨てる模擬では、uid と resourceVersion を取り違えて配線しても
+        テストが素通りしてしまう (r の指摘)。
+        """
+        pvc = {"metadata": {"uid": "uid-abc-123", "resourceVersion": "987654"},
+               "spec": {"volumeName": ""}, "status": {"phase": "Pending"}}
+        proc, deleted, sent = self._run_pvc_snippet(pvc=pvc)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(deleted)
+
+        self.assertIsNotNone(sent["body"], "DELETE の body が送られていない")
+        body = json.loads(sent["body"])
+        self.assertEqual({"uid": "uid-abc-123", "resourceVersion": "987654"},
+                         body.get("preconditions"),
+                         "preconditions に読み取った値がそのまま入っていない")
+        self.assertEqual(
+            "/api/v1/namespaces/redhat-ods-applications"
+            "/persistentvolumeclaims/ogx-postgres-data",
+            sent["uri"], "DELETE の対象 URI が違う")
+
     def test_guide_pvc_bound_is_not_deleted(self):
-        proc, deleted = self._run_pvc_snippet(
+        proc, deleted, _sent = self._run_pvc_snippet(
             pvc={"metadata": {"uid": "u-1", "resourceVersion": "100"},
                  "spec": {"volumeName": "pv-1"}, "status": {"phase": "Bound"}})
         self.assertEqual(0, proc.returncode, proc.stderr)
