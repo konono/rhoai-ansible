@@ -26,6 +26,7 @@ tests/test_render_parity.py は llminferenceservice / maas-policies の
     python3 -m unittest tests.test_render_sync_regressions
 """
 
+import json
 import os
 import re
 import shutil
@@ -339,21 +340,27 @@ class TestUwmMergeShell(RenderSyncBase):
     しかも終了コード 0 で成功に見えていた (レビュー指摘)。
     """
 
-    #: 壊しやすい既存設定のバリエーション
+    #: 壊しやすい既存設定のバリエーション。
+    #: 下 3 つはレビューで「行追記では壊れる」と実証された形。
     CASES = {
         "no_trailing_newline": 'prometheus:\n  retention: 15d',
         "flow_style": '{prometheus: {retention: 15d}}\n',
+        "doc_start_flow_style": '---\n{prometheusK8s: {retention: 15d}}\n',
+        "doc_end_marker": 'prometheusK8s:\n  retention: 15d\n...\n',
+        "value_on_next_line": 'enableUserWorkload:\n  false\nprometheusK8s:\n  retention: 15d\n',
         "already_true": 'enableUserWorkload: true\nprometheus:\n  retention: 15d\n',
         "already_false": 'enableUserWorkload: false\nprometheus:\n  retention: 15d\n',
     }
 
     def _extract_snippet(self) -> str:
         """手順書から UWM 有効化のブロックだけ取り出す。"""
-        start = self.guide.index("if oc get cm cluster-monitoring-config")
+        start = self.guide.index("CMO_ERR=$(mktemp)")
         end = self.guide.index("oc apply -f manifests/13-observability/02-uwm.yml", start)
         return self.guide[start:end]
 
-    def _run_with_mock_oc(self, existing: str, with_pyyaml: bool):
+    def _run_with_mock_oc(self, existing: str, with_pyyaml: bool,
+                          fail_get: bool = False, fail_set: bool = False,
+                          silent_empty_merge: bool = False):
         """模擬 oc を PATH に置いて生成シェルを実行し、書き戻された内容を返す。
 
         PyYAML の有無で実装が分岐するので、両方を実行できるよう python3 も
@@ -368,17 +375,28 @@ class TestUwmMergeShell(RenderSyncBase):
             mock = work / "bin"
             mock.mkdir()
 
+            # 既存 CM を ConfigMap JSON として返す模擬 oc。
+            # 実装は -o json で 1 回だけ取得する形なので、それに合わせる。
+            (work / "cm.json").write_text(
+                json.dumps({"apiVersion": "v1", "kind": "ConfigMap",
+                            "metadata": {"name": "cluster-monitoring-config"},
+                            "data": {"config.yaml": existing}}), encoding="utf-8")
             oc = mock / "oc"
             oc.write_text(
                 "#!/usr/bin/env bash\n"
-                "# 模擬 oc。jsonpath は解釈せず、保存しておいた既存値をそのまま返す。\n"
                 f'WORK="{work}"\n'
+                f'FAIL_GET={"1" if fail_get else "0"}\n'
+                f'FAIL_SET={"1" if fail_set else "0"}\n'
                 'if [ "$1" = "get" ] && [ "$2" = "cm" ]; then\n'
-                '  for a in "$@"; do case "$a" in -o) HAS_O=1;; jsonpath=*) HAS_JP=1;; esac; done\n'
-                '  if [ -n "${HAS_JP:-}" ]; then cat "$WORK/current"; fi\n'
-                '  exit 0\n'
+                '  if [ "$FAIL_GET" = "1" ]; then\n'
+                '    echo "Error from server: etcdserver: request timed out" >&2; exit 1\n'
+                '  fi\n'
+                '  cat "$WORK/cm.json"; exit 0\n'
                 'fi\n'
                 'if [ "$1" = "set" ] && [ "$2" = "data" ]; then\n'
+                '  if [ "$FAIL_SET" = "1" ]; then\n'
+                '    echo "Error from server: admission webhook denied the request" >&2; exit 1\n'
+                '  fi\n'
                 '  for a in "$@"; do\n'
                 '    case "$a" in --from-file=config.yaml=*)\n'
                 '      src="${a#--from-file=config.yaml=}"\n'
@@ -392,7 +410,15 @@ class TestUwmMergeShell(RenderSyncBase):
             oc.chmod(0o755)
 
             py = mock / "python3"
-            if with_pyyaml:
+            if silent_empty_merge:
+                # import yaml は通すが、マージ本体は何も書かずに成功して返る。
+                # 書き戻し直前の非空チェックが効いているかを見るため。
+                py.write_text(
+                    "#!/usr/bin/env bash\n"
+                    'if [ "$1" = "-c" ]; then exit 0; fi\n'
+                    'cat >/dev/null 2>&1 || true\n'
+                    'exit 0\n', encoding="utf-8")
+            elif with_pyyaml:
                 # PyYAML を持つインタプリタ (このテストを動かしている処理系) へ委譲
                 py.write_text(f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n',
                               encoding="utf-8")
@@ -413,63 +439,90 @@ class TestUwmMergeShell(RenderSyncBase):
             shutil.rmtree(work, ignore_errors=True)
 
     def test_existing_config_is_preserved_and_flag_is_set(self):
-        for with_yaml in (True, False):
-            for name, existing in self.CASES.items():
-                if name == "flow_style" and not with_yaml:
-                    continue  # フォールバックは flow style を扱えない (別テストで検証)
-                with self.subTest(case=name, pyyaml=with_yaml):
-                    proc, written = self._run_with_mock_oc(existing, with_yaml)
-                    self.assertEqual(0, proc.returncode,
-                                     f"{name}: 生成シェルが失敗した\n{proc.stderr[-500:]}")
-                    self.assertIsNotNone(written, f"{name}: 書き戻しが発生していない")
+        """PyYAML がある正常系。どの既存形でも他キーを保って true になること。"""
+        for name, existing in self.CASES.items():
+            with self.subTest(case=name):
+                proc, written = self._run_with_mock_oc(existing, with_pyyaml=True)
+                self.assertEqual(0, proc.returncode,
+                                 f"{name}: 生成シェルが失敗した\n{proc.stderr[-500:]}")
+                self.assertIsNotNone(written, f"{name}: 書き戻しが発生していない")
 
-                    parsed = yaml.safe_load(written)
-                    self.assertIsInstance(
-                        parsed, dict,
-                        f"{name}: 書き戻した内容が YAML として読めない\n---\n{written}\n---")
-                    self.assertIs(parsed.get("enableUserWorkload"), True,
-                                  f"{name}: enableUserWorkload が true になっていない")
+                parsed = yaml.safe_load(written)
+                self.assertIsInstance(
+                    parsed, dict,
+                    f"{name}: 書き戻した内容が YAML として読めない\n---\n{written}\n---")
+                self.assertIs(parsed.get("enableUserWorkload"), True,
+                              f"{name}: enableUserWorkload が true になっていない")
 
-                    original = yaml.safe_load(existing) or {}
-                    for key, value in original.items():
-                        if key == "enableUserWorkload":
-                            continue
-                        self.assertEqual(
-                            value, parsed.get(key),
-                            f"{name}: 既存の '{key}' が失われた / 変化した")
+                original = yaml.safe_load(existing) or {}
+                for key, value in original.items():
+                    if key == "enableUserWorkload":
+                        continue
+                    self.assertEqual(
+                        value, parsed.get(key),
+                        f"{name}: 既存の '{key}' が失われた / 変化した")
 
     def test_no_trailing_newline_does_not_concatenate(self):
         """旧実装はここで 'retention: 15denableUserWorkload: true' を作っていた。"""
-        for with_yaml in (True, False):
-            with self.subTest(pyyaml=with_yaml):
-                _, written = self._run_with_mock_oc(
-                    self.CASES["no_trailing_newline"], with_yaml)
-                self.assertIsNotNone(written)
-                self.assertNotIn("15denableUserWorkload", written,
-                                 "末尾改行の無い既存値と連結して壊れた YAML になっている")
+        _, written = self._run_with_mock_oc(
+            self.CASES["no_trailing_newline"], with_pyyaml=True)
+        self.assertIsNotNone(written)
+        self.assertNotIn("15denableUserWorkload", written,
+                         "末尾改行の無い既存値と連結して壊れた YAML になっている")
 
-    def test_fallback_refuses_flow_style_instead_of_corrupting(self):
-        """PyYAML が無く flow style のときは、壊すより中止すること。"""
-        proc, written = self._run_with_mock_oc(self.CASES["flow_style"], with_pyyaml=False)
-        self.assertNotEqual(0, proc.returncode,
-                            "flow style を扱えないのに成功扱いになっている")
-        self.assertIsNone(written, "中止すべき場面で書き戻しが発生している")
+    def test_aborts_when_pyyaml_is_missing(self):
+        """PyYAML が無ければ、劣化した方法に落ちず中止すること。
 
-    def test_merge_failure_never_writes_back(self):
-        """マージ段階で失敗したら oc set data に進まないこと。
-
-        実機で、PyYAML が無く python が落ちたのに処理が続行し、
-        前回の残骸 /tmp/cmo-new.yaml を書き戻そうとした (admission webhook が
-        拒否して事なきを得た)。固定パスをやめ、失敗時は必ず止める。
+        テキスト処理のフォールバックは '---' 始まりの flow style、文書末尾の
+        '...'、値が次行にある形などを静かに壊す (レビューで実証された)。
+        安全に扱えないなら書き戻さないのが正しい。
         """
+        for name in self.CASES:
+            with self.subTest(case=name):
+                proc, written = self._run_with_mock_oc(
+                    self.CASES[name], with_pyyaml=False)
+                self.assertNotEqual(0, proc.returncode,
+                                    f"{name}: PyYAML 無しなのに成功扱いになっている")
+                self.assertIsNone(written,
+                                  f"{name}: 中止すべき場面で書き戻しが発生している")
+                self.assertIn("PyYAML", proc.stderr,
+                              f"{name}: 中止理由が利用者に伝わらない")
+
+    def test_get_failure_never_writes_back(self):
+        """取得に失敗したのを『空の設定』と取り違えて既存を消さないこと。
+
+        以前の実装は、存在確認だけ成功して本体の取得が失敗すると、空入力を
+        正常な空設定として扱い enableUserWorkload: true だけを書き戻して
+        終了コード 0 になっていた (レビュー指摘)。
+        """
+        proc, written = self._run_with_mock_oc(
+            self.CASES["already_false"], with_pyyaml=True, fail_get=True)
+        self.assertNotEqual(0, proc.returncode,
+                            "取得に失敗したのに成功扱いになっている")
+        self.assertIsNone(written,
+                          "取得に失敗したのに書き戻しが発生している (既存設定の消失)")
+
+    def test_set_data_failure_is_not_masked(self):
+        """更新の失敗が、後続の後始末で 0 に化けないこと。"""
+        proc, _ = self._run_with_mock_oc(
+            self.CASES["already_false"], with_pyyaml=True, fail_set=True)
+        self.assertNotEqual(0, proc.returncode,
+                            "oc set data の失敗が握りつぶされている")
+
+    def test_silent_empty_merge_never_writes_back(self):
+        """マージが静かに空を返しても、空の設定で上書きしないこと。"""
+        proc, written = self._run_with_mock_oc(
+            self.CASES["already_false"], with_pyyaml=True, silent_empty_merge=True)
+        self.assertNotEqual(0, proc.returncode,
+                            "空のマージ結果が成功扱いになっている")
+        self.assertIsNone(written, "空のマージ結果を書き戻している")
+
+    def test_no_fixed_tmp_paths(self):
+        """固定 /tmp パスは前回の残骸を掴む。実機でまさにそれが起きた。"""
         snippet = self._extract_snippet()
-        self.assertNotIn("/tmp/cmo-new.yaml", snippet,
-                         "固定の /tmp パスを使っている。前回の残骸を掴む危険がある")
-        self.assertNotIn("/tmp/cmo-current.yaml", snippet,
-                         "固定の /tmp パスを使っている。前回の残骸を掴む危険がある")
+        for bad in ("/tmp/cmo-new.yaml", "/tmp/cmo-current.yaml"):
+            self.assertNotIn(bad, snippet, f"固定パス {bad} を使っている")
         self.assertIn("mktemp", snippet, "一時ファイルが mktemp になっていない")
-        self.assertIn('-s "$CMO_NEW"', snippet,
-                      "書き戻し前にマージ結果の非空チェックが無い")
 
 
 class TestOgxOrphanPvc(RenderSyncBase):
@@ -514,18 +567,64 @@ class TestOgxOrphanPvc(RenderSyncBase):
                          "role に ogx-postgres-data を削除するタスクがちょうど 1 つ必要")
         return tasks[0]
 
-    def test_role_delete_is_guarded_by_when_conditions(self):
-        """when: が「Pending」かつ「volumeName 空」かつ「参照 Pod 無し」であること。"""
-        task = self._delete_task()
-        conds = task.get("when")
-        self.assertIsInstance(conds, list, "削除タスクに when: のリストが無い")
-        joined = " ".join(str(c) for c in conds)
-        self.assertIn("Pending", joined, "when: に Pending 判定が無い")
-        self.assertIn("volumeName", joined,
-                      "when: に volumeName 空の判定が無い "
-                      "(Pending だけでは『データが無い』証明にならない)")
-        self.assertIn("claimName", joined,
-                      "when: に参照 Pod の検査が無い")
+    @staticmethod
+    def _eval_when(conds, pvc, pods):
+        """when: の式を実際の Templar で評価する。
+
+        文字列の有無だけ見ると、条件を反転させても通ってしまう
+        (`volumeName == ''` を `!= ''` にしても素通りした、とレビューで指摘)。
+        実際に評価して真偽を確かめる。
+        """
+        from ansible.module_utils.parsing.convert_bool import boolean
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar
+        try:  # ansible-core 2.19+ はテンプレートに trust が要る
+            from ansible.template import trust_as_template
+        except ImportError:  # 古い ansible-core
+            def trust_as_template(x):
+                return x
+        tmpl = Templar(loader=DataLoader(), variables={
+            "_ogx_pvc": {"resources": ([pvc] if pvc else [])},
+            "_ogx_pods": {"resources": pods},
+        })
+        for c in conds:
+            # Templar は False を文字列 "False" で返すことがある。
+            # bool("False") は True なので、必ず boolean() を通す。
+            rendered = tmpl.template(trust_as_template("{{ %s }}" % c))
+            # 置換されずに素通りしたら、式が評価されていない証拠なので弾く
+            assert "{{" not in str(rendered), f"not templated: {rendered!r}"
+            if not boolean(rendered, strict=False):
+                return False
+        return True
+
+    @staticmethod
+    def _pvc(phase="Pending", volume_name=""):
+        return {"metadata": {"uid": "u-1", "resourceVersion": "100"},
+                "spec": {"volumeName": volume_name}, "status": {"phase": phase}}
+
+    @staticmethod
+    def _pod_using(claim):
+        return {"spec": {"volumes": [{"persistentVolumeClaim": {"claimName": claim}}]}}
+
+    def test_role_when_conditions_evaluate_correctly(self):
+        """削除してよい場合だけ真になることを、実際に評価して確かめる。"""
+        conds = self._delete_task()["when"]
+        cases = [
+            ("削除してよい: Pending / 未割当 / 参照なし", self._pvc(), [], True),
+            ("PVC が存在しない", None, [], False),
+            ("Bound", self._pvc(phase="Bound"), [], False),
+            ("Pending だが PV 割当済み", self._pvc(volume_name="pv-1"), [], False),
+            ("参照している Pod がある", self._pvc(),
+             [self._pod_using("ogx-postgres-data")], False),
+            ("別 PVC を参照する Pod は無関係", self._pvc(),
+             [self._pod_using("other-pvc")], True),
+            ("volumes が無い Pod", self._pvc(), [{"spec": {}}], True),
+            ("volumes が null の Pod", self._pvc(), [{"spec": {"volumes": None}}], True),
+        ]
+        for label, pvc, pods, expected in cases:
+            with self.subTest(case=label):
+                self.assertEqual(expected, self._eval_when(conds, pvc, pods),
+                                 f"{label}: when: の評価結果が期待と違う")
 
     def test_role_delete_sends_uid_and_resource_version_preconditions(self):
         """確認から削除までの間に Bound へ変わったら API 側で弾かせること。"""
@@ -543,18 +642,98 @@ class TestOgxOrphanPvc(RenderSyncBase):
     def test_guide_delete_uses_preconditions_and_full_guard(self):
         """手順書側も同じ安全性を持つこと。
 
-        oc delete は precondition を送れないため API を直接叩く形になっている。
+        oc delete は precondition を送れないが `oc delete --raw=URI -f -` なら
+        body を送れる (実機で 409 時 exit 1 を確認)。
         """
         self.assertIn("preconditions", self.guide,
                       "手順書の削除が precondition 無しで実行されている")
-        for token in ('\\"uid\\"', '\\"resourceVersion\\"'):
-            self.assertIn(token, self.guide, f"手順書の precondition に {token} が無い")
+        self.assertIn("oc delete --raw=", self.guide,
+                      "body を送れない削除方法になっている")
         self.assertIn("volumeName", self.guide,
                       "手順書のガードに volumeName 空の判定が無い")
         self.assertIn("INUSE", self.guide,
                       "手順書のガードに参照 Pod の検査が無い")
         self.assertNotIn("oc delete pvc ogx-postgres-data", self.guide,
                          "precondition を送れない素の oc delete が残っている")
+
+    def _pvc_snippet(self) -> str:
+        start = self.guide.index("PVC_ERR=$(mktemp)")
+        end = self.guide.index("rm -f \"$PVC_ERR\"; trap - EXIT", start) + 40
+        return self.guide[start:end]
+
+    def _run_pvc_snippet(self, *, get_rc=0, get_err="", pvc=None,
+                         delete_rc=0, delete_err=""):
+        """模擬 oc で PVC 掃除部分を実行する。"""
+        work = Path(tempfile.mkdtemp(prefix="pvcdel-"))
+        try:
+            pvc = pvc or {"metadata": {"uid": "u-1", "resourceVersion": "100"},
+                          "spec": {"volumeName": ""}, "status": {"phase": "Pending"}}
+            (work / "pvc.json").write_text(json.dumps(pvc), encoding="utf-8")
+            (work / "pods.json").write_text(json.dumps({"items": []}), encoding="utf-8")
+            mock = work / "bin"; mock.mkdir()
+            oc = mock / "oc"
+            oc.write_text(
+                "#!/usr/bin/env bash\n"
+                f'WORK="{work}"\n'
+                f'GET_RC={get_rc}; DELETE_RC={delete_rc}\n'
+                'if [ "$1" = "get" ] && [ "$2" = "pvc" ]; then\n'
+                f'  if [ "$GET_RC" != "0" ]; then echo {get_err!r} >&2; exit "$GET_RC"; fi\n'
+                '  cat "$WORK/pvc.json"; exit 0\n'
+                'fi\n'
+                'if [ "$1" = "get" ] && [ "$2" = "pods" ]; then cat "$WORK/pods.json"; exit 0; fi\n'
+                'if [ "$1" = "delete" ]; then\n'
+                '  cat >/dev/null\n'
+                f'  if [ "$DELETE_RC" != "0" ]; then echo {delete_err!r} >&2; exit "$DELETE_RC"; fi\n'
+                '  touch "$WORK/deleted"; exit 0\n'
+                'fi\n'
+                'exit 0\n', encoding="utf-8")
+            oc.chmod(0o755)
+            env = dict(os.environ, PATH=f"{mock}:{os.environ['PATH']}")
+            proc = subprocess.run(["bash", "-c", self._pvc_snippet()],
+                                  capture_output=True, text=True, env=env)
+            return proc, (work / "deleted").exists()
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+    def test_guide_pvc_get_failure_stops(self):
+        """取得エラーを『存在しない』と取り違えないこと。"""
+        proc, deleted = self._run_pvc_snippet(
+            get_rc=1, get_err="Error from server: etcdserver: request timed out")
+        self.assertNotEqual(0, proc.returncode, "取得失敗が成功扱いになっている")
+        self.assertFalse(deleted)
+
+    def test_guide_pvc_notfound_is_a_clean_noop(self):
+        proc, deleted = self._run_pvc_snippet(
+            get_rc=1, get_err='Error from server (NotFound): pvc "x" not found')
+        self.assertEqual(0, proc.returncode, f"NotFound は無害な no-op のはず\n{proc.stderr}")
+        self.assertFalse(deleted)
+
+    def test_guide_pvc_conflict_is_tolerated_without_deleting(self):
+        """409 は『確認後に変化した』。消さずに続行するのが正しい。"""
+        proc, deleted = self._run_pvc_snippet(
+            delete_rc=1,
+            delete_err="Error from server (Conflict): Operation cannot be fulfilled")
+        self.assertEqual(0, proc.returncode, f"409 で異常終了している\n{proc.stderr}")
+        self.assertFalse(deleted, "409 なのに削除されている")
+
+    def test_guide_pvc_unexpected_delete_failure_stops(self):
+        """500 などの予期しない失敗は握りつぶさないこと。"""
+        proc, _ = self._run_pvc_snippet(
+            delete_rc=1, delete_err="Error from server (InternalError): 500")
+        self.assertNotEqual(0, proc.returncode,
+                            "予期しない削除失敗が成功扱いになっている")
+
+    def test_guide_pvc_happy_path_deletes(self):
+        proc, deleted = self._run_pvc_snippet()
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertTrue(deleted, "削除してよい条件なのに削除されていない")
+
+    def test_guide_pvc_bound_is_not_deleted(self):
+        proc, deleted = self._run_pvc_snippet(
+            pvc={"metadata": {"uid": "u-1", "resourceVersion": "100"},
+                 "spec": {"volumeName": "pv-1"}, "status": {"phase": "Bound"}})
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertFalse(deleted, "Bound な PVC を削除している")
 
 
 if __name__ == "__main__":
