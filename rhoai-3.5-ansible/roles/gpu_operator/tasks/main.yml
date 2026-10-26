@@ -40,8 +40,22 @@
               enabled: true
             dcgmExporter:
               enabled: true
+              # ServiceMonitor がないと DCGM_FI_DEV_* を誰もスクレイプせず、
+              # GPU 系ダッシュボードが全パネル 0 のままになる。
+              # observability role の 05-gpu-utilization.yaml にも同じ設定があるが、
+              # そちらは「ClusterPolicy が未作成のとき」しか適用されない。
+              # site.yml では gpu_operator が先に走って必ず CR を作るため、
+              # あちらは永久に skip される。ここが唯一効く場所。
+              # https://docs.nvidia.com/datacenter/cloud-native/openshift/latest/install-gpu-ocp.html#cluster-monitoring
+              serviceMonitor:
+                enabled: true
+                interval: 15s
+                honorLabels: true
             gfd:
               enabled: true
+            # Set explicitly when MIG-capable workers are added. Keep existing
+            # operator defaults when an inventory does not configure MIG.
+            mig: "{{ {'strategy': gpu_mig_strategy} if gpu_mig_strategy is defined else omit }}"
             migManager:
               enabled: true
             nodeStatusExporter:

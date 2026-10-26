@@ -1,0 +1,12 @@
+# RTX PRO 6000 Blackwell Server Edition (96 GB): 4 x 1g.24gb.
+# Other GPU models require their own supported profile and expected resource count.
+gpu_mig_strategy: single
+mig_node_selector: rhoai-validation=mig
+mig_profile: all-1g.24gb
+mig_expected_resources:
+  nvidia.com/gpu: 4
+mig_persist_machineset: true
+mig_apply: false
+# disable_mig.yml: physical GPU count per node, NOT the MIG partition count.
+mig_full_gpu_resources:
+  nvidia.com/gpu: 1

@@ -14,6 +14,36 @@
         operator_namespace: openshift-opentelemetry-operator
         operator_channel: "{{ operator_channels.opentelemetry_product }}"
 
+    # user-workload-monitoring-config だけ置いても UWM は起動しない。
+    # cluster-monitoring-config の enableUserWorkload を立てて初めて Prometheus が建つ。
+    # これが無いと llm-serving (ユーザー namespace) の PodMonitor
+    # (kserve-llm-isvc-vllm-engine) が誰にもスクレイプされず、vllm:* メトリクスが
+    # 丸ごと欠落する。openshift-* 配下は UWM の対象外なので platform 側が見るが、
+    # llm-serving のようなユーザー namespace は UWM が無いと取得経路が存在しない。
+    - name: Read existing cluster-monitoring-config
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: ConfigMap
+        name: cluster-monitoring-config
+        namespace: openshift-monitoring
+      register: _cmo_config
+
+    - name: Enable user workload monitoring
+      vars:
+        # 既存 config.yaml を壊さないよう、読み出した内容に enableUserWorkload だけ重ねる
+        _cmo_current: >-
+          {{ (_cmo_config.resources[0].data['config.yaml'] | default('{}', true) | from_yaml) or {} }}
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: cluster-monitoring-config
+            namespace: openshift-monitoring
+          data:
+            config.yaml: "{{ _cmo_current | combine({'enableUserWorkload': true}) | to_nice_yaml }}"
+
     - name: Ensure openshift-user-workload-monitoring namespace exists
       kubernetes.core.k8s:
         state: present
@@ -43,6 +73,21 @@
                       requests:
                         storage: 40Gi
 
+    # Perses は Thanos Querier = platform Prometheus を見ている。
+    # platform Prometheus が namespace 内の PodMonitor を拾うには
+    # このラベルが要る。これが無いと limitador の authorized_calls /
+    # limited_calls が収集されず、Rate Limit 系パネルが恒久的に空になる。
+    # UWM は openshift-* を対象外にする仕様なので UWM では代替できない。
+    - name: Label openshift-rhcl for platform monitoring
+      kubernetes.core.k8s:
+        state: patched
+        kind: Namespace
+        name: openshift-rhcl
+        definition:
+          metadata:
+            labels:
+              openshift.io/cluster-monitoring: "true"
+
     - name: Check existing ClusterPolicy
       kubernetes.core.k8s_info:
         api_version: nvidia.com/v1
@@ -58,6 +103,18 @@
       when:
         - item | basename != 'kustomization.yaml'
         - item | basename != '05-gpu-utilization.yaml' or _clusterpolicy_existing.resources | length == 0
+
+    # 06-custom-dashboard.yaml から PodMonitor を消しただけでは、
+    # 既存クラスタに残った実体は消えない (k8s state=present は作成/更新のみ)。
+    # odh-model-controller の maas-default-gateway-metrics と二重スクレイプになり
+    # istio 系パネルが 2 倍になるため、明示的に削除して収束させる。
+    - name: Remove obsolete duplicate gateway PodMonitor
+      kubernetes.core.k8s:
+        state: absent
+        api_version: monitoring.coreos.com/v1
+        kind: PodMonitor
+        name: maas-gateway-istio-metrics
+        namespace: openshift-ingress
 
   rescue:
     - ansible.builtin.fail:

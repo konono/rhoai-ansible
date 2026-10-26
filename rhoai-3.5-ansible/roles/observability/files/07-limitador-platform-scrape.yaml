@@ -1,0 +1,43 @@
+# Perses の MaaS Gateway Performance ダッシュボードにある
+# 「Rate Limited」「Rate Limit Decisions」を実データで埋めるための PodMonitor。
+#
+# なぜ必要か:
+#   これらのパネルは authorized_calls / limited_calls を参照するが、
+#   Perses は Thanos Querier 越しに **platform Prometheus** を見ている。
+#   limitador が居る openshift-rhcl は
+#     - openshift.io/cluster-monitoring ラベルが無いと platform が見ない
+#     - UWM は openshift-* namespace を対象外にする仕様なので UWM でも取れない
+#   という二重の理由で収集経路が無く、パネルは恒久的に空だった。
+#
+#   既存の 02-podmonitor.yaml / 04-scrapeconfig.yaml は
+#   redhat-ods-monitoring の RHOAI MonitoringStack 向けで、
+#   そちらは RHOAI の Usage ダッシュボードが使う別系統。Perses 側には届かない。
+#
+# 対で必要なもの:
+#   - openshift-rhcl namespace の openshift.io/cluster-monitoring=true ラベル
+#     (roles/observability/tasks/main.yml で付与)
+#   - openshift-monitoring からの 8080 への NetworkPolicy 許可
+#     (01-networkpolicy-workaround.yaml)
+#
+# 注: limited_calls は「実際に 1 度でもレート制限が発動する」まで
+#     limitador 側に出現しない (カウンタが遅延生成される)。
+#     未発動のうちは 0 系列のままだが、ダッシュボード側のクエリが
+#     `or vector(0)` で受けているので 0 と表示される（正しい挙動）。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: maas-limitador-platform
+  namespace: openshift-rhcl
+  labels:
+    app: limitador
+  annotations:
+    argocd.argoproj.io/sync-wave: "5"
+spec:
+  jobLabel: app
+  selector:
+    matchLabels:
+      app: limitador
+  podMetricsEndpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

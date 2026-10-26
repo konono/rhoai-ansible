@@ -29,3 +29,15 @@ spec:
       ports:
         - protocol: TCP
           port: 8081
+    # platform Prometheus (openshift-monitoring) からのスクレイプを許可する。
+    # Perses ダッシュボードは Thanos Querier を見ており、そこに入るのは
+    # platform Prometheus が集めたものだけ。UWM は openshift-* namespace を
+    # 対象外にする仕様なので、openshift-rhcl の limitador は platform 側から
+    # 取るしかない (07-limitador-platform-scrape.yaml の PodMonitor と対)。
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshift-monitoring
+      ports:
+        - protocol: TCP
+          port: 8080

@@ -1,0 +1,26 @@
+---
+- name: Require an explicit MIG resource for this model
+  ansible.builtin.assert:
+    that: _mixed_cfg.gpu_resource | default('') is match('^nvidia[.]com/mig-')
+- name: Read model Pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ _mixed_cfg.namespace }}"
+    label_selectors: ["app.kubernetes.io/name={{ _mixed_model.key }}"]
+    field_selectors: [status.phase=Running]
+  register: _mixed_pods
+- name: Require the requested number of ready replicas
+  ansible.builtin.assert:
+    that:
+      - _mixed_pods.resources | length == _mixed_cfg.replicas | default(1) | int
+      - >-
+        (_mixed_pods.resources | map(attribute='status.conditions') | flatten
+         | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length)
+        == (_mixed_cfg.replicas | default(1) | int)
+- name: Verify GPU allocation and monitoring for each replica
+  ansible.builtin.include_tasks: verify_mig_pod.yml
+  loop: "{{ _mixed_pods.resources }}"
+  loop_control:
+    loop_var: _mixed_pod
+    label: "{{ _mixed_pod.metadata.name }}"

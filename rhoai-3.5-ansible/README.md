@@ -410,7 +410,9 @@ models:
 | `custom_chat_template` | Chat template to inject, loaded from `inventory/<env>/chat_templates/<name>.jinja`. Empty keeps the model's bundled template and omits `--chat-template` | `""` |
 | `chat_template_configmap` | Override the generated ConfigMap name | `<model>-chat-template` |
 | `replicas` | LLMInferenceService replicas | `1` |
-| `gpu_count` | Number of GPUs requested | `1` |
+| `gpu_count` | GPU devices / MIG slices requested per Pod | `1` |
+| `gpu_resource` | Kubernetes GPU resource name | `nvidia.com/gpu` |
+| `node_selector` | Inference Pod node labels (mapping) | `{}` |
 | `resources` | CPU/memory requests and limits (merged recursively) | `500m`/`4Gi` → `2`/`8Gi` |
 | `shm_size` | `/dev/shm` emptyDir size; empty = not mounted | `""` |
 | `startup_probe_failure_threshold` / `startup_probe_period_seconds` | Startup wait budget | `120` / `10` |
@@ -430,7 +432,7 @@ models:
 
 > **Processing order**: When running site.yml, `absent` models are processed first (to release GPUs). Then `present` models are deployed.
 >
-> **GPU capacity check**: If the total `gpu_count` of `present` models exceeds the cluster's GPU count, deployment stops with an error before proceeding.
+> **GPU capacity check**: `present` models are checked per resource name (`gpu_count × replicas`), and each model must fit its selected nodes. Before creating a model, bound active Pods (including Pending and init containers) are counted. Insufficient capacity stops deployment without scaling down other models. This is a GPU check, not a complete scheduler: CPU, memory, taints, storage topology and simultaneous scheduling remain Kubernetes constraints.
 
 #### Keycloak Settings
 
@@ -1013,3 +1015,511 @@ The roles use these removal steps:
 | [docs/daily-operations.md](docs/daily-operations.md) | Day-to-day operations — handling user requests: add/disable users, password reset, quota changes, model add/swap/remove, API key issuance, Keycloak admin recovery, where secrets live |
 | [docs/offline-environment.md](docs/offline-environment.md) | Offline execution environment — asset layout, building from scratch, migrating from a running deployment, venv path rewriting, distributing updates with pack/unpack |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Troubleshooting — past incident examples, pre-deployment checklist, monitoring methods, failure recovery flows, resource health check commands, disconnected environment considerations |
+
+## 追加 GPU worker の MIG 設定
+
+`playbooks/configure_mig.yml` は GPU Operator 導入済みのノードを対象に、
+MIG Manager の設定を確認し、MIG profile と allocatable resource 数が収束するまで待ちます。
+L4 は MIG 非対応です。今回の RTX PRO 6000 Blackwell Server Edition 96 GB では
+`all-1g.24gb` / `single` により `nvidia.com/gpu: 4` を確認しました。
+
+```bash
+export KUBECONFIG=/path/to/cluster/kubeconfig
+# まず読み取りのみで対象・対応 profile・workload を確認
+uv run ansible-playbook playbooks/configure_mig.yml -i inventory/aws-sno-ipi \
+  -e @playbooks/examples/mig-rtx-pro-6000.yml
+# 設定を適用し、既定 20 分まで収束を待つ
+uv run ansible-playbook playbooks/configure_mig.yml -i inventory/aws-sno-ipi \
+  -e @playbooks/examples/mig-rtx-pro-6000.yml -e mig_apply=true
+```
+
+対象 selector、profile、期待 resource 数は明示します。サンプルの selector は今回の
+worker に付けた `rhoai-validation=mig` です。他の GPU には、その GPU が対応する
+profile を指定してください。GPU Operator のノード別 / カスタム / 既定 ConfigMap を
+読み、profile の存在を検査します。`single` では同形状の MIG 領域を通常の
+`nvidia.com/gpu` として要求でき、`mixed` では対応する `nvidia.com/mig-*` resource を使います。
+
+分割変更が必要な対象に GPU Pod があれば中止します。ClusterPolicy の strategy を
+変える場合はクラスタ全体で GPU workload を停止してから実行してください。
+自動 eviction、drain、再起動は行いません。変更対象を cordon して再検査し、成功後だけ
+元の schedulable 状態に戻します。失敗時は cordon を維持するため、MIG Manager logs、
+`nvidia.com/mig.config.state`、GPU resource 数を確認してから復旧してください。
+ハードウェアが reboot を要求する場合もこの playbook は再起動を実行しません。
+既に収束していれば推論稼働中でも再実行でき、cordon や GPU 再設定は行いません。
+
+Machine API の worker は成功後に所有 MachineSet の node label にも profile を保存し、
+replacement worker に引き継ぎます。Machine API を使わないノードでは
+`mig_persist_machineset=false` を指定します。`gpu_mig_strategy` は inventory にも保存し、
+後続の `site.yml` / manifest レンダリングと同じ値にしてください。
+MIG 設定はハードウェアと稼働 Pod の照合を必要とする独立した運用 playbook で、
+通常の `site.yml` 実行から自動的に GPU を再分割することはありません。
+
+参考: [NVIDIA MIG 対応 GPU](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/supported-gpus.html)、
+[GPU Operator の MIG 設定](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html)。
+
+### 設定は role ではなく inventory に置く
+
+`mig_node_selector`・`mig_profile`・`mig_expected_resources` は、環境の GPU と
+運用方針に依存するため **inventory の変数**として管理します。
+role の `vars/main.yml` に固定すると環境ごとの変更が難しくなります。
+role に置くなら共通処理や汎用的な既定値であり、対象ノードや分割形状の選択は inventory が担当します。
+現状の共通処理は `playbooks/tasks/mig_*.yml` にあります。
+
+一つの構成を管理する場合の配置例:
+
+```text
+inventory/myenv/
+├── hosts.yml                         # 実行ホストは localhost
+└── group_vars/all/
+    ├── cluster.yml                   # クラスタ共通の gpu_mig_strategy
+    ├── components.yml
+    ├── vault.yml
+    └── mig.yml                       # 対象 selector、profile、期待リソース数
+```
+
+`cluster.yml`:
+
+```yaml
+gpu_mig_strategy: single
+```
+
+`mig.yml`（RTX PRO 6000 Blackwell Server Edition 96 GB × 1 枚の例）:
+
+```yaml
+mig_node_selector: mig-group=rtx6000-24gb
+mig_profile: all-1g.24gb
+mig_expected_resources:
+  nvidia.com/gpu: 4
+mig_full_gpu_resources:
+  nvidia.com/gpu: 1
+mig_apply: false
+```
+
+`gpu_mig_strategy` は `cluster.yml` に置いてください。通常の `site.yml` に加え、
+manifest renderer もこのファイルを読みます。独立した MIG 操作用の `mig.yml` は
+Ansible が読み込みますが、renderer は読みません。renderer はノードの分割を自動適用しません。
+環境別 inventory は Git 管理外の場合があるため、別途バックアップや構成管理の対象にしてください。
+
+### ノード名・hostname label・GPU label を確認する
+
+以下のコマンドは `rhoai-3.5-ansible/` で実行します。
+
+```bash
+export KUBECONFIG=/path/to/cluster/kubeconfig
+oc get nodes -o wide
+oc get nodes -L kubernetes.io/hostname,nvidia.com/gpu.product,nvidia.com/mig.capable,mig-group
+# あるノードの全 label
+oc get node <node-name> --show-labels
+# 現在の分割・状態・割り当て可能リソース
+oc get node <node-name> -o json | jq '{
+  name: .metadata.name,
+  hostname: .metadata.labels["kubernetes.io/hostname"],
+  gpu: .metadata.labels["nvidia.com/gpu.product"],
+  profile: .metadata.labels["nvidia.com/mig.config"],
+  state: .metadata.labels["nvidia.com/mig.config.state"],
+  allocatable: .status.allocatable
+}'
+```
+
+Node の `metadata.name` と `kubernetes.io/hostname` は同じとは限らないため、
+selector には確認した **label の値**を使います。自動生成される `nvidia.com/*` label は
+GPU Operator が管理します。運用グループには別の label（ここでは `mig-group`）を使います。
+
+### 特定の 1 ノードに適用する
+
+inventory の profile・期待数を使い、対象 selector だけ上書きできます。
+
+```bash
+# <hostname-label-value> は上の確認コマンドで取得した値
+oc get nodes -l 'kubernetes.io/hostname=<hostname-label-value>'
+./playbooks/list_mig_profiles.sh --node <node-name>
+
+# 読み取りのみの事前検査
+uv run ansible-playbook playbooks/configure_mig.yml -i inventory/myenv \
+  -e 'mig_node_selector=kubernetes.io/hostname=<hostname-label-value>'
+# 確認後に適用
+uv run ansible-playbook playbooks/configure_mig.yml -i inventory/myenv \
+  -e 'mig_node_selector=kubernetes.io/hostname=<hostname-label-value>' -e mig_apply=true
+```
+
+複数ノードを持つ MachineSet の一部だけを選び、`mig_persist_machineset=true` のまま
+実行すると停止します。MachineSet の template label は全 replacement worker に影響するためです。
+一時的に 1 ノードだけ変えるなら `-e mig_persist_machineset=false` を明示します。
+恒久的に異なる構成を使う worker は、MachineSet 自体も分けて管理してください。
+
+### inventory と group_vars で構成別に管理する
+
+**Ansible の group と Kubernetes のノードグループは別物です。**
+この playbook は `hosts: localhost` で実行し、`mig_node_selector` で Kubernetes ノードを選びます。
+GPU ノード名を Ansible inventory に追加しただけでは対象になりません。
+`--limit <GPU-node-name>` でも Kubernetes ノードは選択できません。
+
+複数の構成を管理する場合は、クラスタ共通 inventory に **構成別の補助 inventory を一つ重ねる**
+方式にできます。Ansible group は localhost に適用する設定を選び、実ノードは label で対応づけます。
+
+```bash
+# Kubernetes 側のグループ。<node-a>, <node-b> は実際のノード名に置換
+oc label node <node-a> mig-group=rtx6000-24gb --overwrite
+oc label node <node-b> mig-group=rtx6000-48gb --overwrite
+# 適用前に所属ノードを確認
+oc get nodes -l mig-group=rtx6000-24gb
+oc get nodes -l mig-group=rtx6000-48gb
+```
+
+```text
+inventory/
+├── myenv/                            # クラスタ共通。既存の inventory
+│   ├── hosts.yml
+│   └── group_vars/all/cluster.yml     # gpu_mig_strategy: single
+├── mig-rtx24/                        # 24 GB × 4 用の補助 inventory
+│   ├── hosts.yml
+│   └── group_vars/mig_rtx24.yml
+└── mig-rtx48/                        # 48 GB × 2 用の補助 inventory
+    ├── hosts.yml
+    └── group_vars/mig_rtx48.yml
+```
+
+`inventory/mig-rtx24/hosts.yml`:
+
+```yaml
+all:
+  children:
+    mig_rtx24:
+      hosts:
+        localhost:
+          ansible_connection: local
+          ansible_python_interpreter: "{{ ansible_playbook_python }}"
+```
+
+`inventory/mig-rtx24/group_vars/mig_rtx24.yml`:
+
+```yaml
+mig_node_selector: mig-group=rtx6000-24gb
+mig_profile: all-1g.24gb
+mig_expected_resources:
+  nvidia.com/gpu: 4
+mig_full_gpu_resources:
+  nvidia.com/gpu: 1
+mig_persist_machineset: true
+mig_apply: false
+```
+
+48 GB 用は `hosts.yml` の group 名を `mig_rtx48` にし、
+`inventory/mig-rtx48/group_vars/mig_rtx48.yml` を次のようにします。
+
+```yaml
+mig_node_selector: mig-group=rtx6000-48gb
+mig_profile: all-2g.48gb
+mig_expected_resources:
+  nvidia.com/gpu: 2
+mig_full_gpu_resources:
+  nvidia.com/gpu: 1
+mig_persist_machineset: true
+mig_apply: false
+```
+
+```bash
+# Ansible 側の所属を確認（秘密変数を表示する --vars は不要）
+uv run ansible-inventory -i inventory/myenv -i inventory/mig-rtx24 --graph
+# 構成別に事前検査
+uv run ansible-playbook playbooks/configure_mig.yml \
+  -i inventory/myenv -i inventory/mig-rtx24
+uv run ansible-playbook playbooks/configure_mig.yml \
+  -i inventory/myenv -i inventory/mig-rtx48
+# 対象・停止条件を確認してから、必要なグループだけ適用
+uv run ansible-playbook playbooks/configure_mig.yml \
+  -i inventory/myenv -i inventory/mig-rtx24 -e mig_apply=true
+# 同じグループを全 GPU に戻す場合
+uv run ansible-playbook playbooks/disable_mig.yml \
+  -i inventory/myenv -i inventory/mig-rtx24 -e mig_apply=true
+```
+
+子 group の設定は `group_vars/all` より優先されます。ただし `host_vars/localhost` や
+`-e` に同じ変数がある場合はさらに優先されるため、重複定義を整理してください。
+**24 GB 用と 48 GB 用の補助 inventory を同じ実行に両方渡さないでください。**
+localhost に両 group の変数がマージされ、片方が上書きされます。
+`--limit` は変数のマージを解除しないため、この回避策にはなりません。
+変数の読み込み規則は [Ansible inventory の公式説明](https://docs.ansible.com/projects/ansible/latest/inventory_guide/intro_inventory.html) を参照してください。
+
+この補助 inventory は MIG 操作専用です。通常の `site.yml` と renderer はクラスタ共通の
+`inventory/myenv` を使います。replacement worker の `mig-group` label は、worker 作成用
+inventory の `worker_node_labels` にも保存してください。MIG playbook が MachineSet に保存するのは
+`nvidia.com/mig.config` であり、任意のグループ label を自動保存するわけではありません。
+
+### `single` と `mixed` の違い・設定方法
+
+正しい値は **`mixed`** です（`mix` ではありません）。strategy は GPU の分割形状そのものではなく、
+分割済み GPU を Kubernetes のどのリソース名で公開するかを決めます。
+
+| 項目 | `single` | `mixed` |
+|---|---|---|
+| MIG を使うノード内の構成 | 同一形状に揃える。複数 GPU がある場合も揃える | 異なる形状や、全 GPU と MIG の混在に対応 |
+| MIG 領域のリソース名 | `nvidia.com/gpu` | `nvidia.com/mig-<形状>` |
+| 24 GB × 4 の例 | `nvidia.com/gpu: 4` | `nvidia.com/mig-1g.24gb: 4` |
+| Pod が 1 領域を要求する例 | `nvidia.com/gpu: 1` | `nvidia.com/mig-1g.24gb: 1` |
+| MIG 無効の GPU | `nvidia.com/gpu` | `nvidia.com/gpu` |
+| この repo の LLM 配信テンプレート | 既定値で利用可能 | モデルの `gpu_resource` で MIG リソース名を指定 |
+
+`single` でも、別ノードで 24 GB と 48 GB の profile を使い分けられます。
+ただし同じ `nvidia.com/gpu: 1` なので、Pod 側にも `nodeSelector` / node affinity を設定して
+必要な容量のノードを選びます。**MIG 設定の `mig_node_selector` は推論 Pod の配置を設定しません。**
+別ノードの L4 のように MIG を使わない GPU とも同じリソース名になる点に注意してください。
+
+`mixed` の設定例（対応 profile と resource 名は実機で確認すること）:
+
+```yaml
+# クラスタ共通 inventory の group_vars/all/cluster.yml
+gpu_mig_strategy: mixed
+```
+
+```yaml
+# 対象 group の変数
+mig_node_selector: mig-group=rtx6000-24gb
+mig_profile: all-1g.24gb
+mig_expected_resources:
+  nvidia.com/mig-1g.24gb: 4
+mig_full_gpu_resources:
+  nvidia.com/gpu: 1
+```
+
+同じ `configure_mig.yml` で適用します。ClusterPolicy の strategy は **クラスタ共通**なので、
+ノードごとに `single` と `mixed` を切り替える運用にはしません。strategy を変更する場合は
+この playbook がクラスタ全体の GPU workload を検査し、残っていれば停止します。
+変更後はすべての MIG group の期待リソース名と Pod の GPU 要求を揃えてください。
+分割 profile の変更だけなら、通常はその対象ノードの workload 停止で済みます。
+
+モデルの設定例（`inventory/<env>/group_vars/all/components.yml`）:
+
+```yaml
+models:
+  qwen3-06b:
+    hf_repo: Qwen/Qwen3-0.6B
+    state: present
+    gpu_resource: nvidia.com/mig-1g.24gb
+    gpu_count: 1
+    replicas: 2
+    node_selector:
+      mig-group: rtx6000-24gb
+```
+
+この設定は Ansible と `render.py` の両方で、LLMInferenceService の
+`spec.template.nodeSelector` とコンテナの requests / limits に反映されます。
+上の例は **各 Pod が 24 GB の区画を 1 個、2 replicas で合計 2 個**要求します。
+別モデルに `nvidia.com/mig-2g.48gb` を指定することもできますが、対応する区画を
+事前に用意してください。`gpu_resource` は区画を作成する設定ではありません。
+省略時は従来どおり `nvidia.com/gpu` です。GPU 要求は `resources` に直接追加せず、
+`gpu_resource` / `gpu_count` で指定してください。
+
+容量確認と更新時の GPU 数判定も、このリソース名と `node_selector` を使います。
+物理 GPU、24 GB 区画、48 GB 区画は別々に数えます。既存モデルの `gpu_resource` や
+`node_selector` を変更した場合は古いキーを残さないため対象 LLMInferenceService を再作成し、
+そのモデルの推論は一時停止します。モデルを新規作成する際に
+容量が使用中なら、対象 Pod を表示して停止します。別モデルを自動縮退しません。
+再作成時は旧 Pod の消滅を待ち、待機期限超過や取得エラーなら再作成へ進まず停止します。
+既存モデルの再作成前には他 workload の予約を含む空き容量確認を行わないため、
+配置先変更前に対象ノードの空きを確認してください。複数モデルが同じ selector に
+集中する場合の合計要求も、事前のモデル別容量確認だけでは検出できません。
+共有 PVC は従来どおり RWO のため、異なるノードへ配置する場合は PVC の制約にも注意してください。
+手動手順書は `jq` で選択ノードの容量を確認しますが、使用中 Pod の確認は手動です。
+異なるサイズを同じ GPU に混在させる例は
+[`playbooks/examples/mig-mixed-rtx-pro-6000.yml`](playbooks/examples/mig-mixed-rtx-pro-6000.yml)
+を参照してください。RTX PRO 6000 の `all-balanced` は 24 GB × 2 と 48 GB × 1 です。
+別 GPU では `list_mig_profiles.sh` で実機の profile を確認してください。
+
+配信後は、Ansible で実推論・Pod の GPU 要求・実際に見える MIG UUID・ノードラベル・
+Prometheus の推論成功カウンターと DCGM メモリ使用量を確認できます。
+この検証用 playbook は MIG 設定やモデルの削除を行いません。
+
+```bash
+# models.yml には検証対象のモデルを定義する（通常 GPU モデルとの混在も可）
+uv run ansible-playbook playbooks/verify_mig_models.yml \
+  -i inventory/<env> -e @models.yml \
+  -e mig_verification_output=/tmp/mixed-result.json
+```
+
+推論確認は選択された全モデルに対して行い、その後の MIG UUID・監視・同時推論の
+検証は設定を合成した結果が `nvidia.com/mig-*` になるモデルに限定します。
+MIG 対象が 0 件なら成功扱いにせず停止します。
+
+既定ではモデルに直接 3 回ずつ推論し、その後各 replica に 3 リクエストずつ同時送信します。
+監視の前提は UWM / DCGM の収集、
+`thanos-querier` Route、および監視データを読める ServiceAccount です。
+ServiceAccount は既定で `openshift-cluster-observability-operator/perses-sa`、
+`mig_metrics_namespace` / `mig_metrics_serviceaccount` で変更できます。
+MaaS 経由の追加検証は、アクセス権を設定したうえで既存の
+`llm_verify_inference.yml -e inference_via=maas -e maas_api_user=<user>` を利用します。
+
+2026-10-26 に RTX PRO 6000 Blackwell の `mixed` / `all-balanced` で実機検証しました。
+Qwen3-0.6B を 24 GB 区画、Qwen3-4B を 48 GB 区画へ Ansible role で配置し、
+直接推論 6 件、同時推論 6 件、MaaS の body-based / path-based 各 6 件が成功しました。
+各 Pod の MIG UUID が異なること、Prometheus に両サイズの DCGM メトリクスがあること、
+MIG 設定とモデル配置の再実行が `changed=0` であることも確認しました。
+GPU Pod が残っている間の MIG 無効化は、対象 2 Pod を表示して変更せず停止しました。
+検証後は Ansible で MIG 無効・元の `single` strategy へ戻し、既存の Qwen3.5-9B を復元して
+推論応答（`Tokyo`）まで確認しました。検証用の MaaS ポリシーと一時 API キーは削除・失効済みです。
+
+#### 複数モデルを MaaS Gateway から利用する
+
+Gateway は共通で、`GET /v1/models` にアクセス可能なモデルが一覧表示されます。
+上の実機検証では次の 2 ID が `ready: true` で返り、同じ Subscription に所属していました。
+
+| モデル | body-based の `model` | path-based の URL パス |
+|---|---|---|
+| 0.6B | `publishers/llm-serving-mig/models/qwen3-06b-mig` | `/llm-serving-mig/qwen3-06b-mig/v1/chat/completions` |
+| 4B | `publishers/llm-serving-mig/models/qwen3-4b-mig` | `/llm-serving-mig/qwen3-4b-mig/v1/chat/completions` |
+
+body-based は共通の `/v1/chat/completions` へ完全修飾 ID を送り、
+path-based は上の個別パスへ短いモデル名（例 `qwen3-06b-mig`）を送ります。
+利用者ごとの一覧は次の playbook で取得できます。一時 API キーは終了時に失効させます。
+
+```bash
+uv run ansible-playbook playbooks/maas_list_models.yml \
+  -i inventory/<env> -e maas_api_user=<inventoryに定義したユーザー>
+```
+
+##### body-based の `model` ID を確認する
+
+**`GET /v1/models` が返す `data[].id` を、そのままリクエストの `model` に使います。**
+次の playbook は inventory の `keycloak_users` から指定ユーザーのグループを解決し、
+その利用者の一時 API キーで Gateway の `/v1/models` を実際に問い合わせます。
+名前を組み立てて表示しているだけではありません。
+
+```bash
+cd rhoai-3.5-ansible
+
+# <env> と <user> は利用する inventory と keycloak_users の username に置換
+uv run ansible-playbook playbooks/maas_list_models.yml \
+  -i inventory/<env> -e maas_api_user=<user> \
+  -e maas_model_list_output=/tmp/maas-models.json
+
+# body-based リクエストに指定できる ID を表示
+jq -r '.data[].id' /tmp/maas-models.json
+
+# Ready 状態と所属 Subscription も併せて確認
+jq '.data[] | {id, ready, subscriptions}' /tmp/maas-models.json
+```
+
+今回の検証時の出力例:
+
+```text
+publishers/llm-serving-mig/models/qwen3-06b-mig
+publishers/llm-serving-mig/models/qwen3-4b-mig
+```
+
+例えば 1 行目を使う場合、共通の `/v1/chat/completions` に次の JSON を送ります。
+
+```json
+{
+  "model": "publishers/llm-serving-mig/models/qwen3-06b-mig",
+  "messages": [{"role": "user", "content": "こんにちは"}],
+  "max_tokens": 64,
+  "chat_template_kwargs": {"enable_thinking": false}
+}
+```
+
+ID の形式は `publishers/<namespace>/models/<LLMInferenceService の metadata.name>` です。
+Kubernetes 上の名前は次のコマンドで確認できます。
+
+```bash
+oc get llminferenceservice -A
+```
+
+ただし、この一覧は Kubernetes 上の配置情報です。利用者の MaaS アクセス権とは異なります。
+モデルが配置済みでも `/v1/models` に出ない場合は、問い合わせたユーザーのグループ、
+MaaSAuthPolicy、MaaSSubscription、MaaSModelRef の状態を確認してください。
+`ready: true` のモデルを選び、**最終的には実際の API 一覧の `id` を使ってください**。
+保存される JSON に API キーは含まれず、検証用キーは playbook 終了時に失効します。
+
+Subscription はモデル単位ではなく `keycloak_groups` のグループ単位で生成します。
+`llm_add_model.yml` は `install_keycloak: true` の場合、モデル配置の後に
+`manage_maas_access` も実行し、`<group>-subscription` の `modelRefs` を更新します。
+通常グループでは `keycloak_groups.<group>.models` に新しいモデル名を追加してください。
+`models: ["*"]` の管理者グループの Subscription は、再適用時に全 `present` モデルを含みます。
+LLM role だけの実行ではアクセス設定を更新しません。
+
+仕様の詳細は [NVIDIA GPU Operator](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-operator-mig.html) と
+[device plugin の MIG_STRATEGY](https://github.com/NVIDIA/k8s-device-plugin#configuration-option-details) を参照してください。
+
+### MIG 変数の一覧
+
+| 変数 | 内容・単位 | 既定 / 指定方法 |
+|---|---|---|
+| `gpu_mig_strategy` | クラスタ共通の GPU 公開方式。`single` または `mixed` | MIG 設定時は必須。`cluster.yml` に保存 |
+| `mig_node_selector` | 対象 Kubernetes ノードの label selector | 必須。例 `mig-group=rtx6000-24gb` |
+| `mig_profile` | GPU Operator ConfigMap の `mig-configs` 配下のキー | 必須。例 `all-1g.24gb` |
+| `mig_expected_resources` | 適用後に確認するリソース名と個数。**各ノードの個数**でありグループ全体の合計ではない | 必須。割り当て可能な総数（allocatable）を指定 |
+| `mig_full_gpu_resources` | 無効化後の **各ノードの物理 GPU 数** | `disable_mig.yml` で必須。例 `nvidia.com/gpu: 1` |
+| `mig_apply` | `true` で変更を実行。`false` で事前検査のみ | `false`。`--check` は `true` 指定時も変更しない |
+| `mig_persist_machineset` | 成功後の profile を所有 MachineSet に保存 | `true`。同じ MachineSet の既存ノードをすべて選ぶ。非 Machine API ノードは `false` |
+| `mig_ready_timeout` | MIG state・resource 数・Node Ready を待つ秒数 | `1200`。ハードウェア検査には別途最大 30 回・10 秒間隔の再試行がある |
+| `mig_operator_namespace` | GPU Operator / MIG ConfigMap の namespace | `nvidia-gpu-operator` |
+| `mig_cluster_policy` | 操作する ClusterPolicy 名 | `gpu-cluster-policy` |
+
+`mig_expected_resources` は検査条件であり、GPU を増やす設定ではありません。
+実際の分割を決めるのは `mig_profile` です。物理 GPU が 2 枚で各 4 分割なら、
+ノードの期待数は 8、無効化後の物理 GPU 数は 2 になります。
+異なる物理 GPU 数や profile のノードは同じグループにせず、selector を分けてください。
+また、この検査は指定したリソースの値を照合するもので、未指定リソースの不存在までは検査しません。
+
+### MIG を無効化して元の GPU 全体へ戻す
+
+```bash
+# 事前検査（今回の inventory は物理 GPU 数 = 1 を設定済み）
+uv run ansible-playbook playbooks/disable_mig.yml -i inventory/aws-sno-ipi
+# 対象 worker の GPU モデルを停止し、GPU を要求する Pod が無くなってから実行
+uv run ansible-playbook playbooks/disable_mig.yml -i inventory/aws-sno-ipi -e mig_apply=true
+# 再び 4 分割する場合
+uv run ansible-playbook playbooks/configure_mig.yml -i inventory/aws-sno-ipi -e mig_apply=true
+```
+
+`disable_mig.yml` は `all-disabled` を適用し、物理 GPU 数
+（`mig_full_gpu_resources`。今回 `nvidia.com/gpu: 1`）と、NVIDIA MIG Parted の
+読み取り専用 `assert` で MIG 無効を確認します。対象 node と MachineSet の profile を
+同時に管理するため、replacement worker も全 GPU の状態になります。
+他ノードの MIG を壊さないよう **ClusterPolicy の strategy は現在値を維持**します。
+`single` / `mixed` のままでも、MIG 無効の GPU は全体を `nvidia.com/gpu` で割り当てられます。
+
+推論 Pod を自動停止する処理はありません。Deployment を直接 scale しても
+LLMInferenceService controller が復元する場合があるため、モデルの管理元で停止してください。
+設定変更で停止したモデルを自動的に復元することもありません。全 GPU に戻した後は
+モデルの VRAM 要件と GPU 数を見直してから配信を再開してください。
+GPU worker や PVC 自体は削除しません。
+
+分割 profile を変更するときは、前回の success label を新しい profile と同一 patch 内で
+消し、古い成功状態を完了と取り違えないようにしています。適用後はラベル・resource 数に
+加えて NVIDIA MIG Parted で実際の構成を検証します。`WITH_REBOOT` が有効な MIG Manager は
+事前検査で拒否するため、この playbook 経由で意図せず自動 reboot を起こすことはありません。
+
+MIG 解除時に必要な GPU workload 数は **対象ノードで 0 Pod** です。
+4 分割に 4 Pod が動いている場合、3 Pod だけ止めて残り 1 Pod をそのまま全 GPU に
+引き継ぐことはできません。4 Pod ともいったん停止し、解除後に必要なモデルを再起動します。
+playbook は変更前に対象ノード、停止が必要な namespace/Pod 名、現在数、必要数 0 を表示し、
+条件を満たさなければ停止します。対象外ノードの workload は、strategy を変更しない限り
+この停止条件には含めません。
+
+2026-10-26 実機確認: MIG worker 上の 3 モデルを管理元の LLMInferenceService から停止後、
+`disable_mig.yml -e mig_apply=true` を実行し、`ok=48 changed=4 failed=0`。
+MIG Parted の実構成検査、`nvidia-smi` の `Disabled`、allocatable `nvidia.com/gpu: 1`、
+MachineSet の `all-disabled`、cordon 解除を確認しました。キャッシュ PVC は保持し、
+別ノードの L4 / qwen3-5-9b の推論も継続成功しています。
+
+### GPU ごとの MIG プロファイル一覧
+
+Bash ツール `playbooks/list_mig_profiles.sh` で、GPU Operator が公開する profile と
+分割数を確認できます。依存は `oc` と `jq` のみです。
+
+```bash
+# MIG 対応ラベルを持つ全ノード
+./playbooks/list_mig_profiles.sh
+# 対象を絞る
+./playbooks/list_mig_profiles.sh --selector rhoai-validation=mig
+./playbooks/list_mig_profiles.sh --node <GPU-worker-name>
+```
+
+ノード名・GPU 名・現在の profile/state・取得元 ConfigMap と、その `config.yaml` を
+表示します。例えば `all-1g.24gb` の `1g.24gb: 4` は 24 GB の領域 4 個、
+`all-2g.48gb` の `2g.48gb: 2` は 48 GB の領域 2 個です。
+カスタム ConfigMap 指定を優先し、未指定ならノード別、次に共有の既定 ConfigMap を使います。
+共有・カスタム設定は、この GPU に適用できない項目を含む場合があるため取得元を確認してください。
+YAML をテキスト処理で解釈せず原文表示するため、混在分割や device ごとの設定も確認できます。
+設定変更や Pod 内でのコマンド実行は行いません。権限・接続エラー時は停止します。

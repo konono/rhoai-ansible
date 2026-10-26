@@ -1,0 +1,43 @@
+---
+- name: Read Pods for GPU usage checks
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+  register: _mig_pods
+- name: Find active GPU consumers on nodes affected by the change
+  ansible.builtin.set_fact:
+    _mig_busy: >-
+      {%- set ns = namespace(busy=[]) -%}
+      {%- set target_names = _mig_targets | map(attribute='metadata.name') | list -%}
+      {%- for pod in _mig_pods.resources -%}
+      {%- if (pod.status.phase | default('')) not in ['Succeeded', 'Failed']
+            and (_mig_strategy_change | bool or (pod.spec.nodeName | default('')) in target_names) -%}
+      {%- for container in (pod.spec.containers | default([])) + (pod.spec.initContainers | default([])) -%}
+      {%- set resources = (container.resources.requests | default({})) | combine(container.resources.limits | default({})) -%}
+      {%- for key, value in resources.items() -%}
+      {%- if (key == 'nvidia.com/gpu' or key.startswith('nvidia.com/mig-')) and value | int > 0 -%}
+      {%- set ns.busy = ns.busy + [pod.metadata.namespace ~ '/' ~ pod.metadata.name] -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ ns.busy | unique | list }}
+- name: Show blocking Pods and the condition required before proceeding
+  ansible.builtin.debug:
+    msg:
+      operation: "{{ 'MIG 無効化（GPU 全体へ戻す）' if mig_profile == 'all-disabled' else 'MIG 設定変更' }}"
+      scope: "{{ 'クラスタ全体（strategy 変更のため）' if _mig_strategy_change | bool else '対象ノードのみ' }}"
+      target_nodes: "{{ _mig_targets | map(attribute='metadata.name') | list }}"
+      current_gpu_pod_count: "{{ _mig_busy | length }}"
+      required_gpu_pod_count: 0
+      blocking_pods: "{{ _mig_busy }}"
+      action: >-
+        上記 GPU workload を管理元（LLMInferenceService 等）で停止し、対象の GPU 要求 Pod を 0 にしてください。
+        Pod の自動削除・eviction は行いません。1 Pod を残したまま MIG を解除して全 GPU に引き継ぐことはできません。
+        停止後、同じ playbook を -e mig_apply=true で再実行してください。
+  when: _mig_busy | length > 0
+- name: Refuse MIG changes while GPU workloads are active
+  ansible.builtin.assert:
+    that: _mig_busy | length == 0
+    fail_msg: "GPU Pod を 0 にする必要があります（現在 {{ _mig_busy | length }}）。変更・Pod 削除は行っていません。対象: {{ _mig_busy }}"

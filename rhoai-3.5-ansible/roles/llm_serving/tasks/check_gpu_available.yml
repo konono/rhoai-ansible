@@ -1,0 +1,67 @@
+---
+- name: Read nodes before model creation
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+  register: _available_nodes
+
+- name: Read GPU reservations including bound Pending Pods
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+  register: _available_pods
+
+# Account for restartable init containers and the peak of sequential init stages.
+# Unbound Pending Pods are not reservations yet; scheduling still arbitrates races.
+- name: Calculate free slots on selected nodes
+  ansible.builtin.set_fact:
+    _gpu_availability: >-
+      {%- set result = namespace(slots=0, pods=[]) -%}
+      {%- set resource = _model_cfg.gpu_resource | default('nvidia.com/gpu') -%}
+      {%- for node in _available_nodes.resources -%}
+      {%- set selected = namespace(ok=not (node.spec.unschedulable | default(false)), used=0) -%}
+      {%- for key, value in (_model_cfg.node_selector | default({})).items() -%}
+      {%- if (node.metadata.labels | default({})).get(key) != value -%}
+      {%- set selected.ok = false -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if selected.ok -%}
+      {%- for pod in _available_pods.resources -%}
+      {%- if pod.spec.nodeName | default('') == node.metadata.name and pod.status.phase | default('') not in ['Succeeded', 'Failed'] -%}
+      {%- set usage = namespace(app=0, sidecars=0, peak=0) -%}
+      {%- for c in pod.spec.containers | default([]) -%}
+      {%- set res = c.resources | default({}) -%}
+      {%- set usage.app = usage.app + ((res.requests | default({})).get(resource, (res.limits | default({})).get(resource, 0)) | int) -%}
+      {%- endfor -%}
+      {%- for c in pod.spec.initContainers | default([], true) -%}
+      {%- set res = c.resources | default({}) -%}
+      {%- set count = (res.requests | default({})).get(resource, (res.limits | default({})).get(resource, 0)) | int -%}
+      {%- if c.restartPolicy | default('') == 'Always' -%}
+      {%- set usage.sidecars = usage.sidecars + count -%}
+      {%- set usage.peak = [usage.peak, usage.sidecars] | max -%}
+      {%- else -%}
+      {%- set usage.peak = [usage.peak, usage.sidecars + count] | max -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- set used = [usage.app + usage.sidecars, usage.peak] | max -%}
+      {%- set selected.used = selected.used + used -%}
+      {%- if used > 0 -%}
+      {%- set _ = result.pods.append(pod.metadata.namespace ~ '/' ~ pod.metadata.name) -%}
+      {%- endif -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- set free = [0, (node.status.allocatable.get(resource, 0) | int) - selected.used] | max -%}
+      {%- set result.slots = result.slots + (free // (_model_cfg.gpu_count | default(1) | int)) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ {'slots': result.slots, 'pods': result.pods} }}
+
+- name: Stop if selected GPU resources are occupied
+  ansible.builtin.assert:
+    that: _gpu_availability.slots | int >= _model_cfg.replicas | default(1) | int
+    fail_msg: >-
+      {{ _model_name }}: resource={{ _model_cfg.gpu_resource | default('nvidia.com/gpu') }},
+      node_selector={{ _model_cfg.node_selector | default({}) }},
+      available Pod slots={{ _gpu_availability.slots }}, required={{ _model_cfg.replicas | default(1) }}.
+      使用中の Pod={{ _gpu_availability.pods }}。利用者が不要な workload を停止して再実行してください。
+      このチェックは Pod / Deployment を削除・縮退しません。

@@ -880,48 +880,99 @@ for p in d['items']:
 | MaaSModelRef が Pending のまま | MaaSAuthPolicy / MaaSSubscription が未適用 | `playbooks/manage_maas_access.yml` を実行する |
 | transformers の `... is part of ...InitKwargs, but not documented` | 単なる警告（stderr に出るだけ） | 無視してよい |
 
-### 7.z NeMo Guardrails の既知の問題（reasoning モデル使用時）
+### 7.z NeMo Guardrails のハマりどころ（reasoning モデル使用時）
 
 `verify.yml` は NemoGuardrails CR が Ready かしか見ないため、以下は検出できない。
 `tools/test-guardrails.sh` で機能確認すること。
 
-**判定 rail が reasoning モデルだと機能しない（対処済み）**
+#### 通常の推論が完了せず GPU を占有し続ける（[#15](https://github.com/konono/rhoai-ansible/issues/15)、2026-10-26 解決）
 
-`self check input` / `self check output` は「Yes か No で答えよ」という判定
-プロンプトを LLM に投げる。Qwen3 系はこれにも思考を返すため、小さい
-`max_tokens` を思考だけで使い切り **content が空**で返る。判定できないまま
-1 リクエストで input/output 2 つの rail + 本体生成が走り、応答が返らなくなる。
+**症状**: CR は Ready、input rail のブロックも効くのに、rail に引っかからない
+通常の質問だけが返ってこない。vLLM 側は `Running: N reqs` が張り付いたまま
+生成を続け、`--max-num-seqs` の枠を占有して本体モデルの応答性能を食い潰す。
 
-```
-thinking あり: completion_tokens 256 / reasoning 256 / content "" / 33 秒
-thinking なし: completion_tokens   2 / reasoning   0 / content "Yes" / 即答
-```
+原因は独立した 2 つで、**両方直さないと直らない**。
 
-role 側で `extra_body.chat_template_kwargs.enable_thinking: false` を既定にした。
-思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
+**原因 1: 参照されていない `define user` が dialog rail を起動していた**
 
-**通常の推論が完了せず GPU を占有し続ける（未解決: [#15](https://github.com/konono/rhoai-ansible/issues/15)）**
+`rails.co` に `define user ask about harmful topics` があったが、どの flow からも
+参照されていない死に設定だった。しかし nemoguardrails は user canonical form が
+1 つでも定義されていると passthrough をやめ、**dialog rail モード**に入る
+(`actions/llm/generation.py` の `generate_user_intent`)。
 
-この問題のため `install_guardrails` の既定は `false` になっている。
-有効にする場合は本項を踏まえた上で `tools/test-guardrails.sh` で機能確認すること。
-
-上記の対処でブロック経路は即答するようになったが、**rail に引っかからない
-通常の質問は 10 分待っても完了しない**。このとき vLLM 側は次の状態が続く。
-
-```
-Running: 4 reqs, Avg generation throughput: 132 tokens/s   ← 止まらない
+```python
+if self.config.user_messages:   # intent 生成 + flow 解決（複数回 LLM 呼び出し）
+else:                           # Task.GENERAL を 1 回だけ呼んで返す
 ```
 
-Guardrails が LLM 呼び出しをループしており、`--max-num-seqs` の枠を
-占有し続ける。**本体モデルの応答性能を食い潰す**ため、Guardrails を
-使わない環境では無効化を推奨する。
+`config.user_messages` は `define user ...` だけから作られる。intent 候補が
+1 件しかない few-shot 補完プロンプトに対してモデルが停止せず生成し続け、
+リクエストが終わらなくなっていた。実機ログ:
+
+```
+Executing action generate_user_intent
+Phase 1 Generating user intent
+# Choose intent from this list: ask about harmful topics
+User intent: ask about harmful topics      <- 延々と続く
+```
+
+有害プロンプトのブロックは input rail (`self check input`) が担当しており
+canonical form は不要なので、定義ごと削除した。
+**`rails.co` に `define user ...` を足すと再発する。**
+
+**原因 2: `extra_body:` のネストで思考が切れていなかった**
+
+nemoguardrails の **OpenAI 互換クライアント経路**では、`models[].parameters` の
+未知のキーは**そのまま HTTP ボディに転送される**。
+
+つまり `extra_body: {chat_template_kwargs: ...}` と書くと、vLLM には
+`chat_template_kwargs` ではなく **`extra_body` という未知のフィールド**が送られ、
+黙って無視される。200 OK が返るのでエラーにもならない。
+
+vLLM が見るのはボディ直下の `chat_template_kwargs` なので、`parameters` 直下に置く。
+
+**適用バージョン**: RHOAI 3.5 同梱の **0.24 系で実機確認済み**。直下形式が正しいのは
+OpenAI 互換クライアント経路を通る **0.22 以降**。**0.21 以前は LangChain 経路**で、
+直下に置くと SDK が `TypeError` になり、`extra_body` ネストの方が正しい形になる。
+古い nemoguardrails を積む環境へ移植する場合は戻すこと。
+
+> `_compat/langchain_kwargs.py` の docstring にある "After 0.23 any unrecognized
+> parameter is forwarded verbatim ..." は、**互換シムを削除する時期**の説明であって
+> 転送が始まるバージョンの話ではない。0.22 の default framework には既に同じ
+> 転送実装がある。当初これを「0.23 から転送される」と読み違えていた。
+
+**前提**: 本 role の `base_url` は内部 vLLM サービスに固定している。
+`chat_template_kwargs` は vLLM 固有の拡張なので、未知フィールドを拒否する他の
+OpenAI 互換サーバへ向けた場合は 400 になりうる。任意のサーバ対応は range 外。
 
 ```yaml
-# components.yml
-install_guardrails: false
+parameters:
+  base_url: "..."
+  api_key: "dummy"
+  chat_template_kwargs:        # extra_body: でネストしないこと
+    enable_thinking: false
 ```
 
-既に動いてしまっている場合の止め方:
+思考が切れていないと本体生成が `max_tokens` を思考だけで使い切って
+**content が空**で返り、出力 rail がそれを拒否扱いにして
+「I'm sorry, I cannot help with that request」を返す。実測:
+
+```
+thinking あり / max_tokens 64: completion_tokens 64 (全部 reasoning) / content ""
+thinking なし:                 completion_tokens  4 / content "Tokyo."
+```
+
+思考を有効に戻したい場合は `guardrails_enable_thinking: true` を指定する。
+
+**修正後の実測**（AWS SNO g6.8xlarge / L4 / Qwen3.5-9B）:
+
+```
+Step 2 ブロック:   即答
+Step 3 通常推論:   2.3-2.5 秒で "Paris" / "Tokyo"
+vLLM:              Running: 0 reqs （GPU を掴みっぱなしにしない）
+```
+
+#### 止め方（GPU を掴んだまま戻らない場合）
 
 `oc scale deploy/nemo-guardrails --replicas=0` は**効かない**。operator が
 CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を 0 にするのも
@@ -929,25 +980,14 @@ CR の `spec.replicas` に戻すため数十秒で 1 に復帰する。CR 側を
 
 **`install_guardrails: false` にするだけでは既に動いている CR は消えない。**
 false にすると guardrails role 自体がスキップされるため、CR を削除する
-uninstall タスクが実行されないまま残り続ける。DataScienceCluster の
-`nemoguardrails: Removed` は operator の管理を外すだけで、作成済みの CR の
-削除までは確認できていない。
-
-止めるには uninstall を明示的に実行する。
+uninstall タスクが実行されないまま残り続ける。
 
 ```bash
 uv run ansible-playbook playbooks/uninstall.yml -i inventory/<env> \
   --tags guardrails -e '{"uninstall_guardrails": true}'
 ```
 
-そのうえで、次回以降作られないよう inventory でも無効にしておく。
-
-```yaml
-# inventory/<env>/group_vars/all/components.yml
-install_guardrails: false
-```
-
-playbook を使わずその場で止める場合は CR を直接削除する
+その場で止めるなら CR を直接削除する
 （`install_guardrails: true` のままだと次回の playbook 実行で作り直される）。
 
 ```bash
@@ -959,11 +999,6 @@ oc delete nemoguardrails nemo-guardrails -n redhat-ods-applications
 ```bash
 oc logs -n llm-serving <model>-kserve-xxxxx -c main --tail=3 | grep Running
 ```
-
-原因は Colang の intent 生成が収束しないことと見られる（Pod ログに
-`generate_user_intent` のプロンプト構築が繰り返し現れる）。
-小型の非 reasoning モデルを判定用に別途割り当てる構成が本筋だが未検証。
-調査の経緯と再現手順は [#15](https://github.com/konono/rhoai-ansible/issues/15) にまとめてある。
 
 ### 7.y MaaS Gateway のルーティング方式
 
@@ -1059,6 +1094,123 @@ Qwen3 系は既定で思考に数百トークン使うため、`max_tokens` が�
 `finish_reason=length` のまま `content` が空で返ります。この playbook は既定で
 `chat_template_kwargs={"enable_thinking": false}` を送って短く確定的に応答させます。
 thinking 込みで見たい場合は `-e inference_chat_template_kwargs={}` を指定します。
+
+---
+
+### 7.v ノード再起動後に DataScienceCluster が Not Ready のままになる
+
+SNO のノードを停止→起動すると、ワークロードは復旧しているのに
+`DataScienceCluster` が `Ready=False` のまま戻らないことがある。
+
+```
+DSC    Ready=False / ModulesReady=False   "Some modules are degraded: ogx"
+OGX    Ready=True (AllDependentsHealthy) / phase=Ready
+       Degraded=True (UnhealthyOGXServers) severity=Info
+       message: "Unhealthy OGXServer instances: redhat-ods-applications/ogx-server"
+OGXServer  phase=Ready / HealthCheck=True / availableReplicas=1
+```
+
+**OGXServer 自身は健全なのに親の `Degraded` が落ちない**のが特徴。
+再起動直後は vLLM がモデル（10 GiB 超）を再ロード中で、ogx-server の
+5 分おきの疎通に失敗する。
+
+```
+ERROR  list_provider_model_ids() failed
+WARN   Model refresh failed  error=Connection error. provider_id=vllm-inference
+```
+
+その後ポーリングは成功に戻る（`list_provider_model_ids() returned models count=N`）が、
+**`Degraded` フラグが片方向にラッチされたまま再評価されない**。
+
+#### 対処
+
+`rhods-operator` の再起動では**直らない**（実機で 5 分観察して変化なし）。
+OGX モジュール側の operator を再起動する。
+
+```bash
+oc rollout restart deploy/opendatahub-ogx-operator -n redhat-ods-applications
+oc rollout status  deploy/opendatahub-ogx-operator -n redhat-ods-applications
+```
+
+10 秒ほどで `Degraded=False` → `DSC Ready=True` に戻る。
+
+#### 併せて掃除するもの
+
+ノード再起動では、再起動前に動いていた Pod が `ContainerStatusUnknown` の
+まま残骸として残る。置き換えの Pod は別途起動しているので削除してよい。
+`verify.yml` の「unhealthy pod なし」チェックはこれを拾って落ちる。
+
+```bash
+oc get pods -A --no-headers \
+  | awk '$4!="Running" && $4!="Completed" {print $1, $2, $4}'
+oc delete pod <name> -n <ns>
+```
+
+なお `openshift-kube-apiserver` の `installer-N-...` が `Error` で残るのは
+OpenShift の通常動作（失敗したリビジョンの Pod を調査用に保持する）。
+`oc get co kube-apiserver` が Available かつ not Degraded なら放置してよい。
+
+---
+
+### 7.w Perses ダッシュボードが空・NaN になる場合（修正済み、2026-10-26）
+
+`モニタリング > Dashboards (Perses)` の `MaaS Gateway *` ダッシュボードで、
+全パネルが 0 / `No data` / `NaNns` になる不具合が 4 件あった。いずれも
+playbook 側に取り込み済みなので、**再適用すれば直る**。
+
+```bash
+uv run ansible-playbook site.yml -i inventory/<env> --tags deps,gpu,workload,observability
+```
+
+| 症状 | 原因 | 対処 |
+|---|---|---|
+| GPU 系 8 パネルが全て 0 | DCGM exporter に ServiceMonitor が無く `DCGM_FI_DEV_*` が誰にもスクレイプされていなかった | `gpu_operator` role の ClusterPolicy に `dcgmExporter.serviceMonitor` を追加 |
+| `vllm:*` メトリクスが全欠落 | UWM 未有効。KServe が `llm-serving` に作る PodMonitor を見る Prometheus が存在しなかった | `observability` role で `cluster-monitoring-config` の `enableUserWorkload` を有効化 |
+| `P95 Latency` が `NaNns` | 観測ゼロだと `histogram_quantile` が NaN を返し、`milliseconds` フォーマッタがそのまま描画する | クエリ末尾に `> 0 or vector(0)` |
+| `Error Rate` が `No data` | 分子が空集合だと除算結果ごと消える | 分子 `or vector(0)` / 分母 `> 0 or vector(1)` |
+| `Req/Sec by Model` にモデルが出ない | `destination_service=~".*maas.*"` は `maas-api` にしか一致せず、実体の `<model>-kserve-workload-svc` を除外していた | `source_workload=~"maas-default-gateway.*",reporter="source"` に変更 |
+| istio 系の値が実測の 2 倍 | odh-model-controller が作る `maas-default-gateway-metrics` と自前 PodMonitor の二重スクレイプ | 自前 PodMonitor を削除（role が既存実体も消す） |
+| `Rate Limited` / `Rate Limit Decisions` が常に空 | limitador は `openshift-rhcl` に居るが、同 ns に `openshift.io/cluster-monitoring` ラベルが無く platform Prometheus が見ない。UWM は `openshift-*` を対象外にする仕様なので UWM でも取れず、収集経路が無かった | ns にラベル付与 + platform 用 PodMonitor (`07-limitador-platform-scrape.yaml`) + NetworkPolicy に `openshift-monitoring` → 8080 を追加 |
+
+**`limited_calls` について**: limitador はレート制限が実際に 1 度でも発動する
+まで `limited_calls` を export しない（カウンタが遅延生成される）。未発動の間は
+`authorized_calls` のみが存在する。ダッシュボードのクエリは `or vector(0)` で
+受けているので 0 と表示される（正常）。収集できているかは次で確認する。
+
+```bash
+# Thanos で確認（authorized_calls が出れば収集経路は生きている）
+authorized_calls
+authorized_calls_total      # 03-recordingrule.yaml が評価されていれば出る
+limitador_up
+```
+
+**GPU ダッシュボードが依然 0 のとき**は ServiceMonitor の有無を見る。
+
+```bash
+oc get servicemonitor -n nvidia-gpu-operator        # nvidia-dcgm-exporter があること
+oc get clusterpolicy gpu-cluster-policy -o jsonpath='{.spec.dcgmExporter}'
+```
+
+`observability` role の `05-gpu-utilization.yaml` にも同じ ClusterPolicy 設定が
+あるが、**ClusterPolicy が未作成のときしか適用されない**。site.yml では
+`gpu_operator` が先に走って必ず CR を作るため、あちらは常に skip される。
+設定は `gpu_operator` role 側が唯一の有効な置き場所になっている。
+
+**二重スクレイプの確認方法**（1 job だけ出れば正常）。
+
+```bash
+# Thanos で job ごとの系列数を見る
+count by (job) (istio_requests_total{source_workload=~"maas-default-gateway.*"})
+```
+
+PodMonitor を消しても Prometheus の設定リロードに 2〜3 分かかる。
+ターゲットが消えたかは次で確認する。
+
+```bash
+oc exec -n openshift-monitoring prometheus-k8s-0 -c prometheus -- \
+  curl -s 'http://localhost:9090/api/v1/targets?state=active' \
+  | python3 -c 'import json,sys; print([t["labels"]["job"] for t in json.load(sys.stdin)["data"]["activeTargets"] if "gateway" in t["labels"].get("job","")])'
+```
 
 ---
 

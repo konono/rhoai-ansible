@@ -27,6 +27,7 @@ NS="${2:-redhat-ods-applications}"
 NG_URL="http://localhost:8000"
 # ブロックされたと判定する応答の手がかり（rail の設定次第で変わる）
 BLOCK_PATTERN="${BLOCK_PATTERN:-cannot help|can't help|I'm sorry|unable to assist|refuse}"
+NORMAL_PATTERN="${NORMAL_PATTERN:-Tokyo|東京}"
 # rail のパイプラインは判定と生成で複数回 LLM を呼ぶため、素の推論より遅い。
 # reasoning モデルだと更に伸びるので既定を長めに取る。
 TIMEOUT="${TIMEOUT:-180}"
@@ -65,7 +66,7 @@ ng_curl() {
     # set -e 下で代入が失敗すると rc=$? に辿り着かない可能性があるため、
     # 成否を明示的に受け取る
     out=$(oc exec "${POD}" -c nemo-guardrails -n "${NS}" -- \
-        curl -sk --max-time "${TIMEOUT}" "$@" 2>/dev/null) && rc=0 || rc=$?
+        curl -skf --max-time "${TIMEOUT}" "$@" 2>/dev/null) && rc=0 || rc=$?
     printf '%s\n__RC__%s' "${out}" "${rc}"
 }
 body_of() { printf '%s' "$1" | sed 's/\n*__RC__[0-9]*$//'; }
@@ -81,24 +82,21 @@ else
 fi
 echo ""
 
-# モデル未指定なら Ready な LLMInferenceService から拾う
+# Guardrails が接続するモデルを設定から取得する。
+# クラスタの先頭の Ready モデルでは、複数モデル環境で別のモデルを選んでしまう。
+# PyYAML は Guardrails コンテナ側のものを使い、端末には追加依存を要求しない。
 if [[ -z "${MODEL}" ]]; then
-    MODEL=$(oc get llminferenceservice -A -o json 2>/dev/null | python3 -c '
-import json, sys
-try:
-    items = json.load(sys.stdin).get("items", [])
-except Exception:
-    sys.exit(0)
-for it in items:
-    conds = (it.get("status") or {}).get("conditions") or []
-    if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conds):
-        print(it["metadata"]["name"]); break
-' || true)
-    if [[ -z "${MODEL}" ]]; then
-        echo "  Ready なモデルが見つかりません。モデル名を指定してください。" >&2
-        exit 1
-    fi
-    echo "  モデル未指定のため ${MODEL} を使います"
+    MODEL=$(oc get configmap nemo-guardrails-config -n "${NS}" \
+        -o jsonpath='{.data.config\.yaml}' | \
+        oc exec -i "${POD}" -c nemo-guardrails -n "${NS}" -- python3 -c '
+import sys, yaml
+cfg = yaml.safe_load(sys.stdin) or {}
+models = [m.get("model") for m in cfg.get("models", []) if m.get("type") == "main"]
+if len(models) != 1 or not models[0]:
+    sys.exit("Expected exactly one main model in Guardrails config")
+print(models[0])
+') || { echo "  Guardrails のモデル設定を取得できません。モデル名を指定してください。" >&2; exit 1; }
+    echo "  Guardrails 設定のモデル ${MODEL} を使います"
     echo ""
 fi
 
@@ -137,6 +135,8 @@ if [[ "${BLOCKED_RC}" -eq 28 ]]; then
     echo "    Guardrails の API が応答していません。CR が Ready でも"
     echo "    chat/completions が返らないことがあります:"
     echo "      oc logs -n ${NS} ${POD} -c nemo-guardrails --tail=50"
+elif [[ "${BLOCKED_RC}" -ne 0 ]]; then
+    ng "ブロック検査の HTTP/通信エラー (curl rc=${BLOCKED_RC})"
 elif [[ -z "${BLOCKED_MSG}" ]]; then
     ng "応答が取得できませんでした: $(printf '%s' "${BLOCKED}" | head -c 200)"
 elif printf '%s' "${BLOCKED_MSG}" | grep -qiE "${BLOCK_PATTERN}"; then
@@ -158,9 +158,7 @@ NORMAL_RAW=$(ng_curl -X POST "${NG_URL}/v1/chat/completions" \
 NORMAL_RC=$(rc_of "${NORMAL_RAW}")
 NORMAL=$(body_of "${NORMAL_RAW}")
 NORMAL_MSG=$(printf '%s' "${NORMAL}" | content_of)
-if [[ -n "${NORMAL_MSG}" ]]; then
-    ok "通常推論: ${NORMAL_MSG:0:100}"
-elif [[ "${NORMAL_RC}" -eq 28 ]]; then
+if [[ "${NORMAL_RC}" -eq 28 ]]; then
     ng "通常推論が ${TIMEOUT}s でタイムアウトしました"
     echo "    ブロック経路は rail が即答するため、ここだけ失敗する場合は"
     echo "    Guardrails から LLM への接続を疑ってください:"
@@ -173,6 +171,24 @@ elif [[ "${NORMAL_RC}" -eq 28 ]]; then
     echo "      oc delete nemoguardrails nemo-guardrails -n ${NS}"
     echo "    (oc scale deploy は operator に戻されるため効きません)"
     echo "    単に遅いだけなら TIMEOUT=600 で伸ばせます"
+elif [[ "${NORMAL_RC}" -ne 0 ]]; then
+    ng "通常推論の HTTP/通信エラー (curl rc=${NORMAL_RC})"
+elif printf '%s' "${NORMAL_MSG}" | grep -qiE "${BLOCK_PATTERN}"; then
+    # 応答が返ってきても、それが拒否文なら素通しできていない。
+    # 「空でなければ OK」だけ見ていると、rail が通常の質問まで
+    # ブロックしている状態を見逃す (#15 の修正過程で実際に見逃した)。
+    ng "通常の質問がブロックされました: ${NORMAL_MSG:0:120}"
+    echo "    rail に引っかからないはずの質問が拒否されています。"
+    echo "    出力 rail が空の応答を受け取って誤判定している可能性があります:"
+    echo "      oc logs -n ${NS} ${POD} -c nemo-guardrails --tail=200 | grep -E 'LLM Completion|BotMessage'"
+    echo "    本体生成が空で返る場合、思考 (reasoning) が max_tokens を"
+    echo "    使い切っていないか確認してください。models[].parameters の"
+    echo "    chat_template_kwargs は extra_body でネストせず直下に置くこと"
+    echo "    (nemoguardrails 0.22+ の default framework は未知キーをボディに転送する)。"
+elif [[ -n "${NORMAL_MSG}" ]] && printf '%s' "${NORMAL_MSG}" | grep -qiE "${NORMAL_PATTERN}"; then
+    ok "通常推論: ${NORMAL_MSG:0:100}"
+elif [[ -n "${NORMAL_MSG}" ]]; then
+    ng "期待した回答ではありません: ${NORMAL_MSG:0:150}"
 else
     ng "通常推論に失敗 (curl rc=${NORMAL_RC}): $(printf '%s' "${NORMAL}" | head -c 200)"
 fi

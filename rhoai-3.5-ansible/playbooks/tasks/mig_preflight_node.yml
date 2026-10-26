@@ -1,0 +1,96 @@
+---
+- name: Require MIG-capable hardware
+  ansible.builtin.assert:
+    that: mig_node.metadata.labels['nvidia.com/mig.capable'] | default('false') == 'true'
+    fail_msg: "Node {{ mig_node.metadata.name }} does not report MIG capability"
+- name: Read available MIG profile configuration
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: "{{ item }}"
+    namespace: "{{ _mig_ns }}"
+  loop: >-
+    {{ [_mig_policy.resources[0].spec.migManager.config.name]
+       if (_mig_policy.resources[0].spec.migManager.config.name | default('')) | length > 0
+       else [mig_node.metadata.name ~ '-mig-config', 'default-mig-parted-config'] }}
+  register: _mig_configs
+- name: Select the first existing profile config
+  ansible.builtin.set_fact:
+    _mig_config_docs: "{{ _mig_configs.results | map(attribute='resources') | flatten }}"
+- name: Require a profile configuration
+  ansible.builtin.assert:
+    that: _mig_config_docs | length > 0
+- name: Require a supported profile
+  ansible.builtin.assert:
+    that: mig_profile in ((_mig_config_docs[0].data['config.yaml'] | from_yaml)['mig-configs'])
+    fail_msg: "Profile {{ mig_profile }} is not in the GPU Operator config for {{ mig_node.metadata.name }}"
+- name: Retain the hardware profile for post-apply verification
+  ansible.builtin.set_fact:
+    _mig_node_configs: "{{ _mig_node_configs | combine({mig_node.metadata.name: _mig_config_docs[0].data['config.yaml']}) }}"
+- name: Read the target MIG Manager Pod
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ _mig_ns }}"
+    label_selectors: [app=nvidia-mig-manager]
+    field_selectors: ["spec.nodeName={{ mig_node.metadata.name }}", status.phase=Running]
+  register: _mig_manager_pods
+- name: Require one running manager and prohibit automatic reboot configuration
+  ansible.builtin.assert:
+    that:
+      - _mig_manager_pods.resources | length == 1
+      - >-
+        (_mig_manager_pods.resources[0].spec.containers | selectattr('name', 'equalto', 'nvidia-mig-manager')
+          | map(attribute='env', default=[]) | flatten | selectattr('name', 'equalto', 'WITH_REBOOT')
+          | rejectattr('value', 'defined') | list | length) == 0
+      - >-
+        (_mig_manager_pods.resources[0].spec.containers | selectattr('name', 'equalto', 'nvidia-mig-manager')
+          | map(attribute='env', default=[]) | flatten | selectattr('name', 'equalto', 'WITH_REBOOT')
+          | map(attribute='value') | map('lower') | reject('in', ['false', '0', '']) | list | length) == 0
+    fail_msg: This playbook requires a running MIG Manager without automatic reboot (WITH_REBOOT)
+- name: Identify nodes needing a change
+  ansible.builtin.set_fact:
+    _mig_targets: "{{ _mig_targets + [mig_node] }}"
+  when: >-
+    _mig_strategy_change | bool or
+    mig_node.metadata.labels['nvidia.com/mig.config'] | default('') != mig_profile or
+    mig_node.metadata.labels['nvidia.com/mig.config.state'] | default('') != 'success' or
+    (mig_node.status.allocatable | dict2items | selectattr('key', 'in', _mig_expected.keys()) | items2dict) != _mig_expected
+- name: Find owning MachineSet for profile persistence
+  when: mig_persist_machineset | default(true) | bool
+  block:
+    - name: Require Machine API ownership
+      ansible.builtin.assert:
+        that: mig_node.metadata.annotations['machine.openshift.io/machine'] | default('') is match('^[^/]+/[^/]+$')
+        fail_msg: Use mig_persist_machineset=false for non-Machine-API nodes
+    - name: Read owning Machine
+      kubernetes.core.k8s_info:
+        api_version: machine.openshift.io/v1beta1
+        kind: Machine
+        name: "{{ mig_node.metadata.annotations['machine.openshift.io/machine'].split('/')[1] }}"
+        namespace: "{{ mig_node.metadata.annotations['machine.openshift.io/machine'].split('/')[0] }}"
+      register: _mig_machine
+    - name: Require a MachineSet owner
+      ansible.builtin.assert:
+        that:
+          - _mig_machine.resources | length == 1
+          - _mig_machine.resources[0].metadata.ownerReferences | default([]) | selectattr('kind', 'equalto', 'MachineSet') | list | length == 1
+    - name: Record owning MachineSet
+      ansible.builtin.set_fact:
+        _mig_machinesets: >-
+          {{ _mig_machinesets + [{'namespace': _mig_machine.resources[0].metadata.namespace,
+              'name': (_mig_machine.resources[0].metadata.ownerReferences | selectattr('kind', 'equalto', 'MachineSet') | first).name}] }}
+    - name: Read all Machines sharing this MachineSet
+      kubernetes.core.k8s_info:
+        api_version: machine.openshift.io/v1beta1
+        kind: Machine
+        namespace: "{{ _mig_machine.resources[0].metadata.namespace }}"
+        label_selectors:
+          - "machine.openshift.io/cluster-api-machineset={{ (_mig_machine.resources[0].metadata.ownerReferences | selectattr('kind', 'equalto', 'MachineSet') | first).name }}"
+      register: _mig_siblings
+    - name: Require all existing nodes of the persisted MachineSet to be selected
+      ansible.builtin.assert:
+        that: >-
+          (_mig_siblings.resources | selectattr('status.nodeRef.name', 'defined') | map(attribute='status.nodeRef.name') | list
+           | difference(_mig_nodes.resources | map(attribute='metadata.name') | list)) | length == 0
+        fail_msg: Select all nodes in the MachineSet or set mig_persist_machineset=false; template labels affect every replacement worker

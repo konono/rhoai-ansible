@@ -1,0 +1,61 @@
+---
+- name: Require exactly the requested GPU resource in the live Pod
+  ansible.builtin.assert:
+    that:
+      - _main.resources.requests[_mixed_cfg.gpu_resource] | int == _mixed_cfg.gpu_count | default(1) | int
+      - _main.resources.limits[_mixed_cfg.gpu_resource] | int == _mixed_cfg.gpu_count | default(1) | int
+      - _main.resources.requests | list | select('match', '^nvidia[.]com/(gpu|mig-.*)$') | list == [_mixed_cfg.gpu_resource]
+  vars:
+    _main: "{{ _mixed_pod.spec.containers | selectattr('name', 'equalto', 'main') | first }}"
+- name: Read the model's actual node
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    name: "{{ _mixed_pod.spec.nodeName }}"
+  register: _mixed_node
+- name: Require the configured node labels
+  ansible.builtin.assert:
+    that: _mixed_node.resources[0].metadata.labels[item.key] == item.value
+  loop: "{{ _mixed_cfg.node_selector | default({}) | dict2items }}"
+- name: Inspect actual GPU devices visible inside the model container
+  ansible.builtin.command:
+    argv: [oc, exec, -n, "{{ _mixed_cfg.namespace }}", "{{ _mixed_pod.metadata.name }}", -c, main, --, nvidia-smi, -L]
+  register: _mixed_devices
+  changed_when: false
+- name: Require the requested number of real MIG devices
+  ansible.builtin.assert:
+    that:
+      - _mixed_devices.stdout | regex_findall('UUID[:] (MIG-[^)]+)') | length == _mixed_cfg.gpu_count | default(1) | int
+      - "('MIG ' ~ (_mixed_cfg.gpu_resource | replace('nvidia.com/mig-', ''))) in _mixed_devices.stdout"
+- name: Wait for positive per-Pod inference and DCGM memory metrics in Prometheus
+  ansible.builtin.uri:
+    url: "https://{{ _verify_thanos.resources[0].spec.host }}/api/v1/query?query={{ item.query | urlencode }}"
+    headers:
+      Authorization: "Bearer {{ _verify_monitor_token.stdout | trim }}"
+    validate_certs: false
+    return_content: true
+    timeout: 30
+  loop:
+    - name: inference_success
+      query: 'sum(vllm:request_success_total{namespace="{{ _mixed_cfg.namespace }}",pod="{{ _mixed_pod.metadata.name }}"}) > 0'
+    - name: dcgm_memory
+      query: 'DCGM_FI_DEV_FB_USED{namespace="{{ _mixed_cfg.namespace }}",pod="{{ _mixed_pod.metadata.name }}",GPU_I_PROFILE="MIG {{ _mixed_cfg.gpu_resource | replace("nvidia.com/mig-", "") }}"} > 0'
+  loop_control:
+    label: "{{ item.name }}"
+  register: _mixed_metrics
+  until:
+    - _mixed_metrics is succeeded
+    - _mixed_metrics.json.status | default('') == 'success'
+    - _mixed_metrics.json.data.result | default([]) | length > 0
+  retries: 18
+  delay: 10
+  no_log: true
+- name: Record non-secret verification evidence
+  ansible.builtin.set_fact:
+    _mixed_results: >-
+      {{ _mixed_results + [{'model': _mixed_model.key, 'namespace': _mixed_cfg.namespace,
+          'pod': _mixed_pod.metadata.name, 'node': _mixed_pod.spec.nodeName,
+          'resource': _mixed_cfg.gpu_resource,
+          'mig_uuids': _mixed_devices.stdout | regex_findall('UUID[:] (MIG-[^)]+)'),
+          'nvidia_smi': _mixed_devices.stdout,
+          'metrics': _mixed_metrics.results | map(attribute='json.data.result') | list}] }}

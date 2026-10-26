@@ -1,0 +1,71 @@
+---
+- name: Validate model GPU resource settings
+  ansible.builtin.assert:
+    that:
+      - item.gpu_resource | default('nvidia.com/gpu') is match('^nvidia[.]com/(gpu|mig-[a-zA-Z0-9][a-zA-Z0-9_.-]*)$')
+      - item.gpu_count | default(1) | string is match('^[1-9][0-9]*$')
+      - item.replicas | default(1) | string is match('^[1-9][0-9]*$')
+      - item.node_selector | default({}) is mapping
+      - (item.node_selector | default({})).keys() | reject('string') | list | length == 0
+      - (item.node_selector | default({})).values() | reject('string') | list | length == 0
+    fail_msg: "{{ item.name }}: gpu_resource, gpu_count, replicas, node_selector を確認してください"
+  loop: "{{ _gpu_models }}"
+  loop_control:
+    label: "{{ item.name }}"
+
+- name: Read nodes for GPU capacity checks
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+  register: _capacity_nodes
+
+- name: Count demand separately for each GPU resource
+  ansible.builtin.set_fact:
+    _gpu_demands: >-
+      {%- set demands = {} -%}
+      {%- for model in _gpu_models -%}
+      {%- set key = model.gpu_resource | default('nvidia.com/gpu') -%}
+      {%- set count = (model.gpu_count | default(1) | int) * (model.replicas | default(1) | int) -%}
+      {%- set _ = demands.update({key: demands.get(key, 0) + count}) -%}
+      {%- endfor -%}
+      {{ demands }}
+    _gpu_capacity: >-
+      {%- set capacity = {} -%}
+      {%- for node in _capacity_nodes.resources -%}
+      {%- if not (node.spec.unschedulable | default(false)) -%}
+      {%- for key, value in node.status.allocatable.items() -%}
+      {%- set _ = capacity.update({key: capacity.get(key, 0) + (value | int)}) -%}
+      {%- endfor -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ capacity }}
+
+- name: Require enough capacity of each GPU resource type
+  ansible.builtin.assert:
+    that: item.value | int <= _gpu_capacity.get(item.key, 0) | int
+    fail_msg: "GPU 不足: {{ item.key }} required={{ item.value }}, allocatable={{ _gpu_capacity.get(item.key, 0) }}. state: absent または要求数を調整してください。"
+  loop: "{{ _gpu_demands | dict2items }}"
+
+- name: Check each model fits its selected nodes
+  ansible.builtin.assert:
+    that:
+      - _selected_slots | int >= item.replicas | default(1) | int
+    fail_msg: "{{ item.name }}: {{ item.gpu_resource | default('nvidia.com/gpu') }} x {{ item.gpu_count | default(1) }} / Pod, replicas={{ item.replicas | default(1) }} が node_selector={{ item.node_selector | default({}) }} に収まりません。"
+  vars:
+    _selected_slots: >-
+      {%- set total = namespace(slots=0) -%}
+      {%- for node in _capacity_nodes.resources -%}
+      {%- set selected = namespace(ok=not (node.spec.unschedulable | default(false))) -%}
+      {%- for key, value in (item.node_selector | default({})).items() -%}
+      {%- if (node.metadata.labels | default({})).get(key) != value -%}
+      {%- set selected.ok = false -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {%- if selected.ok -%}
+      {%- set total.slots = total.slots + ((node.status.allocatable.get(item.gpu_resource | default('nvidia.com/gpu'), 0) | int) // (item.gpu_count | default(1) | int)) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ total.slots }}
+  loop: "{{ _gpu_models }}"
+  loop_control:
+    label: "{{ item.name }}"

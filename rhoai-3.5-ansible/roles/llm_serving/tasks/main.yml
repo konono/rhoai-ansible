@@ -31,42 +31,26 @@
         _https_proxy: "{{ _https_proxy | default(_llm_proxy_status.results[1].stdout) }}"
         _no_proxy: "{{ _no_proxy | default(_llm_proxy_status.results[2].stdout) }}"
 
-    # === GPU キャパシティチェック ===
-    - name: Calculate total GPU required by present models
+    # Resource names are independent capacities; never add full GPUs to MIG slices.
+    - name: Resolve present models for GPU capacity checks
       ansible.builtin.set_fact:
-        _required_gpus: >-
-          {{ models | dict2items
-             | selectattr('value.state', 'defined')
-             | selectattr('value.state', 'equalto', 'present')
-             | map(attribute='value')
-             | map(attribute='gpu_count', default=model_defaults.gpu_count)
-             | map('int') | sum
-             + models | dict2items
-               | rejectattr('value.state', 'defined')
-               | map(attribute='value')
-               | map(attribute='gpu_count', default=model_defaults.gpu_count)
-               | map('int') | sum }}
-    
-    - name: Check cluster GPU capacity
-      ansible.builtin.command: >-
-        oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
-      register: _cluster_gpus
-      changed_when: false
-      failed_when: false
-    
-    - name: Warn if GPU capacity insufficient for all present models
-      ansible.builtin.fail:
-        msg: >-
-          GPU 不足: present モデルの合計 GPU 要求数 ({{ _required_gpus }}) が
-          クラスタの GPU 数 ({{ _cluster_gpu_total }}) を超えています。
-          一部のモデルの state を absent に変更するか、gpu_count を調整してください。
-      vars:
-        _cluster_gpu_total: "{{ _cluster_gpus.stdout_lines | default([]) | select('ne', '') | map('int') | sum }}"
-      when:
-        - not (download_only | default(false) | bool)
-        - _cluster_gpus.rc == 0
-        - (_required_gpus | int) > (_cluster_gpu_total | int)
-    
+        _gpu_models: >-
+          {%- set result = [] -%}
+          {%- for name, raw in models.items() -%}
+          {%- set cfg = model_defaults
+              | combine(model_recipes['_fallback'], recursive=True)
+              | combine(model_recipes.get(raw.hf_repo | default(''), {}), recursive=True)
+              | combine(raw, recursive=True) -%}
+          {%- if cfg.state | default('present') == 'present' -%}
+          {%- set _ = result.append(cfg | combine({'name': name})) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {{ result }}
+
+    - name: Validate GPU configuration and capacity before changing workloads
+      ansible.builtin.include_tasks: check_gpu_capacity.yml
+      when: not (download_only | default(false) | bool)
+
     - name: Create llm-serving namespace
       kubernetes.core.k8s:
         state: present
