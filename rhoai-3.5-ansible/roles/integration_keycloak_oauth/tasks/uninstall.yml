@@ -87,12 +87,17 @@
 
     # IdP を外すと oauth-openshift が作り直される。認証が戻るまで見届ける。
     - name: Wait for the authentication ClusterOperator to settle
-      ansible.builtin.command: >-
-        oc get clusteroperator authentication
-        -o jsonpath={range .status.conditions[*]}{.type}={.status}{" "}{end}
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - clusteroperator
+          - authentication
+          - -o
+          - 'jsonpath={range .status.conditions[*]}{.type}={.status}{" "}{end}'
       register: _auth_co
       until: >-
-        'Available=True' in _auth_co.stdout
+        _auth_co.rc == 0 and 'Available=True' in _auth_co.stdout
         and 'Degraded=False' in _auth_co.stdout
       retries: 36
       delay: 10

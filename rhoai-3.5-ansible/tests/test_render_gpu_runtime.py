@@ -182,6 +182,136 @@ class RenderGpuRuntime(unittest.TestCase):
                 self.assertIn('create configmap small-chat-template', calls)
                 if proxy_missing: self.assertIn('No proxy configured', result.stdout)
 
+    def test_guide_preserves_existing_pvc_and_stops_on_read_error(self):
+        base = list(yaml.safe_load_all((self.runtime/'01-base.yml').read_text()))
+        self.assertNotIn('PersistentVolumeClaim', [doc['kind'] for doc in base])
+        pvc = yaml.safe_load((self.runtime/'01-model-cache-pvc.yml').read_text())
+        self.assertEqual(pvc['kind'], 'PersistentVolumeClaim')
+        section = self.guide.split(': LLM Serving\n', 1)[1].split('\n## Step ', 1)[0]
+        block = re.findall(r'```bash\n(.*?)```', section, flags=re.S)[0]
+        for mode in ('existing', 'absent', 'error'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runtime = root/'manifests/09-llm-serving'
+                shutil.copytree(self.runtime, runtime)
+                (runtime/'gpu-models.json').write_text('[]')
+                oc = root/'oc'
+                oc.write_text('#!/bin/sh\n'
+                              'printf "%s\\n" "$*" >> "$GUIDE_CALLS"\n'
+                              'case "$1 $2" in\n'
+                              ' "get nodes") echo \'{"items":[]}\';;\n'
+                              ' "get pvc") '+{'existing': 'echo persistentvolumeclaim/hf-model-cache',
+                                               'absent': ':', 'error': 'exit 1'}[mode]+';;\n'
+                              ' "get proxy") exit 1;;\n'
+                              'esac\n')
+                oc.chmod(0o755)
+                result = subprocess.run(['bash', '-c', block], cwd=root, text=True, capture_output=True,
+                    env={**os.environ, 'PATH': tmp+':'+os.environ['PATH'], 'GUIDE_CALLS': str(root/'calls')})
+                calls = (root/'calls').read_text()
+                self.assertEqual(result.returncode, 1 if mode == 'error' else 0, result.stderr)
+                self.assertEqual('create -f manifests/09-llm-serving/01-model-cache-pvc.yml' in calls,
+                                 mode == 'absent')
+                self.assertNotIn('apply -f manifests/09-llm-serving/01-model-cache-pvc.yml', calls)
+                if mode == 'error':
+                    self.assertNotIn('get clusterstoragecontainer', calls)
+
+    def test_download_runtime_handles_existing_state_and_failures(self):
+        mock = r'''
+import json, os, sys
+from pathlib import Path
+p = Path(os.environ['CASE_DIR']); args = sys.argv[1:]; mode = os.environ['MOCK_MODE']
+with (p/'calls').open('a') as f: f.write(json.dumps(args)+'\n')
+if args[0] == 'create':
+    print((p/'job.json').read_text())
+elif args[:2] == ['get', 'llminferenceservices.v1alpha2.serving.kserve.io']:
+    if mode == 'lis-error': sys.exit(1)
+    if mode == 'ready': print('{"status":{"conditions":[{"type":"Ready","status":"True"}]}}')
+elif args[:2] == ['get', 'job']:
+    if mode == 'job-error': sys.exit(1)
+    if mode == 'active': print('{"status":{"active":1}}')
+    elif mode == 'complete': print('{"status":{"succeeded":1}}')
+    elif mode in ('failed', 'delete-error', 'cache-failed-job'): print('{"status":{"failed":1}}')
+elif args[0] == 'run':
+    sys.exit(0 if mode in ('cache', 'cache-failed-job') else 1)
+elif args[0] == 'delete':
+    assert args[1:3] == ['job', 'download-small']
+    if mode == 'delete-error': sys.exit(1)
+elif args[0] == 'apply':
+    if mode == 'apply-error': sys.exit(1)
+elif args[0] == 'wait':
+    if mode == 'wait-error': sys.exit(1)
+else: sys.exit('unexpected command: '+repr(args))
+'''
+        section = self.guide.split(': LLM Serving\n', 1)[1].split('\n## Step ', 1)[0]
+        self.assertIn('bash manifests/09-llm-serving/llm-download.sh manifests/09-llm-serving/model-small-download.yml', section)
+        self.assertNotIn('oc apply -f manifests/09-llm-serving/model-small-download.yml', section)
+        job = yaml.safe_load((self.runtime/'model-small-download.yml').read_text())
+        for mode in ('ready', 'active', 'complete', 'cache', 'cache-failed-job', 'missing', 'failed',
+                     'lis-error', 'job-error', 'delete-error', 'apply-error', 'wait-error'):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root/'job.json').write_text(json.dumps(job))
+                oc = root/'oc'
+                oc.write_text('#!'+sys.executable+'\n'+mock)
+                oc.chmod(0o755)
+                result = subprocess.run(['bash', str(self.runtime/'llm-download.sh'),
+                                         str(self.runtime/'model-small-download.yml')],
+                    capture_output=True, text=True, timeout=30,
+                    env={**os.environ, 'PATH': tmp+':'+os.environ['PATH'],
+                         'CASE_DIR': tmp, 'MOCK_MODE': mode})
+                calls = [json.loads(line) for line in (root/'calls').read_text().splitlines()]
+                verbs = [call[0] for call in calls]
+                self.assertEqual(result.returncode != 0, mode.endswith('-error'), result.stderr)
+                self.assertEqual('apply' in verbs, mode in ('missing', 'failed', 'apply-error', 'wait-error'))
+                self.assertEqual('delete' in verbs, mode in ('failed', 'delete-error'))
+                self.assertEqual('wait' in verbs, mode in ('active', 'missing', 'failed', 'wait-error'))
+                if mode == 'ready':
+                    self.assertNotIn(['get', 'job'], [c[:2] for c in calls])
+                if mode in ('active', 'complete'):
+                    self.assertNotIn('run', verbs)
+                if mode == 'failed':
+                    self.assertLess(verbs.index('delete'), verbs.index('apply'))
+
+    def test_download_probe_cannot_consume_remaining_guide_commands(self):
+        section = self.guide.split(': LLM Serving\n', 1)[1].split('\n## Step ', 1)[0]
+        block = next(b for b in re.findall(r'```bash\n(.*?)```', section, flags=re.S)
+                     if 'bash manifests/09-llm-serving/llm-download.sh ' in b)
+        job = yaml.safe_load((self.runtime/'model-small-download.yml').read_text())
+        # The downstream deployment is a recorder; the actual generated guide
+        # and download helper run unchanged. The oc run mock consumes all stdin.
+        for mutate in (False, True):
+            with self.subTest(mutate=mutate), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                runtime = root/'manifests/09-llm-serving'
+                shutil.copytree(self.runtime, runtime)
+                (root/'job.json').write_text(json.dumps(job))
+                (runtime/'llm-deploy.sh').write_text('echo reached > "$CASE_DIR/deployed"\n')
+                if mutate:
+                    script = runtime/'llm-download.sh'
+                    original = script.read_text()
+                    self.assertIn(' </dev/null', original)
+                    script.write_text(original.replace(' </dev/null', ''))
+                oc = root/'oc'
+                oc.write_text('#!'+sys.executable+'\n'+r'''
+import os, sys
+from pathlib import Path
+p = Path(os.environ['CASE_DIR'])
+if sys.argv[1] == 'create': print((p/'job.json').read_text())
+elif sys.argv[1] == 'get': pass
+elif sys.argv[1] == 'run': (p/'consumed').write_text(sys.stdin.read())
+else: sys.exit('unexpected command')
+''')
+                oc.chmod(0o755)
+                result = subprocess.run(['bash', '-c', block], cwd=root, text=True, capture_output=True,
+                    timeout=30, env={**os.environ, 'PATH': tmp+':'+os.environ['PATH'], 'CASE_DIR': tmp})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((root/'deployed').exists(), not mutate)
+                consumed = (root/'consumed').read_text()
+                if mutate:
+                    self.assertIn('llm-deploy.sh deploy', consumed)
+                else:
+                    self.assertEqual(consumed, '')
+
     def changed(self):
         live = copy.deepcopy(self.desired)
         live['spec']['template']['containers'][0]['image'] = 'old-image'

@@ -592,6 +592,8 @@ models:
 | GroupSync CR | group-sync-operator |
 
 **Wait**: Keycloak Ready, realm import complete
+
+GroupSync verifies Keycloak TLS using `openshift-config-managed/default-ingress-cert` (`ca-bundle.crt`) directly. Its Subscription sets `WATCH_NAMESPACE=group-sync-operator,openshift-config-managed` so the controller cache can read the managed bundle and follow certificate rotation. No CA copy or insecure TLS override is used. After user/group changes, allow up to five minutes for synchronization before running `verify.yml`. Verification checks current-generation reconciliation and actual OpenShift Group membership; old error conditions can remain after successful recovery.
 **Variables used**: `keycloak_namespace`, `keycloak_realm`, `keycloak_db_password`, `keycloak_users`, `keycloak_groups`, `operator_channels.keycloak`, `operator_channels.group_sync`
 
 #### `llm_serving`
@@ -1000,6 +1002,8 @@ The roles use these removal steps:
 
 > **Notes**:
 > - Back up persistent disks used by PVCs before uninstalling. This is a prerequisite in Red Hat's RHOAI uninstall procedure; the playbook cannot verify that a backup exists.
+> - LLM uninstall deletes `download-*` Jobs that reference `hf-model-cache`, waits for their dependent Pods to disappear, then deletes the cache PVC. Job lookup or deletion failures stop this sequence so a completed Job cannot survive deletion of its cache.
+> - Full RHOAI uninstall also deletes the `llm-serving` namespace. Namespace-local VolumeSnapshots are not sufficient protection with a `Delete` policy; retain the snapshot contents and cloud snapshot handles outside the deleted namespace when using CSI snapshots as backups.
 > - Remove ODF-backed PVCs and OBCs before removing NooBaa. The ODF role waits for all OBCs to disappear and stops if any remain.
 > - The playbook sets the NooBaa deletion policy after OBC removal, following [Red Hat's procedure](https://access.redhat.com/solutions/5948631).
 > - LVM Operator does not automatically delete LVM resources (VG/LV) on nodes. Handle manually if needed
@@ -1326,6 +1330,11 @@ models:
 既存モデルでは image・args・env・resources・mount/probe・volumes・replicas・model URI・
 nodeSelector の変更を比較し、GPU 種別・配置先変更またはローリング更新の容量不足なら
 対象モデルだけを再作成します。変更なしでは削除しません。
+ダウンロードは同梱の `llm-download.sh` が Ansible と同じ順序で判断します。
+Ready なモデルと完了済み Job はスキップし、実行中の Job は完了を待ちます。
+新たなダウンロードが必要な場合は PVC のキャッシュを確認し、キャッシュがなければ
+失敗済み Job を削除して再作成します。既存のモデルキャッシュ PVC は変更せず、
+不在時だけ `01-model-cache-pvc.yml` から作成します。
 旧 Pod の終了待ちは最大 300 秒で、取得エラー・期限超過なら適用へ進まず失敗します。
 原因解消後に同じ手順を再実行してください。適用失敗・Ready 待機失敗も成功扱いにしません。
 手順書の LLM Serving の Bash ブロックは専用の子 Bash 内で実行されるため、

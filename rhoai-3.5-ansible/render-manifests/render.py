@@ -1195,6 +1195,11 @@ class ManifestRenderer:
                                       self.channels.get("group_sync_operator", "alpha"),
                                       source=self.catalogs.get("community", "community-operators"),
                                       target_namespaces=["group-sync-operator"])
+        # The CA is maintained by ingress; include its namespace in the controller cache.
+        gs_op_docs[-1]["spec"]["config"] = {"env": [{
+            "name": "WATCH_NAMESPACE",
+            "value": "group-sync-operator,openshift-config-managed",
+        }]}
         gs_secret = {
             "apiVersion": "v1", "kind": "Secret",
             "metadata": {"name": "keycloak-group-sync", "namespace": "group-sync-operator"},
@@ -1212,6 +1217,8 @@ class ManifestRenderer:
                     "keycloak": {
                         "realm": kc_realm,
                         "credentialsSecret": {"name": "keycloak-group-sync", "namespace": "group-sync-operator"},
+                        "ca": {"kind": "ConfigMap", "name": "default-ingress-cert",
+                               "namespace": "openshift-config-managed", "key": "ca-bundle.crt"},
                         "url": f"https://keycloak-{kc_ns}.<CLUSTER_DOMAIN>",
                         "loginRealm": kc_realm,
                         "scope": "sub",
@@ -1303,8 +1310,13 @@ class ManifestRenderer:
             "oc wait --for=condition=Established crd/groupsyncs.redhatcop.redhat.io --timeout=300s\n"
             f"sed -i.bak \"s/<CLUSTER_DOMAIN>/$CLUSTER_DOMAIN/g\" manifests/06-keycloak/07-group-sync.yml\n"
             f"rm manifests/06-keycloak/07-group-sync.yml.bak\n"
+            "# Ingress の公開証明書チェーンを信頼する（TLS 検証は無効化しない）。\n"
+            "# CA は openshift-config-managed/default-ingress-cert を直接参照し、ローテーションに追従する。\n"
             "oc apply -f manifests/06-keycloak/07-group-sync.yml\n"
             "```\n\n"
+            "GroupSync の確認では現在の generation に対する ReconcileSuccess=True と lastSyncSuccessTime を確認してください。\n"
+            "過去の ReconcileError が残る場合があるため、成功時刻より新しいエラーがないことを確認します。\n"
+            "ユーザー・グループ作成後（同期周期は最大 5 分）、OpenShift Group の users に設定したユーザーが含まれることも確認してください。\n\n"
             "### Keycloak API 操作 (group-sync-sa ロール割当)\n\n"
             "Realm import 後、group-sync-sa ユーザーに realm-management クライアントロールを付与する必要があります。\n"
             "Keycloak UI (Admin Console) から手動で行うか、以下の curl コマンドで実施:\n\n"
@@ -1766,7 +1778,8 @@ class ManifestRenderer:
             "subjects": [{"kind": "ServiceAccount", "name": "llm-serving-sa", "namespace": llm_ns}],
         }
 
-        self._write_manifests("09-llm-serving", "01-base.yml", [ns_doc, hf_secret, pvc, sa, rb])
+        self._write_manifests("09-llm-serving", "01-base.yml", [ns_doc, hf_secret, sa, rb])
+        self._write_manifests("09-llm-serving", "01-model-cache-pvc.yml", [pvc])
         self._write_manifests("09-llm-serving", "02-csc.yml", [csc])
 
         # custom_chat_template は inventory 配下に置いた chat template の名前
@@ -1778,7 +1791,7 @@ class ManifestRenderer:
         # Ship the bash/jq runtime with the output so the manual update path has
         # the same capacity, reservation and recreation decisions as the role.
         runtime_dir = Path(__file__).resolve().parent / "files"
-        for filename in ("llm-deploy.sh", "llm-gpu.jq"):
+        for filename in ("llm-deploy.sh", "llm-gpu.jq", "llm-download.sh"):
             self._write_file("09-llm-serving", filename, (runtime_dir / filename).read_text())
         gpu_models = []
         for name, raw in self.models.items():
@@ -1965,9 +1978,9 @@ class ManifestRenderer:
             model_steps.append(
                 f"### モデル: {model_name} ({model_cfg['hf_repo']})\n\n"
                 f"```bash\n"
-                f"# ダウンロード Job\n"
-                f"oc apply -f manifests/09-llm-serving/model-{model_name}-download.yml || exit 1\n"
-                f"oc wait --for=condition=complete job/download-{model_name} -n {model_cfg['namespace']} --timeout=3600s || exit 1\n\n"
+                f"# Ready・Job 状態・PVC キャッシュを確認し、必要時のみダウンロード\n"
+                f"bash manifests/09-llm-serving/llm-download.sh "
+                f"manifests/09-llm-serving/model-{model_name}-download.yml || exit 1\n\n"
                 f"# GPU 空き確認・変更判定・必要時の再作成・Ready 待機 (bash/oc/jq)\n"
                 f"bash manifests/09-llm-serving/llm-deploy.sh deploy "
                 f"manifests/09-llm-serving/model-{model_name}-deploy.yml || exit 1\n"
@@ -2011,6 +2024,8 @@ class ManifestRenderer:
             "各 Bash ブロックは `bash <<'RHOAI_LLM_STEP'` から終端行までまとめて実行してください。\n"
             "別の Bash プロセス内で失敗時に停止するため、対話シェル自体は終了しません。\n"
             "GPU の判定・適用は同梱の `llm-deploy.sh` と `llm-gpu.jq` で行います。\n"
+            "ダウンロードは `llm-download.sh` で Ready・実行中/完了済み Job・PVC キャッシュを確認し、\n"
+            "必要な場合だけ失敗済み Job を削除して再作成します。既存 PVC は変更しません。\n"
             "Ansible と同じく、全 present モデルの資源別合計・選択ノード容量を先に検査し、\n"
             "新規モデルは使用中 Pod（bound Pending・init/sidecar を含む）を差し引きます。\n"
             "既存モデルは変更されたフィールド・GPU 種別・nodeSelector・容量から更新方法を判定します。\n"
@@ -2023,6 +2038,12 @@ class ManifestRenderer:
             "bash manifests/09-llm-serving/llm-deploy.sh preflight || exit 1\n\n"
             "# Base リソース\n"
             "oc apply -f manifests/09-llm-serving/01-base.yml\n\n"
+            "# role と同じく既存 PVC は変更しない（復元元・容量・StorageClass を保持）\n"
+            "# Proxy の任意取得とは異なり、PVC の取得エラーはここで停止する\n"
+            f"MODEL_CACHE_PVC=$(oc get pvc hf-model-cache -n {llm_ns} --ignore-not-found -o name)\n"
+            "if [ -z \"$MODEL_CACHE_PVC\" ]; then\n"
+            "  oc create -f manifests/09-llm-serving/01-model-cache-pvc.yml\n"
+            "fi\n\n"
             "# ClusterStorageContainer CRD 待機\n"
             "oc wait --for=condition=Established crd/clusterstoragecontainers.serving.kserve.io --timeout=300s\n\n"
             "# ClusterStorageContainer (既存がなければ作成)\n"
@@ -2571,6 +2592,14 @@ define flow self check output
             "  - YAML として読み書きせずテキスト追記で代用すると、末尾改行の無い\n"
             "    既存値や flow style の設定を壊すため、**PyYAML が無い場合は\n"
             "    該当手順が中止する**（黙って劣化した方法に落ちない）。\n\n"
+            "## Operator の待機判定\n\n"
+            "各ステップの「CSV Succeeded 待機」は、適用した Subscription の "
+            "`status.installedCSV` が非空になり、その名前の CSV の `status.phase` が "
+            "`Succeeded` になるまで待つことを意味します。\n"
+            "Subscription の名前と namespace は直前に適用した operator manifest で確認し、"
+            "`oc get subscription <名前> -n <namespace> -o jsonpath='{.status.installedCSV}'` "
+            "で対象 CSV を特定してください。`oc get csv -w` に別 Operator の行や "
+            "`olm.copiedFrom` ラベル付きのコピーが表示されても、それを完了判定に使わないでください。\n\n"
             "## 事前準備\n\n"
             "```bash\n"
             "# クラスターへの接続確認\n"

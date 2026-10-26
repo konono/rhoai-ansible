@@ -42,6 +42,7 @@
         source: "{{ operator_source | default(catalog_sources.redhat) }}"
         sourceNamespace: openshift-marketplace
         installPlanApproval: Automatic
+        config: "{{ operator_config | default(omit) }}"
 
 - name: "Wait for installedCSV of {{ operator_name }}"
   kubernetes.core.k8s_info:
