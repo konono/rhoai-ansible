@@ -56,3 +56,8 @@ catalog_sources:
 maas_db_password: ""
 ogx_db_password: ""
 keycloak_db_password: ""
+
+# ---- MIG (optional; GPU Operator must already support the installed GPU) ----
+# Set the same strategy used by playbooks/configure_mig.yml.
+# Omit for clusters that do not configure MIG. This alone does not partition nodes.
+# gpu_mig_strategy: single

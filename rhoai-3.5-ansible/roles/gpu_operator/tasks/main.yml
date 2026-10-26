@@ -53,6 +53,9 @@
                 honorLabels: true
             gfd:
               enabled: true
+            # Set explicitly when MIG-capable workers are added. Keep existing
+            # operator defaults when an inventory does not configure MIG.
+            mig: "{{ {'strategy': gpu_mig_strategy} if gpu_mig_strategy is defined else omit }}"
             migManager:
               enabled: true
             nodeStatusExporter:

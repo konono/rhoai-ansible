@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import shlex
 import os
 import re
 import secrets
@@ -120,6 +121,8 @@ _MAAS_MANAGED_LABELS = {"app.kubernetes.io/managed-by": "ansible-maas-access"}
 _TEMPLATE_DEFAULT_KEYS = (
     "replicas",
     "gpu_count",
+    "gpu_resource",
+    "node_selector",
     "startup_probe_failure_threshold",
     "startup_probe_period_seconds",
     "resources",
@@ -227,6 +230,8 @@ class ManifestRenderer:
             "chat_template_configmap": "",
             "replicas": 1,
             "gpu_count": 1,
+            "gpu_resource": "nvidia.com/gpu",
+            "node_selector": {},
             # vLLM 引数は hf_repo をキーにした model_recipes から解決する
             # （roles/llm_serving/vars/model_recipes.yml）
             "vllm_args": [],
@@ -606,6 +611,8 @@ class ManifestRenderer:
                 "nodeStatusExporter": {"enabled": True},
             },
         }
+        if "gpu_mig_strategy" in self.cfg:
+            cr_doc["spec"]["mig"] = {"strategy": self.cfg["gpu_mig_strategy"]}
         self._write_manifests("03-deps-gpu", "01-operator.yml", docs)
         self._write_manifests("03-deps-gpu", "02-clusterpolicy.yml", [cr_doc])
         self._step("GPU Operator", (
@@ -1553,6 +1560,15 @@ class ManifestRenderer:
         merged = _fill_missing(merged, {k: role_defaults[k]
                                         for k in _TEMPLATE_DEFAULT_KEYS
                                         if k in role_defaults})
+        if merged.get("state", "present") == "present":
+            if not re.fullmatch(r"nvidia\.com/(gpu|mig-[a-zA-Z0-9][a-zA-Z0-9_.-]*)", str(merged["gpu_resource"])):
+                raise SystemExit("gpu_resource must be nvidia.com/gpu or nvidia.com/mig-<profile>")
+            for key in ("gpu_count", "replicas"):
+                if not re.fullmatch(r"[1-9][0-9]*", str(merged[key])):
+                    raise SystemExit(f"{key} must be a positive integer")
+            selector = merged["node_selector"]
+            if not isinstance(selector, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in selector.items()):
+                raise SystemExit("node_selector must be a mapping of string labels")
         return merged
 
     def _render_maas_policies(self) -> list[dict]:
@@ -1891,8 +1907,8 @@ class ManifestRenderer:
                             "args": vllm_args,
                             "env": vllm_env,
                             "resources": {
-                                "requests": {**{k: str(v) for k, v in res["requests"].items()}, "nvidia.com/gpu": gpu_count},
-                                "limits": {**{k: str(v) for k, v in res["limits"].items()}, "nvidia.com/gpu": gpu_count},
+                                "requests": {**{k: str(v) for k, v in res["requests"].items()}, model_cfg["gpu_resource"]: gpu_count},
+                                "limits": {**{k: str(v) for k, v in res["limits"].items()}, model_cfg["gpu_resource"]: gpu_count},
                             },
                             "startupProbe": {
                                 "httpGet": {"path": "/health", "port": 8000, "scheme": "HTTPS"},
@@ -1904,6 +1920,7 @@ class ManifestRenderer:
                             **({"volumeMounts": volume_mounts} if volume_mounts else {}),
                         }],
                         "tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"}],
+                        **({"nodeSelector": model_cfg["node_selector"]} if model_cfg["node_selector"] else {}),
                         **({"volumes": volumes} if volumes else {}),
                     },
                 },
@@ -1933,12 +1950,30 @@ class ManifestRenderer:
                 self._write_file("09-llm-serving", f"chat_template-{custom_ct}.jinja", src.read_text())
                 cm_names_created.add((cm_name, custom_ct))
 
+            gpu_selector = ",".join(f"{k}={v}" for k, v in model_cfg["node_selector"].items())
+            gpu_query = (
+                'oc get nodes -o json'
+                + (f" -l {shlex.quote(gpu_selector)}" if gpu_selector else "")
+            )
+            # jq reads the literal resource key (dots and slash are not a JSON path).
+            gpu_check = (
+                f"gpu_nodes=$({gpu_query}) || exit 1\n"
+                f"printf '%s' \"$gpu_nodes\" | jq -e --arg r {shlex.quote(model_cfg['gpu_resource'])} "
+                f"--argjson count {model_cfg['gpu_count']} --argjson replicas {model_cfg['replicas']} "
+                "'[.items[] | select(.spec.unschedulable != true) | "
+                "((.status.allocatable[$r] // \"0\" | tonumber) / $count | floor)] | "
+                "(add // 0) >= $replicas' >/dev/null || { echo 'GPU capacity insufficient'; exit 1; }\n"
+            )
             model_steps.append(
                 f"### モデル: {model_name} ({model_cfg['hf_repo']})\n\n"
                 f"```bash\n"
                 f"# ダウンロード Job\n"
                 f"oc apply -f manifests/09-llm-serving/model-{model_name}-download.yml\n"
                 f"oc wait --for=condition=complete job/download-{model_name} -n {model_cfg['namespace']} --timeout=3600s\n\n"
+                f"# 選択ノードの {model_cfg['gpu_resource']} 容量確認 (jq 必須)\n"
+                + gpu_check
+                + f"# 使用中の Pod も確認し、空き容量が不足する場合はここで停止してください。\n"
+                f"oc get pods -A -o wide\n"
                 f"# LLMInferenceService デプロイ\n"
                 f"oc apply -f manifests/09-llm-serving/model-{model_name}-deploy.yml\n"
                 f"```\n\n"
@@ -2513,6 +2548,7 @@ define flow self check output
             "## 前提条件\n\n"
             "- `oc` コマンドがインストール済みで、クラスターに admin 権限でログイン済み\n"
             "- `KUBECONFIG` が適切に設定されている\n"
+            "- `jq` がインストール済み（LLM の GPU 容量確認に使用）\n"
             "- `manual-deploy-guide.md` があるディレクトリから作業する\n"
             "- `python3` + **PyYAML** (`pip install pyyaml`)\n"
             "  - Observability の手順で `cluster-monitoring-config` の既存設定を\n"

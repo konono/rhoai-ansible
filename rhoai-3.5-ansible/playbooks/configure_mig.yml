@@ -1,0 +1,173 @@
+---
+# Plan by default. Apply with -e mig_apply=true. Never drains/reboots nodes.
+- name: Configure MIG on explicitly selected GPU workers
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    _mig_ns: "{{ mig_operator_namespace | default('nvidia-gpu-operator') }}"
+    _mig_policy_name: "{{ mig_cluster_policy | default('gpu-cluster-policy') }}"
+    _apply_mig: "{{ mig_apply | default(false) | bool and not ansible_check_mode }}"
+  tasks:
+    - name: Require explicit target and expected GPU capacity
+      ansible.builtin.assert:
+        that:
+          - mig_node_selector is defined and mig_node_selector | length > 0
+          - mig_profile is defined and mig_profile | length > 0
+          - gpu_mig_strategy | default('') in ['single', 'mixed']
+          - mig_expected_resources is defined and mig_expected_resources | length > 0
+    - name: Require the disable profile when invoked by disable_mig.yml
+      ansible.builtin.assert:
+        that:
+          - mig_profile == 'all-disabled'
+          - mig_expected_resources == mig_full_gpu_resources
+      when: mig_disable_mode | default(false) | bool
+    - name: Validate expected resource names and counts
+      ansible.builtin.assert:
+        that:
+          - item.key is match('^nvidia.com/(gpu$|mig-)')
+          - item.value | int > 0
+      loop: "{{ mig_expected_resources | dict2items }}"
+    - name: Normalize expected resource quantities
+      ansible.builtin.set_fact:
+        _mig_expected: "{{ _mig_expected | default({}) | combine({item.key: item.value | string}) }}"
+      loop: "{{ mig_expected_resources | dict2items }}"
+    - name: Read GPU Operator policy
+      kubernetes.core.k8s_info:
+        api_version: nvidia.com/v1
+        kind: ClusterPolicy
+        name: "{{ _mig_policy_name }}"
+      register: _mig_policy
+    - name: Require an installed MIG Manager
+      ansible.builtin.assert:
+        that:
+          - _mig_policy.resources | length == 1
+          - _mig_policy.resources[0].spec.migManager.enabled | default(false) | bool
+    - name: Read explicitly selected nodes
+      kubernetes.core.k8s_info:
+        api_version: v1
+        kind: Node
+        label_selectors: ["{{ mig_node_selector }}"]
+      register: _mig_nodes
+    - name: Require matching nodes
+      ansible.builtin.assert:
+        that: _mig_nodes.resources | length > 0
+    - name: Initialize plan
+      ansible.builtin.set_fact:
+        _mig_targets: []
+        _mig_node_configs: {}
+        _mig_machinesets: []
+        _mig_cordoned: []
+        _mig_strategy_change: "{{ _mig_policy.resources[0].spec.mig.strategy | default('none') != gpu_mig_strategy }}"
+    - name: Validate capabilities, profile and MachineSet ownership for each node
+      ansible.builtin.include_tasks: tasks/mig_preflight_node.yml
+      loop: "{{ _mig_nodes.resources }}"
+      loop_control:
+        loop_var: mig_node
+        label: "{{ mig_node.metadata.name }}"
+    - name: Check for GPU workloads before any mutation
+      ansible.builtin.include_tasks: tasks/mig_check_workloads.yml
+    - name: Show MIG plan
+      ansible.builtin.debug:
+        msg:
+          nodes: "{{ _mig_nodes.resources | map(attribute='metadata.name') | list }}"
+          reconfigure: "{{ _mig_targets | map(attribute='metadata.name') | list }}"
+          strategy_change: "{{ _mig_strategy_change }}"
+          profile: "{{ mig_profile }}"
+          expected_resources: "{{ _mig_expected }}"
+          machinesets: "{{ _mig_machinesets | unique }}"
+    - name: Apply MIG configuration
+      when: _apply_mig | bool
+      block:
+        - name: Cordon only nodes that need reconfiguration
+          kubernetes.core.k8s:
+            state: patched
+            definition:
+              apiVersion: v1
+              kind: Node
+              metadata:
+                name: "{{ item.metadata.name }}"
+              spec:
+                unschedulable: true
+          loop: "{{ _mig_targets }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+          when: not (item.spec.unschedulable | default(false) | bool)
+        - name: Remember nodes that were originally schedulable
+          ansible.builtin.set_fact:
+            _mig_cordoned: "{{ _mig_cordoned + [item.metadata.name] }}"
+          loop: "{{ _mig_targets }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+          when: not (item.spec.unschedulable | default(false) | bool)
+        - name: Recheck GPU workloads after cordon
+          ansible.builtin.include_tasks: tasks/mig_check_workloads.yml
+        - name: Set GPU Operator MIG strategy
+          kubernetes.core.k8s:
+            state: patched
+            definition:
+              apiVersion: nvidia.com/v1
+              kind: ClusterPolicy
+              metadata:
+                name: "{{ _mig_policy_name }}"
+              spec:
+                mig:
+                  strategy: "{{ gpu_mig_strategy }}"
+          when: _mig_strategy_change | bool
+        - name: Set MIG profile and invalidate the previous success label atomically
+          kubernetes.core.k8s:
+            state: patched
+            merge_type: merge
+            definition:
+              apiVersion: v1
+              kind: Node
+              metadata:
+                name: "{{ item.metadata.name }}"
+                labels: >-
+                  {{ {'nvidia.com/mig.config': mig_profile} | combine(
+                     {'nvidia.com/mig.config.state': none}
+                     if (item.metadata.labels['nvidia.com/mig.config'] | default('')) != mig_profile else {}) }}
+          loop: "{{ _mig_targets }}"
+          loop_control:
+            label: "{{ item.metadata.name }}"
+        - name: Wait for each node to report successful MIG configuration and expected capacity
+          ansible.builtin.include_tasks: tasks/mig_wait_node.yml
+          loop: "{{ _mig_nodes.resources }}"
+          loop_control:
+            loop_var: mig_node
+            label: "{{ mig_node.metadata.name }}"
+        - name: Persist successful profile for replacement workers
+          kubernetes.core.k8s:
+            state: patched
+            definition:
+              apiVersion: machine.openshift.io/v1beta1
+              kind: MachineSet
+              metadata:
+                name: "{{ item.name }}"
+                namespace: "{{ item.namespace }}"
+              spec:
+                template:
+                  spec:
+                    metadata:
+                      labels:
+                        nvidia.com/mig.config: "{{ mig_profile }}"
+          loop: "{{ _mig_machinesets | unique }}"
+        - name: Restore originally schedulable nodes after successful verification
+          kubernetes.core.k8s:
+            state: patched
+            definition:
+              apiVersion: v1
+              kind: Node
+              metadata:
+                name: "{{ item }}"
+              spec:
+                unschedulable: false
+          loop: "{{ _mig_cordoned }}"
+      rescue:
+        - name: Leave failed reconfiguration cordoned for diagnosis
+          ansible.builtin.fail:
+            msg: >-
+              MIG configuration failed. No workload was evicted or node rebooted.
+              Inspect MIG Manager logs and nvidia.com/mig.config.state.
+              Reconfiguration targets may remain cordoned: {{ _mig_targets | map(attribute='metadata.name') | list }}.
+              Original failure: {{ ansible_failed_result.msg | default(ansible_failed_result) }}

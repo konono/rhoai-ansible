@@ -1,0 +1,50 @@
+---
+- name: "Wait for MIG convergence on {{ mig_node.metadata.name }}"
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    name: "{{ mig_node.metadata.name }}"
+  register: _mig_wait
+  until:
+    - _mig_wait.resources | length == 1
+    - _mig_wait.resources[0].metadata.labels['nvidia.com/mig.config'] | default('') == mig_profile
+    - _mig_wait.resources[0].metadata.labels['nvidia.com/mig.config.state'] | default('') == 'success'
+    - (_mig_wait.resources[0].status.allocatable | dict2items | selectattr('key', 'in', _mig_expected.keys()) | items2dict) == _mig_expected
+    - _mig_wait.resources[0].status.conditions | selectattr('type', 'equalto', 'Ready') | selectattr('status', 'equalto', 'True') | list | length > 0
+  retries: "{{ (mig_ready_timeout | default(1200) | int // 10) | int }}"
+  delay: 10
+- name: Find the running MIG Manager for hardware verification
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: "{{ _mig_ns }}"
+    label_selectors: [app=nvidia-mig-manager]
+    field_selectors: ["spec.nodeName={{ mig_node.metadata.name }}", status.phase=Running]
+  register: _mig_assert_pods
+  until: _mig_assert_pods.resources | length == 1
+  retries: 30
+  delay: 10
+- name: Verify actual GPU partition geometry with NVIDIA MIG Parted (read-only)
+  ansible.builtin.command:
+    argv:
+      - oc
+      - exec
+      - -i
+      - -n
+      - "{{ _mig_ns }}"
+      - "{{ _mig_assert_pods.resources[0].metadata.name }}"
+      - -c
+      - nvidia-mig-manager
+      - --
+      - nvidia-mig-parted
+      - assert
+      - --config-file
+      - /dev/stdin
+      - --selected-config
+      - "{{ mig_profile }}"
+    stdin: "{{ _mig_node_configs[mig_node.metadata.name] }}"
+  register: _mig_hardware_assert
+  changed_when: false
+  until: _mig_hardware_assert.rc == 0
+  retries: 30
+  delay: 10

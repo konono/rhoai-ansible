@@ -25,6 +25,9 @@ spec:
         - name: maas-default-gateway
           namespace: openshift-ingress
   template:
+{% if _model_cfg.node_selector | default({}) %}
+    nodeSelector: {{ _model_cfg.node_selector | to_json }}
+{% endif %}
     containers:
       - name: main
         image: {{ _model_cfg.vllm_image }}
@@ -90,11 +93,11 @@ spec:
           requests:
             cpu: "{{ _req.cpu | default('500m') }}"
             memory: {{ _req.memory | default('4Gi') }}
-            nvidia.com/gpu: "{{ _model_cfg.gpu_count | default(1) }}"
+            "{{ _model_cfg.gpu_resource | default('nvidia.com/gpu') }}": "{{ _model_cfg.gpu_count | default(1) }}"
           limits:
             cpu: "{{ _lim.cpu | default('2') }}"
             memory: {{ _lim.memory | default('8Gi') }}
-            nvidia.com/gpu: "{{ _model_cfg.gpu_count | default(1) }}"
+            "{{ _model_cfg.gpu_resource | default('nvidia.com/gpu') }}": "{{ _model_cfg.gpu_count | default(1) }}"
         startupProbe:
           httpGet:
             path: /health

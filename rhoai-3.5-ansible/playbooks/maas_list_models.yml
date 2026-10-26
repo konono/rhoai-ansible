@@ -1,0 +1,26 @@
+---
+# Show the actual OpenAI-compatible model list visible to an inventory user.
+# A temporary API key is issued and revoked; policies are not modified.
+- name: List models visible through the MaaS Gateway
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  vars:
+    maas_api_user: ""
+  tasks:
+    - name: Select an inventory user
+      ansible.builtin.set_fact:
+        _list_user: "{{ maas_api_user if maas_api_user | length > 0 else (keycloak_users | default([]) | map(attribute='username') | first | default('')) }}"
+    - name: Resolve only the groups configured for this user
+      ansible.builtin.set_fact:
+        _list_groups: "{{ keycloak_users | default([]) | selectattr('username', 'equalto', _list_user) | map(attribute='groups') | first | default([]) }}"
+    - name: Require an explicitly configured identity
+      ansible.builtin.assert:
+        that:
+          - _list_user | length > 0
+          - _list_groups | length > 0
+    - name: Query the Gateway model list
+      ansible.builtin.include_tasks: tasks/maas_list_models.yml

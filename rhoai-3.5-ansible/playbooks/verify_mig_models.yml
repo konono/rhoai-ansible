@@ -1,0 +1,168 @@
+---
+# Verify already deployed mixed-MIG models. Does not change MIG or delete workloads.
+# -i inventory/<env> -e @models.yml
+# Optional: -e mig_verification_output=/absolute/path/result.json
+- name: Verify inference through the existing Ansible workflow
+  ansible.builtin.import_playbook: llm_verify_inference.yml
+  vars:
+    inference_max_tokens: 64
+    inference_prompt: Explain what a GPU does in one short sentence.
+
+- name: Verify mixed MIG assignment and collected metrics
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  environment:
+    K8S_AUTH_KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+    KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
+  tasks:
+    - name: Require facts from the inference verification play
+      ansible.builtin.assert:
+        that:
+          - _targets is defined
+          - _rd is defined
+          - model_recipes is defined
+        fail_msg: Run this playbook from its first play to initialize model configuration.
+    - name: Initialize mixed MIG targets
+      ansible.builtin.set_fact:
+        _mixed_targets: []
+    - name: Select models with a resolved mixed MIG resource
+      ansible.builtin.set_fact:
+        _mixed_targets: "{{ _mixed_targets + [_mixed_model] }}"
+      loop: "{{ _targets }}"
+      loop_control:
+        loop_var: _mixed_model
+        label: "{{ _mixed_model.key }}"
+      vars:
+        _mixed_cfg: >-
+          {{ model_defaults | default(_rd.model_defaults)
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(_mixed_model.value.hf_repo | default(''), {}), recursive=True)
+             | combine(_mixed_model.value, recursive=True) }}
+      when: _mixed_cfg.gpu_resource | default('') is match('^nvidia[.]com/mig-')
+    - name: Require at least one mixed MIG model
+      ansible.builtin.assert:
+        that: _mixed_targets | length > 0
+        fail_msg: No selected model uses an nvidia.com/mig-* resource. Full GPU models only receive the direct inference check.
+    - name: Read the cluster MIG strategy
+      kubernetes.core.k8s_info:
+        api_version: nvidia.com/v1
+        kind: ClusterPolicy
+        name: "{{ mig_cluster_policy | default('gpu-cluster-policy') }}"
+      register: _verify_policy
+    - name: Require mixed strategy
+      ansible.builtin.assert:
+        that:
+          - _verify_policy.resources | length == 1
+          - _verify_policy.resources[0].spec.mig.strategy == 'mixed'
+    - name: Find Prometheus query route
+      kubernetes.core.k8s_info:
+        api_version: route.openshift.io/v1
+        kind: Route
+        name: thanos-querier
+        namespace: openshift-monitoring
+      register: _verify_thanos
+    - name: Obtain a short-lived monitoring token without printing it
+      ansible.builtin.command:
+        argv:
+          - oc
+          - create
+          - token
+          - "{{ mig_metrics_serviceaccount | default('perses-sa') }}"
+          - -n
+          - "{{ mig_metrics_namespace | default('openshift-cluster-observability-operator') }}"
+          - --duration=10m
+      register: _verify_monitor_token
+      changed_when: false
+      no_log: true
+    - name: Initialize verification results
+      ansible.builtin.set_fact:
+        _mixed_results: []
+    - name: Verify each selected model
+      ansible.builtin.include_tasks: tasks/verify_mig_model.yml
+      loop: "{{ _mixed_targets }}"
+      loop_control:
+        loop_var: _mixed_model
+        label: "{{ _mixed_model.key }}"
+      vars:
+        _mixed_cfg: >-
+          {{ model_defaults | default(_rd.model_defaults)
+             | combine(model_recipes['_fallback'], recursive=True)
+             | combine(model_recipes.get(_mixed_model.value.hf_repo | default(''), {}), recursive=True)
+             | combine(_mixed_model.value, recursive=True) }}
+    - name: Require separate MIG devices for the tested Pods
+      ansible.builtin.assert:
+        that: >-
+          (_mixed_results | map(attribute='mig_uuids') | flatten | unique | length)
+          == (_mixed_results | map(attribute='mig_uuids') | flatten | length)
+    - name: Verify concurrent inference across the MIG devices
+      block:
+        - name: Launch three concurrent requests per replica
+          ansible.builtin.command:
+            argv:
+              - oc
+              - exec
+              - -n
+              - "{{ item.0.namespace }}"
+              - "{{ item.0.pod }}"
+              - -c
+              - main
+              - --
+              - curl
+              - -skfS
+              - --max-time
+              - '60'
+              - https://localhost:8000/v1/chat/completions
+              - -H
+              - 'Content-Type: application/json'
+              - -d
+              - >-
+                {{ {'model': item.0.model,
+                    'messages': [{'role': 'user', 'content': 'Explain what a GPU does in one sentence.'}],
+                    'max_tokens': 64, 'chat_template_kwargs': {'enable_thinking': false}} | to_json }}
+          loop: "{{ _mixed_results | product(range(3)) | list }}"
+          loop_control:
+            label: "{{ item.0.model }} #{{ item.1 + 1 }}"
+          async: 90
+          poll: 0
+          changed_when: false
+          register: _mixed_requests
+        - name: Wait for all concurrent responses
+          ansible.builtin.async_status:
+            jid: "{{ item.ansible_job_id }}"
+          loop: "{{ _mixed_requests.results }}"
+          loop_control:
+            label: "{{ item.item.0.model }} #{{ item.item.1 + 1 }}"
+          register: _mixed_completed
+          until: _mixed_completed.finished
+          retries: 35
+          delay: 3
+          changed_when: false
+        - name: Require a successful nonempty answer from every request
+          ansible.builtin.assert:
+            that:
+              - item.rc == 0
+              - (item.stdout | from_json).choices[0].message.content | default('', true) | trim | length > 0
+          loop: "{{ _mixed_completed.results }}"
+          loop_control:
+            label: "{{ item.item.item.0.model }}"
+      always:
+        - name: Remove local async job records
+          ansible.builtin.async_status:
+            jid: "{{ item.ansible_job_id }}"
+            mode: cleanup
+          loop: "{{ _mixed_requests.results | default([]) | selectattr('ansible_job_id', 'defined') | list }}"
+          loop_control:
+            label: "{{ item.ansible_job_id }}"
+    - name: Display validated model placements and metrics
+      ansible.builtin.debug:
+        var: _mixed_results
+    - name: Save verification evidence
+      ansible.builtin.copy:
+        dest: "{{ mig_verification_output }}"
+        content: >-
+          {{ {'status': 'PASS', 'strategy': 'mixed', 'models': _mixed_results,
+              'concurrent_responses': _mixed_completed.results | map(attribute='stdout') | map('from_json') | list}
+             | to_nice_json }}
+        mode: '0600'
+      when: mig_verification_output is defined

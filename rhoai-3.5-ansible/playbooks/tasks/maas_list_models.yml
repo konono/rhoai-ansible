@@ -1,0 +1,109 @@
+---
+- name: Read the MaaS Gateway
+  kubernetes.core.k8s_info:
+    api_version: gateway.networking.k8s.io/v1
+    kind: Gateway
+    name: maas-default-gateway
+    namespace: openshift-ingress
+  register: _list_gateway
+- name: Read the MaaS Gateway Service
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Service
+    namespace: openshift-ingress
+    label_selectors: [gateway.networking.k8s.io/gateway-name=maas-default-gateway]
+  register: _list_service
+- name: Read the MaaS API Pod
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Pod
+    namespace: redhat-ai-gateway-infra
+    label_selectors: [app.kubernetes.io/name=maas-api]
+    field_selectors: [status.phase=Running]
+  register: _list_api
+- name: Query with a temporary key and always revoke it
+  block:
+    - name: Issue a model-list verification key
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - redhat-ai-gateway-infra
+          - "{{ _list_api.resources[0].metadata.name }}"
+          - --
+          - curl
+          - -skfS
+          - --max-time
+          - '30'
+          - -X
+          - POST
+          - https://localhost:8443/v1/api-keys
+          - -H
+          - "X-MaaS-Username: {{ _list_user }}"
+          - -H
+          - "X-MaaS-Group: {{ _list_groups | to_json }}"
+          - -H
+          - 'Content-Type: application/json'
+          - -d
+          - '{"name":"verify-model-list"}'
+      register: _list_key
+      no_log: true
+      changed_when: true
+    - name: Fetch the real OpenAI-compatible model list through the Gateway
+      ansible.builtin.command:
+        argv: [oc, exec, -i, -n, redhat-ai-gateway-infra, "{{ _list_api.resources[0].metadata.name }}", --, curl, --config, '-']
+        stdin: |
+          url = {{ ('https://' ~ _list_gateway.resources[0].spec.listeners[0].hostname ~ '/v1/models') | to_json }}
+          resolve = {{ (_list_gateway.resources[0].spec.listeners[0].hostname ~ ':443:' ~ _list_service.resources[0].spec.clusterIP) | to_json }}
+          header = {{ ('Authorization: Bearer ' ~ (_list_key.stdout | from_json).key) | to_json }}
+          insecure
+          silent
+          show-error
+          fail
+          max-time = 30
+      register: _list_response
+      changed_when: false
+      no_log: true
+    - name: Display the list visible to this identity
+      ansible.builtin.debug:
+        msg:
+          user: "{{ _list_user }}"
+          base_url: "https://{{ _list_gateway.resources[0].spec.listeners[0].hostname }}/v1"
+          models: "{{ _list_response.stdout | from_json }}"
+    - name: Save the response without the API key
+      ansible.builtin.copy:
+        dest: "{{ maas_model_list_output }}"
+        content: "{{ _list_response.stdout | from_json | to_nice_json }}\n"
+        mode: '0600'
+      when: maas_model_list_output is defined
+  always:
+    - name: Revoke the temporary model-list key
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - redhat-ai-gateway-infra
+          - "{{ _list_api.resources[0].metadata.name }}"
+          - --
+          - curl
+          - -skS
+          - --max-time
+          - '30'
+          - -o
+          - /dev/null
+          - -w
+          - '%{http_code}'
+          - -X
+          - DELETE
+          - "https://localhost:8443/v1/api-keys/{{ (_list_key.stdout | from_json).id }}"
+          - -H
+          - "X-MaaS-Username: {{ _list_user }}"
+          - -H
+          - "X-MaaS-Group: {{ _list_groups | to_json }}"
+      register: _list_revoke
+      failed_when: _list_revoke.stdout not in ['200', '204']
+      changed_when: true
+      no_log: true
+      when: _list_key.stdout is defined and _list_key.rc | default(1) == 0

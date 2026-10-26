@@ -5,106 +5,10 @@
 # Required vars: _model_name, _model_cfg
 # =============================================================================
 
-- name: "Check cluster GPU capacity"
-  ansible.builtin.command: >-
-    oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
-  register: _gpu_allocatable
-  changed_when: false
-  failed_when: false
-  when: not (_model_already_ready | bool)
-
-- name: "Check GPU usage by running pods"
-  ansible.builtin.shell: |
-    oc get pods -A --field-selector=status.phase=Running -o json | \
-      python3 -c "
-    import sys,json
-    data = json.load(sys.stdin)
-    total = 0
-    for pod in data.get('items', []):
-      for c in pod.get('spec', {}).get('containers', []):
-        gpu = c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', '0')
-        total += int(gpu)
-    print(total)
-    "
-  register: _gpu_used
-  changed_when: false
-  failed_when: false
-  when: not (_model_already_ready | bool)
-
-- name: "Determine GPU availability"
-  ansible.builtin.set_fact:
-    _total_gpus: "{{ _gpu_allocatable.stdout_lines | select('ne', '') | map('int') | sum }}"
-    _used_gpus: "{{ _gpu_used.stdout | trim | int }}"
-    _needed_gpus: "{{ _model_cfg.gpu_count }}"
-  when: not (_model_already_ready | bool)
-
-- name: "Calculate GPU deficit"
-  ansible.builtin.set_fact:
-    _available_gpus: "{{ (_total_gpus | int) - (_used_gpus | int) }}"
-    _gpu_deficit: "{{ (_needed_gpus | int) - ((_total_gpus | int) - (_used_gpus | int)) }}"
-  when: not (_model_already_ready | bool)
-
-- name: "Display GPU status"
-  ansible.builtin.debug:
-    msg: >-
-      GPU: total={{ _total_gpus }}, used={{ _used_gpus }}, available={{ _available_gpus }},
-      needed={{ _needed_gpus }}, deficit={{ _gpu_deficit }}
-  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
-
-- name: "Find GPU-consuming deployments to scale down"
-  ansible.builtin.shell: |
-    oc get pods -n {{ _model_cfg.namespace }} --field-selector=status.phase=Running -o json | \
-      python3 -c "
-    import sys,json
-    data = json.load(sys.stdin)
-    deployments = set()
-    for pod in data.get('items', []):
-      for c in pod.get('spec', {}).get('containers', []):
-        gpu = c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', '0')
-        if int(gpu) > 0:
-          for ref in pod.get('metadata', {}).get('ownerReferences', []):
-            if ref.get('kind') == 'ReplicaSet':
-              rs = ref['name']
-              deploy = '-'.join(rs.split('-')[:-1])
-              deployments.add(deploy)
-    for d in sorted(deployments):
-      print(d)
-    "
-  register: _gpu_deployments
-  changed_when: false
-  failed_when: false
-  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
-
-- name: "Scale down GPU deployments for reallocation"
-  ansible.builtin.command: >-
-    oc scale deployment/{{ _gpu_deploy }} -n {{ _model_cfg.namespace }} --replicas=0
-  register: _scale_down
-  changed_when: "'scaled' in _scale_down.stdout"
-  failed_when: false
-  loop: "{{ _gpu_deployments.stdout_lines | default([]) }}"
-  loop_control:
-    loop_var: _gpu_deploy
-  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
-
-- name: "Wait for GPU release"
-  ansible.builtin.shell: |
-    oc get pods -n {{ _model_cfg.namespace }} --field-selector=status.phase=Running -o json | \
-      python3 -c "
-    import sys,json
-    data = json.load(sys.stdin)
-    total = 0
-    for pod in data.get('items', []):
-      for c in pod.get('spec', {}).get('containers', []):
-        gpu = c.get('resources', {}).get('requests', {}).get('nvidia.com/gpu', '0')
-        total += int(gpu)
-    print(total)
-    "
-  register: _remaining_gpu
-  until: (_remaining_gpu.stdout | trim | int) <= ((_total_gpus | int) - (_needed_gpus | int))
-  retries: 30
-  delay: 5
-  changed_when: false
-  when: not (_model_already_ready | bool) and (_gpu_deficit | default(0) | int) > 0
+# Read-only check. Never scale down unrelated models to make space.
+- name: Check available model GPU resources
+  ansible.builtin.include_tasks: check_gpu_available.yml
+  when: _existing_lis.resources | length == 0
 
 - name: "Wait for llmisvc webhook endpoint ready ({{ _model_name }})"
   ansible.builtin.command: >-
@@ -143,6 +47,8 @@
          or (_cur.resources | default({})) != (_new.resources | default({}))
          or (_cur.volumeMounts | default([])) != (_new.volumeMounts | default([]))
          or (_cur.startupProbe | default({})) != (_new.startupProbe | default({}))
+         or (_existing_lis.resources[0].spec.template.nodeSelector | default({}))
+            != (_desired_lis.spec.template.nodeSelector | default({}))
          or (_existing_lis.resources[0].spec.template.volumes | default([]))
             != (_desired_lis.spec.template.volumes | default([]))
          or (_existing_lis.resources[0].spec.replicas | default(1))
@@ -166,19 +72,33 @@
 # 全 GPU 数が必要数の 2 倍に満たない場合は、更新ではなく作り直す。
 #
 # 変更が無ければ問い合わせ自体が不要なので、比較の後に実行する。
-- name: "Check total cluster GPUs for rollout strategy ({{ _model_name }})"
-  ansible.builtin.command: >-
-    oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
-  register: _rollout_gpus
-  changed_when: false
+- name: Read selected nodes for rollout strategy
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Node
+    label_selectors: "{{ _gpu_node_selectors }}"
+  vars:
+    _gpu_node_selectors: >-
+      {%- set selectors = [] -%}
+      {%- for key, value in (_model_cfg.node_selector | default({})).items() -%}
+      {%- set _ = selectors.append(key ~ '=' ~ value) -%}
+      {%- endfor -%}
+      {{ selectors }}
+  register: _rollout_nodes
   when:
     - _existing_lis.resources | length > 0
     - _lis_spec_changed | default(false) | bool
 
-- name: "Set the total cluster GPU count ({{ _model_name }})"
+- name: Count selected GPU resources for rollout
   ansible.builtin.set_fact:
     _rollout_gpu_total: >-
-      {{ _rollout_gpus.stdout_lines | default([]) | select('ne', '') | map('int') | sum }}
+      {%- set total = namespace(value=0) -%}
+      {%- for node in _rollout_nodes.resources -%}
+      {%- if not (node.spec.unschedulable | default(false)) -%}
+      {%- set total.value = total.value + (node.status.allocatable.get(_model_cfg.gpu_resource | default('nvidia.com/gpu'), 0) | int) -%}
+      {%- endif -%}
+      {%- endfor -%}
+      {{ total.value }}
   when:
     - _existing_lis.resources | length > 0
     - _lis_spec_changed | default(false) | bool
@@ -193,18 +113,30 @@
       「ローリング更新で足りるか / 作り直しが必要か」を判定できず、
       稼働中の {{ _model_name }} を誤って削除する恐れがあるため停止します。
       次が通るか確認してください:
-      oc get nodes -o jsonpath='{range .items[*]}{.status.allocatable.nvidia\.com/gpu}{"\n"}{end}'
+      oc get nodes -o yaml (resource={{ _model_cfg.gpu_resource | default('nvidia.com/gpu') }})
   when:
     - _existing_lis.resources | length > 0
     - _lis_spec_changed | default(false) | bool
     - (_rollout_gpu_total | default(0) | int) <= 0
 
+# Resource / selector key removal cannot be expressed by omitting keys in a merge patch.
+# Recreate on those changes so stale GPU requests and node labels cannot survive.
 - name: "Decide whether an in-place update can roll ({{ _model_name }})"
   ansible.builtin.set_fact:
     _needs_recreate: >-
       {{ _existing_lis.resources | length > 0
          and (_lis_spec_changed | default(false) | bool)
-         and ((_rollout_gpu_total | default(0) | int) < ((_model_cfg.gpu_count | int) * 2)) }}
+         and (
+           ((_rollout_gpu_total | default(0) | int) < ((_model_cfg.gpu_count | int) * (_model_cfg.replicas | default(1) | int) * 2))
+           or ((_existing_lis.resources[0].spec.template.nodeSelector | default({}))
+               != (_desired_lis.spec.template.nodeSelector | default({})))
+           or ((_current_gpu_keys | sort) != [_model_cfg.gpu_resource | default('nvidia.com/gpu')])
+         ) }}
+  vars:
+    _current_gpu_keys: >-
+      {{ ((_existing_lis.resources[0].spec.template.containers | selectattr('name', 'equalto', 'main') | first).resources.requests
+          | default({}) | list | select('match', '^nvidia[.]com/(gpu|mig-.*)$') | list)
+         if _existing_lis.resources | length > 0 else [] }}
 
 - name: "Report the update strategy ({{ _model_name }})"
   ansible.builtin.debug:
@@ -212,7 +144,7 @@
       {{ '変更なし。LLMInferenceService はそのまま'
          if _existing_lis.resources | length > 0
             and not (_lis_spec_changed | default(false) | bool)
-         else ('GPU に余裕が無いため削除してから再作成する'
+         else ('GPU 容量不足または GPU 種別・配置先の変更のため削除してから再作成する'
                if _needs_recreate | bool
                else 'そのまま適用する(新規作成、またはローリング更新が可能)') }}
 
@@ -231,11 +163,11 @@
     -l app.kubernetes.io/name={{ _model_name }}
     --no-headers --ignore-not-found
   register: _recreate_pods
-  until: _recreate_pods.stdout_lines | length == 0
+  until: _recreate_pods.rc == 0 and _recreate_pods.stdout_lines | length == 0
   retries: 60
   delay: 5
   changed_when: false
-  failed_when: false
+  failed_when: _recreate_pods.rc != 0 or _recreate_pods.stdout_lines | length > 0
   when: _needs_recreate | bool
 
 - name: "Apply LLMInferenceService for {{ _model_name }}"

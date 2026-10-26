@@ -1,0 +1,41 @@
+---
+# Restore full GPUs on the selected nodes. Preserve the cluster-wide strategy,
+# since other workers may still use MIG. Default: read-only plan.
+- name: Prepare to restore whole GPUs on selected workers
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require the expected physical GPU count explicitly
+      ansible.builtin.assert:
+        that:
+          - mig_full_gpu_resources is defined
+          - mig_full_gpu_resources.keys() | list == ['nvidia.com/gpu']
+          - mig_full_gpu_resources['nvidia.com/gpu'] | int > 0
+        fail_msg: Set mig_full_gpu_resources to the number of physical GPUs per selected node
+    - name: Read the current cluster-wide GPU strategy
+      kubernetes.core.k8s_info:
+        api_version: nvidia.com/v1
+        kind: ClusterPolicy
+        name: "{{ mig_cluster_policy | default('gpu-cluster-policy') }}"
+      register: _disable_mig_policy
+    - name: Require an existing GPU Operator policy
+      ansible.builtin.assert:
+        that:
+          - _disable_mig_policy.resources | length == 1
+          - _disable_mig_policy.resources[0].spec.mig.strategy | default('none') in ['single', 'mixed']
+    - name: Preserve the strategy used by other workers
+      ansible.builtin.set_fact:
+        gpu_mig_strategy: "{{ _disable_mig_policy.resources[0].spec.mig.strategy }}"
+    - name: Reject an extra-vars override that would change the cluster strategy
+      ansible.builtin.assert:
+        that:
+          - gpu_mig_strategy == _disable_mig_policy.resources[0].spec.mig.strategy
+      # The imported play sets the disable profile independently of inventory.
+
+- name: Restore whole GPUs with the same workload guards and hardware checks
+  ansible.builtin.import_playbook: configure_mig.yml
+  vars:
+    mig_profile: all-disabled
+    mig_expected_resources: "{{ mig_full_gpu_resources }}"
+    mig_disable_mode: true

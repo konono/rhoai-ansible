@@ -171,7 +171,7 @@ spec:
               calculation: last-number
               format:
                 unit: decimal
-                decimalPlaces: 1
+                decimalPlaces: 3
               sparkline:
                 color: '#2196f3'
                 width: 1.5
@@ -246,14 +246,14 @@ spec:
         kind: Panel
         spec:
           display:
-            name: Rate Limited
+            name: Rate Limited / sec
           plugin:
             kind: StatChart
             spec:
               calculation: last-number
               format:
                 unit: decimal
-                decimalPlaces: 0
+                decimalPlaces: 3
               sparkline:
                 color: '#9c27b0'
                 width: 1.5
@@ -782,4 +782,3 @@ spec:
                         kube_pod_container_resource_requests{resource="nvidia_com_gpu"}
                       )
                     seriesNameFormat: '{{namespace}}'
-

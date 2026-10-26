@@ -46,8 +46,10 @@ model_defaults:
   # --- コンテナ環境変数の追加 (VLLM_* / NCCL_* など) ---
   vllm_env: {}
 
-  # --- Pod リソース (nvidia.com/gpu は gpu_count から設定) ---
+  # --- Pod リソース (gpu_resource を gpu_count 個要求) ---
   gpu_count: 1
+  gpu_resource: nvidia.com/gpu
+  node_selector: {}
   resources:
     requests:
       cpu: "500m"

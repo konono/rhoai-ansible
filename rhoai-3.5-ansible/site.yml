@@ -173,6 +173,8 @@
         bash {{ ansible_root }}/scripts/setup-opencode.sh setup
       args:
         chdir: "{{ ansible_root }}"
+      environment:
+        OPENCODE_INVENTORY: "{{ inventory_dir }}"
       register: _opencode
       changed_when: "'opencode.json' in _opencode.stdout"
       failed_when: false

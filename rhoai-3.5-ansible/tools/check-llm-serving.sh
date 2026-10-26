@@ -101,10 +101,13 @@ data = json.load(sys.stdin)
 for pod in data.get('items', []):
     name = pod['metadata']['name']
     phase = pod.get('status', {}).get('phase', 'Unknown')
-    for c in pod.get('spec', {}).get('containers', []):
-        gpu = c.get('resources', {}).get('limits', {}).get('nvidia.com/gpu', '0')
-        if gpu != '0':
-            print(f'  {name} ({phase}): {gpu} GPU(s) - container: {c[\"name\"]}')
+    spec = pod.get('spec', {})
+    for c in spec.get('containers', []) + (spec.get('initContainers') or []):
+        resources = c.get('resources', {})
+        assigned = {**resources.get('limits', {}), **resources.get('requests', {})}
+        for resource, count in assigned.items():
+            if (resource == 'nvidia.com/gpu' or resource.startswith('nvidia.com/mig-')) and int(count) > 0:
+                print(f'  {name} ({phase}): {resource}={count} - container: {c[\"name\"]}')
 " 2>/dev/null || echo "  GPU 情報の取得に失敗しました"
 echo ""
 

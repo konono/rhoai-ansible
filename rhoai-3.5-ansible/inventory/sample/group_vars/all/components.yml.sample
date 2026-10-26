@@ -32,7 +32,7 @@ lvm_device_paths:
 metallb_ip_range: ""
 
 # ---- GPU 割当について ----
-# present なモデルの gpu_count 合計がクラスタの GPU 数を超えると
+# present なモデルの gpu_count × replicas を GPU リソース名ごとに集計し、容量を超えると
 # roles/llm_serving/tasks/main.yml の容量チェックで fail する。
 # GPU 1 枚の構成では present にできるモデルは常に 1 つだけ。
 #
@@ -105,7 +105,10 @@ models:
   #   vllm_args:                       # 書くとレシピを完全に置き換える
   #     - "--max-model-len=32768"
   #     - "--gpu-memory-utilization=0.90"
-  #   gpu_count: 1                     # k8s レベルの設定は名前付きキー
+  #   gpu_count: 1                     # 1 Pod あたりの GPU / MIG 区画数
+  #   gpu_resource: nvidia.com/mig-1g.24gb  # mixed の例。省略時 nvidia.com/gpu
+  #   node_selector:                  # 推論 Pod の配置先 (MIG 操作の selector とは別)
+  #     mig-group: rtx6000-24gb
   #   resources:
   #     requests: {cpu: "500m", memory: 4Gi}
   #     limits:   {cpu: "2",    memory: 8Gi}

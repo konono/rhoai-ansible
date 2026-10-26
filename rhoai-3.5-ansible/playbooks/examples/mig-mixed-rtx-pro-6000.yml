@@ -1,0 +1,44 @@
+---
+# Example only: label your target node(s), check supported profiles, and provision
+# the model cache on suitable storage before deploying. MIG defaults to plan mode.
+gpu_mig_strategy: mixed
+mig_node_selector: mig-group=rtx6000-mixed
+mig_profile: all-balanced
+mig_expected_resources:
+  nvidia.com/mig-1g.24gb: 2
+  nvidia.com/mig-2g.48gb: 1
+mig_full_gpu_resources:
+  nvidia.com/gpu: 1
+mig_persist_machineset: true
+mig_apply: false
+
+llm_namespace: llm-serving-mig
+models:
+  qwen3-06b-mig:
+    hf_repo: Qwen/Qwen3-0.6B
+    namespace: llm-serving-mig
+    state: present
+    gpu_resource: nvidia.com/mig-1g.24gb
+    gpu_count: 1
+    node_selector:
+      mig-group: rtx6000-mixed
+    vllm_args:
+      - --max-model-len=4096
+      - --max-num-seqs=4
+      - --gpu-memory-utilization=0.75
+      - --enforce-eager
+      - --reasoning-parser=qwen3
+  qwen3-4b-mig:
+    hf_repo: Qwen/Qwen3-4B
+    namespace: llm-serving-mig
+    state: present
+    gpu_resource: nvidia.com/mig-2g.48gb
+    gpu_count: 1
+    node_selector:
+      mig-group: rtx6000-mixed
+    vllm_args:
+      - --max-model-len=4096
+      - --max-num-seqs=4
+      - --gpu-memory-utilization=0.75
+      - --enforce-eager
+      - --reasoning-parser=qwen3

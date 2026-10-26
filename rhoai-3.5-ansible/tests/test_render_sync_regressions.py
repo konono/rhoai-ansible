@@ -242,6 +242,43 @@ class TestClusterPolicyParity(RenderSyncBase):
                 dcgm.get("serviceMonitor", {}).get("enabled"), True,
                 f"{label}: dcgmExporter.serviceMonitor.enabled が true でない")
 
+    def test_optional_mig_strategy_matches_role(self):
+        """MIG の指定と未指定を、role の実式と renderer の出力で比較する。"""
+        import importlib.util
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar
+        try:
+            from ansible.template import trust_as_template
+        except ImportError:
+            def trust_as_template(value):
+                return value
+
+        spec = importlib.util.spec_from_file_location("render_mig_test", RENDER_PY)
+        renderer = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(renderer)
+        definition = find_k8s_definitions(
+            ANSIBLE_DIR / "roles/gpu_operator/tasks/main.yml", "ClusterPolicy")[0]
+        expression = definition["spec"]["mig"]
+        for strategy in (None, "single", "mixed"):
+            with self.subTest(strategy=strategy), tempfile.TemporaryDirectory() as tmp:
+                cfg = renderer.load_config(ANSIBLE_DIR / "inventory/sample/group_vars/all")
+                variables = {"omit": "__omitted__"}
+                if strategy is not None:
+                    cfg["gpu_mig_strategy"] = strategy
+                    variables["gpu_mig_strategy"] = strategy
+                role_value = Templar(loader=DataLoader(), variables=variables).template(
+                    trust_as_template(expression))
+                out = Path(tmp)
+                renderer.ManifestRenderer(cfg, out, ANSIBLE_DIR / "inventory/sample").render_gpu_operator()
+                rendered = yaml.safe_load(
+                    (out / "manifests/03-deps-gpu/02-clusterpolicy.yml").read_text())
+                if strategy is None:
+                    self.assertEqual("__omitted__", role_value)
+                    self.assertNotIn("mig", rendered["spec"])
+                else:
+                    self.assertEqual({"strategy": strategy}, role_value)
+                    self.assertEqual(role_value, rendered["spec"]["mig"])
+
 
 class TestObservabilityGuideCoverage(RenderSyncBase):
     """「静的ファイルを足したのに手順書が apply しない」を防ぐ。"""
