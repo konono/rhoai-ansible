@@ -24,8 +24,8 @@ from __future__ import annotations
 
 import argparse
 import base64
-import shlex
 import os
+import json
 import re
 import secrets
 import string
@@ -1195,6 +1195,11 @@ class ManifestRenderer:
                                       self.channels.get("group_sync_operator", "alpha"),
                                       source=self.catalogs.get("community", "community-operators"),
                                       target_namespaces=["group-sync-operator"])
+        # The CA is maintained by ingress; include its namespace in the controller cache.
+        gs_op_docs[-1]["spec"]["config"] = {"env": [{
+            "name": "WATCH_NAMESPACE",
+            "value": "group-sync-operator,openshift-config-managed",
+        }]}
         gs_secret = {
             "apiVersion": "v1", "kind": "Secret",
             "metadata": {"name": "keycloak-group-sync", "namespace": "group-sync-operator"},
@@ -1212,6 +1217,8 @@ class ManifestRenderer:
                     "keycloak": {
                         "realm": kc_realm,
                         "credentialsSecret": {"name": "keycloak-group-sync", "namespace": "group-sync-operator"},
+                        "ca": {"kind": "ConfigMap", "name": "default-ingress-cert",
+                               "namespace": "openshift-config-managed", "key": "ca-bundle.crt"},
                         "url": f"https://keycloak-{kc_ns}.<CLUSTER_DOMAIN>",
                         "loginRealm": kc_realm,
                         "scope": "sub",
@@ -1303,8 +1310,13 @@ class ManifestRenderer:
             "oc wait --for=condition=Established crd/groupsyncs.redhatcop.redhat.io --timeout=300s\n"
             f"sed -i.bak \"s/<CLUSTER_DOMAIN>/$CLUSTER_DOMAIN/g\" manifests/06-keycloak/07-group-sync.yml\n"
             f"rm manifests/06-keycloak/07-group-sync.yml.bak\n"
+            "# Ingress の公開証明書チェーンを信頼する（TLS 検証は無効化しない）。\n"
+            "# CA は openshift-config-managed/default-ingress-cert を直接参照し、ローテーションに追従する。\n"
             "oc apply -f manifests/06-keycloak/07-group-sync.yml\n"
             "```\n\n"
+            "GroupSync の確認では現在の generation に対する ReconcileSuccess=True と lastSyncSuccessTime を確認してください。\n"
+            "過去の ReconcileError が残る場合があるため、成功時刻より新しいエラーがないことを確認します。\n"
+            "ユーザー・グループ作成後（同期周期は最大 5 分）、OpenShift Group の users に設定したユーザーが含まれることも確認してください。\n\n"
             "### Keycloak API 操作 (group-sync-sa ロール割当)\n\n"
             "Realm import 後、group-sync-sa ユーザーに realm-management クライアントロールを付与する必要があります。\n"
             "Keycloak UI (Admin Console) から手動で行うか、以下の curl コマンドで実施:\n\n"
@@ -1766,7 +1778,8 @@ class ManifestRenderer:
             "subjects": [{"kind": "ServiceAccount", "name": "llm-serving-sa", "namespace": llm_ns}],
         }
 
-        self._write_manifests("09-llm-serving", "01-base.yml", [ns_doc, hf_secret, pvc, sa, rb])
+        self._write_manifests("09-llm-serving", "01-base.yml", [ns_doc, hf_secret, sa, rb])
+        self._write_manifests("09-llm-serving", "01-model-cache-pvc.yml", [pvc])
         self._write_manifests("09-llm-serving", "02-csc.yml", [csc])
 
         # custom_chat_template は inventory 配下に置いた chat template の名前
@@ -1775,6 +1788,18 @@ class ManifestRenderer:
         chat_template_dir = self.inventory_dir / "chat_templates"
 
         # Per-model manifests
+        # Ship the bash/jq runtime with the output so the manual update path has
+        # the same capacity, reservation and recreation decisions as the role.
+        runtime_dir = Path(__file__).resolve().parent / "files"
+        for filename in ("llm-deploy.sh", "llm-gpu.jq", "llm-download.sh"):
+            self._write_file("09-llm-serving", filename, (runtime_dir / filename).read_text())
+        gpu_models = []
+        for name, raw in self.models.items():
+            resolved = self._merge_model_cfg(raw)
+            if resolved.get("state", "present") == "present":
+                gpu_models.append({"name": name, **{key: resolved[key] for key in
+                    ("gpu_resource", "gpu_count", "replicas", "node_selector")}})
+        self._write_file("09-llm-serving", "gpu-models.json", json.dumps(gpu_models, indent=2) + "\n")
         model_steps = []
         absent_steps = []
         cm_names_created: set[tuple[str, str]] = set()
@@ -1806,7 +1831,7 @@ class ManifestRenderer:
                 absent_steps.append(
                     f"### モデル削除: {model_name}\n\n"
                     f"```bash\n"
-                    f"oc delete llminferenceservice {model_name} -n {ns} --ignore-not-found\n"
+                    f"oc delete llminferenceservices.v1alpha2.serving.kserve.io {model_name} -n {ns} --ignore-not-found\n"
                     f"# GPU Pod 終了待機\n"
                     f"while oc get pods -n {ns} -l app.kubernetes.io/name={model_name} "
                     f"--field-selector=status.phase=Running --no-headers 2>/dev/null | grep -q .; "
@@ -1950,35 +1975,16 @@ class ManifestRenderer:
                 self._write_file("09-llm-serving", f"chat_template-{custom_ct}.jinja", src.read_text())
                 cm_names_created.add((cm_name, custom_ct))
 
-            gpu_selector = ",".join(f"{k}={v}" for k, v in model_cfg["node_selector"].items())
-            gpu_query = (
-                'oc get nodes -o json'
-                + (f" -l {shlex.quote(gpu_selector)}" if gpu_selector else "")
-            )
-            # jq reads the literal resource key (dots and slash are not a JSON path).
-            gpu_check = (
-                f"gpu_nodes=$({gpu_query}) || exit 1\n"
-                f"printf '%s' \"$gpu_nodes\" | jq -e --arg r {shlex.quote(model_cfg['gpu_resource'])} "
-                f"--argjson count {model_cfg['gpu_count']} --argjson replicas {model_cfg['replicas']} "
-                "'[.items[] | select(.spec.unschedulable != true) | "
-                "((.status.allocatable[$r] // \"0\" | tonumber) / $count | floor)] | "
-                "(add // 0) >= $replicas' >/dev/null || { echo 'GPU capacity insufficient'; exit 1; }\n"
-            )
             model_steps.append(
                 f"### モデル: {model_name} ({model_cfg['hf_repo']})\n\n"
                 f"```bash\n"
-                f"# ダウンロード Job\n"
-                f"oc apply -f manifests/09-llm-serving/model-{model_name}-download.yml\n"
-                f"oc wait --for=condition=complete job/download-{model_name} -n {model_cfg['namespace']} --timeout=3600s\n\n"
-                f"# 選択ノードの {model_cfg['gpu_resource']} 容量確認 (jq 必須)\n"
-                + gpu_check
-                + f"# 使用中の Pod も確認し、空き容量が不足する場合はここで停止してください。\n"
-                f"oc get pods -A -o wide\n"
-                f"# LLMInferenceService デプロイ\n"
-                f"oc apply -f manifests/09-llm-serving/model-{model_name}-deploy.yml\n"
+                f"# Ready・Job 状態・PVC キャッシュを確認し、必要時のみダウンロード\n"
+                f"bash manifests/09-llm-serving/llm-download.sh "
+                f"manifests/09-llm-serving/model-{model_name}-download.yml || exit 1\n\n"
+                f"# GPU 空き確認・変更判定・必要時の再作成・Ready 待機 (bash/oc/jq)\n"
+                f"bash manifests/09-llm-serving/llm-deploy.sh deploy "
+                f"manifests/09-llm-serving/model-{model_name}-deploy.yml || exit 1\n"
                 f"```\n\n"
-                + self._wait_step(f"{model_name} Ready 待機",
-                                  f"oc wait --for=condition=Ready llminferenceservice/{model_name} -n {model_cfg['namespace']} --timeout=900s")
                 + f"\n\n**MaaSModelRef の確認**\n\n"
                 f"```bash\n"
                 f"oc get maasmodelref {model_name} -n {model_cfg['namespace']} -o jsonpath='{{.status.phase}}{{\"\\n\"}}'\n"
@@ -2014,10 +2020,30 @@ class ManifestRenderer:
         if model_steps:
             present_section = "### Phase 2: モデルデプロイ (state: present)\n\n" + "\n".join(model_steps)
 
-        self._step("LLM Serving", (
+        llm_guide = (
+            "各 Bash ブロックは `bash <<'RHOAI_LLM_STEP'` から終端行までまとめて実行してください。\n"
+            "別の Bash プロセス内で失敗時に停止するため、対話シェル自体は終了しません。\n"
+            "GPU の判定・適用は同梱の `llm-deploy.sh` と `llm-gpu.jq` で行います。\n"
+            "ダウンロードは `llm-download.sh` で Ready・実行中/完了済み Job・PVC キャッシュを確認し、\n"
+            "必要な場合だけ失敗済み Job を削除して再作成します。既存 PVC は変更しません。\n"
+            "Ansible と同じく、全 present モデルの資源別合計・選択ノード容量を先に検査し、\n"
+            "新規モデルは使用中 Pod（bound Pending・init/sidecar を含む）を差し引きます。\n"
+            "既存モデルは変更されたフィールド・GPU 種別・nodeSelector・容量から更新方法を判定します。\n"
+            "再作成時は対象モデルだけを削除し、旧 Pod の消滅を最大 300 秒待ちます。\n"
+            "取得失敗・待機期限超過・apply 失敗は中止します。別 workload を自動停止しません。\n"
+            "既存モデルの再作成前の予約込み空き容量や、複数モデルの selector 競合の事前検出は、\n"
+            "Ansible と同じ制約が残ります。GPU の MIG 分割自体は先に専用 playbook で設定してください。\n\n"
             "```bash\n"
+            "# workload を変更する前の全モデル GPU 容量検査\n"
+            "bash manifests/09-llm-serving/llm-deploy.sh preflight || exit 1\n\n"
             "# Base リソース\n"
             "oc apply -f manifests/09-llm-serving/01-base.yml\n\n"
+            "# role と同じく既存 PVC は変更しない（復元元・容量・StorageClass を保持）\n"
+            "# Proxy の任意取得とは異なり、PVC の取得エラーはここで停止する\n"
+            f"MODEL_CACHE_PVC=$(oc get pvc hf-model-cache -n {llm_ns} --ignore-not-found -o name)\n"
+            "if [ -z \"$MODEL_CACHE_PVC\" ]; then\n"
+            "  oc create -f manifests/09-llm-serving/01-model-cache-pvc.yml\n"
+            "fi\n\n"
             "# ClusterStorageContainer CRD 待機\n"
             "oc wait --for=condition=Established crd/clusterstoragecontainers.serving.kserve.io --timeout=300s\n\n"
             "# ClusterStorageContainer (既存がなければ作成)\n"
@@ -2025,15 +2051,16 @@ class ManifestRenderer:
             "  oc apply -f manifests/09-llm-serving/02-csc.yml\n"
             "fi\n\n"
             "# Proxy 設定をダウンロード Job manifest に反映 (設定されている場合のみ)\n"
-            "HTTP_PROXY=$(oc get proxy cluster -o jsonpath='{.status.httpProxy}' 2>/dev/null)\n"
-            "HTTPS_PROXY=$(oc get proxy cluster -o jsonpath='{.status.httpsProxy}' 2>/dev/null)\n"
-            "NO_PROXY=$(oc get proxy cluster -o jsonpath='{.status.noProxy}' 2>/dev/null)\n"
+            "HTTP_PROXY=$(oc get proxy cluster -o jsonpath='{.status.httpProxy}' 2>/dev/null) || HTTP_PROXY=''\n"
+            "HTTPS_PROXY=$(oc get proxy cluster -o jsonpath='{.status.httpsProxy}' 2>/dev/null) || HTTPS_PROXY=''\n"
+            "NO_PROXY=$(oc get proxy cluster -o jsonpath='{.status.noProxy}' 2>/dev/null) || NO_PROXY=''\n"
             "if [ -n \"$HTTP_PROXY\" ] || [ -n \"$HTTPS_PROXY\" ]; then\n"
             "  proxy_args=()\n"
             "  if [ -n \"$HTTP_PROXY\" ]; then proxy_args+=(\"HTTP_PROXY=$HTTP_PROXY\"); fi\n"
             "  if [ -n \"$HTTPS_PROXY\" ]; then proxy_args+=(\"HTTPS_PROXY=$HTTPS_PROXY\"); fi\n"
             "  if [ -n \"$NO_PROXY\" ]; then proxy_args+=(\"NO_PROXY=$NO_PROXY\"); fi\n"
             "  for f in manifests/09-llm-serving/model-*-download.yml; do\n"
+            "    [ -f \"$f\" ] || continue\n"
             "    oc set env --local -f \"$f\" --overwrite -o yaml \"${proxy_args[@]}\" > \"$f.tmp\"\n"
             "    mv \"$f.tmp\" \"$f\"\n"
             "  done\n"
@@ -2051,7 +2078,14 @@ class ManifestRenderer:
             + "```\n\n"
             + absent_section
             + present_section
-        ))
+        )
+        llm_guide = re.sub(
+            r"```bash\n(.*?)```",
+            lambda match: "```bash\nbash <<'RHOAI_LLM_STEP'\nset -euo pipefail\n"
+                + match.group(1) + "RHOAI_LLM_STEP\n```",
+            llm_guide, flags=re.S,
+        )
+        self._step("LLM Serving", llm_guide)
 
     def render_mlflow(self):
         obc = {
@@ -2548,6 +2582,8 @@ define flow self check output
             "## 前提条件\n\n"
             "- `oc` コマンドがインストール済みで、クラスターに admin 権限でログイン済み\n"
             "- `KUBECONFIG` が適切に設定されている\n"
+            "- LLM 配信時は LLMInferenceService / MaaSModelRef の CRD が登録済みのクラスターに接続している\n"
+            "  - `oc create --dry-run=client` も認証設定と API のリソース情報を必要とします。オフラインの YAML パーサーではありません。\n"
             "- `jq` がインストール済み（LLM の GPU 容量確認に使用）\n"
             "- `manual-deploy-guide.md` があるディレクトリから作業する\n"
             "- `python3` + **PyYAML** (`pip install pyyaml`)\n"
@@ -2556,6 +2592,14 @@ define flow self check output
             "  - YAML として読み書きせずテキスト追記で代用すると、末尾改行の無い\n"
             "    既存値や flow style の設定を壊すため、**PyYAML が無い場合は\n"
             "    該当手順が中止する**（黙って劣化した方法に落ちない）。\n\n"
+            "## Operator の待機判定\n\n"
+            "各ステップの「CSV Succeeded 待機」は、適用した Subscription の "
+            "`status.installedCSV` が非空になり、その名前の CSV の `status.phase` が "
+            "`Succeeded` になるまで待つことを意味します。\n"
+            "Subscription の名前と namespace は直前に適用した operator manifest で確認し、"
+            "`oc get subscription <名前> -n <namespace> -o jsonpath='{.status.installedCSV}'` "
+            "で対象 CSV を特定してください。`oc get csv -w` に別 Operator の行や "
+            "`olm.copiedFrom` ラベル付きのコピーが表示されても、それを完了判定に使わないでください。\n\n"
             "## 事前準備\n\n"
             "```bash\n"
             "# クラスターへの接続確認\n"

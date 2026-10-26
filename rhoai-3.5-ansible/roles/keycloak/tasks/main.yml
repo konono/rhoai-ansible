@@ -365,6 +365,11 @@
       ansible.builtin.include_tasks: "{{ role_path }}/../common/tasks/install_operator.yml"
       vars:
         operator_name: group-sync-operator
+        # Cross-namespace CA reads use the controller cache, not only RBAC.
+        operator_config:
+          env:
+            - name: WATCH_NAMESPACE
+              value: group-sync-operator,openshift-config-managed
         operator_namespace: group-sync-operator
         operator_channel: "{{ operator_channels.group_sync_operator }}"
         operator_source: "{{ catalog_sources.community }}"
@@ -410,6 +415,11 @@
                   credentialsSecret:
                     name: keycloak-group-sync
                     namespace: group-sync-operator
+                  ca:
+                    kind: ConfigMap
+                    name: default-ingress-cert
+                    namespace: openshift-config-managed
+                    key: ca-bundle.crt
                   url: "{{ keycloak_url }}"
                   loginRealm: "{{ keycloak_realm }}"
                   scope: sub

@@ -1,7 +1,7 @@
 ---
 # Uninstall: llm_serving
 # No operator — resources only (managed by rhoai)
-# Order: Backup → LLMInferenceService → MaaSModelRef → ClusterStorageContainer → Secret → PVC
+# Order: Backup → LLMInferenceService → MaaSModelRef → ClusterStorageContainer → download Jobs → Secret → PVC
 
 - block:
     # -----------------------------------------------------------------------
@@ -141,6 +141,38 @@
         _csc_check.resources | default([]) | length > 0 and
         (_csc_check.resources[0].metadata.labels | default({})).get('app.kubernetes.io/managed-by', '') == 'rhoai-ansible'
       failed_when: false
+
+    # Completed Jobs must not outlive the cache: a later install would otherwise
+    # trust their succeeded status even though it has created an empty PVC.
+    # Fail closed on lookup/deletion errors: do not remove the cache first.
+    - name: Find download Jobs in the selected LLM namespace
+      kubernetes.core.k8s_info:
+        api_version: batch/v1
+        kind: Job
+        namespace: "{{ llm_namespace | default('llm-serving') }}"
+      register: _download_jobs
+
+    - name: Delete model download Jobs before deleting their cache PVC
+      kubernetes.core.k8s:
+        state: absent
+        api_version: batch/v1
+        kind: Job
+        name: "{{ item.metadata.name }}"
+        namespace: "{{ llm_namespace | default('llm-serving') }}"
+        delete_options:
+          propagationPolicy: Foreground
+        wait: true
+        wait_timeout: 300
+      loop: "{{ _download_jobs.resources }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      when:
+        - item.metadata.name is match('^download-')
+        - >-
+          item.spec.template.spec.volumes | default([], true)
+          | selectattr('persistentVolumeClaim', 'defined')
+          | selectattr('persistentVolumeClaim.claimName', 'equalto', 'hf-model-cache')
+          | list | length > 0
 
     - name: Delete hf-token Secret
       kubernetes.core.k8s:

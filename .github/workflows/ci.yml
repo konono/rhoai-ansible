@@ -35,6 +35,8 @@ jobs:
       # discover は使えない（tests/ に __init__.py が無い）ため列挙する。
       - name: Unit tests
         working-directory: ${{ env.PB_DIR }}
+        env:
+          GPU_RUNTIME_TEST_LOG_DIR: ${{ github.workspace }}/${{ env.PB_DIR }}/.local/render-gpu-repeat/initial/cases
         run: |
           fail=0
           for t in tests/test_*.py; do
@@ -44,6 +46,31 @@ jobs:
             echo "::endgroup::"
           done
           exit $fail
+
+      - name: Repeat generated GPU runtime tests with diagnostics
+        if: success() || failure()
+        working-directory: ${{ env.PB_DIR }}
+        run: |
+          set -o pipefail
+          jq --version
+          fail=0
+          for attempt in 1 2 3; do
+            logdir="$PWD/.local/render-gpu-repeat/run-$attempt"
+            mkdir -p "$logdir"
+            GPU_RUNTIME_TEST_LOG_DIR="$logdir/cases" \
+              python -m unittest tests.test_render_gpu_runtime -v 2>&1 | tee "$logdir/unittest.log" || fail=1
+          done
+          exit "$fail"
+
+      - name: Preserve GPU runtime test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: render-gpu-runtime-diagnostics
+          path: ${{ env.PB_DIR }}/.local/render-gpu-repeat/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
 
       # ---- Ansible 構文チェック -------------------------------------------
       # CI では inventory/sample だけが git 管理対象（他環境は .gitignore）。

@@ -188,6 +188,52 @@
       when: install_keycloak | default(true)
       tags: [platform, keycloak]
 
+    - name: "Verify: Group Sync reconciled the current configuration"
+      kubernetes.core.k8s_info:
+        api_version: redhatcop.redhat.io/v1alpha1
+        kind: GroupSync
+        name: keycloak-group-sync
+        namespace: group-sync-operator
+      register: _group_sync
+      # The operator retains old ReconcileError conditions after recovery.
+      # Require current-generation success and reject a later failure.
+      # metav1.Time uses UTC RFC3339 seconds, so lexical order is chronological.
+      failed_when: >-
+        _group_sync.resources | length == 0 or
+        (_gs_success | length == 0) or
+        (_gs_errors | selectattr('lastTransitionTime', 'gt',
+          _gs_status.lastSyncSuccessTime | default('')) | list | length > 0)
+      vars:
+        _gs: "{{ _group_sync.resources | default([]) | first | default({}) }}"
+        _gs_status: "{{ _gs.status | default({}) }}"
+        _gs_success: >-
+          {{ _gs_status.conditions | default([])
+             | selectattr('type', 'equalto', 'ReconcileSuccess')
+             | selectattr('status', 'equalto', 'True')
+             | selectattr('observedGeneration', 'defined')
+             | selectattr('observedGeneration', 'equalto', _gs.metadata.generation | default(-1)) | list }}
+        _gs_errors: >-
+          {{ _gs_status.conditions | default([])
+             | selectattr('type', 'equalto', 'ReconcileError')
+             | selectattr('status', 'equalto', 'True') | list }}
+      when: install_keycloak | default(true)
+      tags: [integration, keycloak_groups]
+
+    - name: "Verify: OpenShift groups contain configured Keycloak users"
+      kubernetes.core.k8s_info:
+        api_version: user.openshift.io/v1
+        kind: Group
+        name: "{{ item.1 }}"
+      register: _synced_group
+      failed_when: >-
+        _synced_group.resources | length == 0 or
+        item.0.username not in (_synced_group.resources[0].users | default([], true))
+      loop: "{{ keycloak_users | default([]) | subelements('groups', skip_missing=True) }}"
+      loop_control:
+        label: "{{ item.0.username }} -> {{ item.1 }}"
+      when: install_keycloak | default(true)
+      tags: [integration, keycloak_groups]
+
     # ==================== Integration ====================
     - name: "Verify: Keycloak user-group assignments"
       block:

@@ -1,8 +1,5 @@
 """Exercise real Ansible capacity expressions and both manifest generators."""
 import subprocess
-import json
-import os
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -217,20 +214,12 @@ class TestMixedManifest(unittest.TestCase):
                 else:
                     self.assertNotIn('nodeSelector', actual['spec']['template'])
             self.assertEqual(yaml.safe_load((ans / 'small-llminferenceservice.yml').read_text())['spec']['replicas'], 2)
-            # Execute the actual generated capacity shell, including HTTP/read failure.
+            # The guide must invoke the shipped runtime, not bypass it with apply.
             guide = (out / 'manual-deploy-guide.md').read_text()
-            snippet = re.search(r"gpu_nodes=\$\(oc get nodes -o json -l pool=mig\).*?exit 1; }\n", guide, re.S).group()
-            bindir = Path(tmp) / 'bin'; bindir.mkdir()
-            mock = bindir / 'oc'
-            mock.write_text('#!/bin/sh\n[ "$MOCK_FAIL" = 1 ] && exit 1\ncat "$GPU_NODES_FILE"\n')
-            mock.chmod(0o755)
-            nodesfile = Path(tmp) / 'nodes.json'
-            for resources, failure, expected in [({MIG: '4'}, '0', 0), ({'nvidia.com/gpu': '40'}, '0', 1), ({MIG: '1'}, '0', 1), ({MIG: '4'}, '1', 1)]:
-                nodesfile.write_text(json.dumps({'items': [node(resources=resources)]}))
-                result = subprocess.run(['bash', '-c', snippet], capture_output=True, text=True,
-                    env={**os.environ, 'PATH': str(bindir) + ':' + os.environ['PATH'],
-                         'GPU_NODES_FILE': str(nodesfile), 'MOCK_FAIL': failure})
-                self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertIn('bash manifests/09-llm-serving/llm-deploy.sh preflight || exit 1', guide)
+            for name in ('small', 'large', 'full'):
+                self.assertIn(f'llm-deploy.sh deploy manifests/09-llm-serving/model-{name}-deploy.yml || exit 1', guide)
+                self.assertNotIn(f'oc apply -f manifests/09-llm-serving/model-{name}-deploy.yml', guide)
 
 
 

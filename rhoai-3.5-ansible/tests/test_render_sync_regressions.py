@@ -833,5 +833,82 @@ class TestOgxOrphanPvc(RenderSyncBase):
         self.assertFalse(deleted, "Bound な PVC を削除している")
 
 
+class TestGroupSyncCA(RenderSyncBase):
+    def test_role_and_renderer_reference_the_same_verified_ca(self):
+        task_file = ANSIBLE_DIR / "roles/keycloak/tasks/main.yml"
+        role = find_k8s_definitions(task_file, "GroupSync")[0]
+        rendered = next(d for d in yaml.safe_load_all(
+            (self.manifests / "06-keycloak/07-group-sync.yml").read_text())
+            if d and d.get("kind") == "GroupSync")
+        actual = rendered['spec']['providers'][0]['keycloak']
+        expected = role['spec']['providers'][0]['keycloak']
+        self.assertEqual(expected['ca'], actual['ca'])
+        self.assertFalse(actual.get('insecure', False))
+        self.assertFalse(expected.get('insecure', False))
+        self.assertEqual(actual['ca'], {
+            'kind': 'ConfigMap', 'name': 'default-ingress-cert',
+            'namespace': 'openshift-config-managed', 'key': 'ca-bundle.crt'})
+
+    def test_cross_namespace_ca_is_in_the_operator_cache_in_both_paths(self):
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar
+        try:
+            from ansible.template import trust_as_template
+        except ImportError:
+            def trust_as_template(value):
+                return value
+        tasks = yaml.safe_load((ANSIBLE_DIR / 'roles/keycloak/tasks/main.yml').read_text())
+        install = next(t for t in _walk(tasks)
+                       if t.get('name') == 'Install Group Sync Operator')
+        definition = find_k8s_definitions(
+            ANSIBLE_DIR / 'roles/common/tasks/install_operator.yml', 'Subscription')[0]
+        config = Templar(loader=DataLoader(), variables=install['vars']).template(
+            trust_as_template(definition['spec']['config']))
+        subscription = next(d for d in yaml.safe_load_all(
+            (self.manifests / '06-keycloak/06-group-sync-operator.yml').read_text())
+            if d and d.get('kind') == 'Subscription')
+        self.assertEqual(config, subscription['spec']['config'])
+        watch = next(e['value'] for e in config['env'] if e['name'] == 'WATCH_NAMESPACE')
+        self.assertEqual(set(watch.split(',')),
+                         {'group-sync-operator', 'openshift-config-managed'})
+
+
+    def test_verify_rejects_missing_stale_or_failed_group_sync(self):
+        from ansible.parsing.dataloader import DataLoader
+        from ansible.template import Templar
+        try:
+            from ansible.template import trust_as_template
+        except ImportError:
+            def trust_as_template(value):
+                return value
+        tasks = yaml.safe_load((ANSIBLE_DIR / 'playbooks/verify.yml').read_text())
+        task = next(t for t in _walk(tasks) if t.get('name') ==
+                    'Verify: Group Sync reconciled the current configuration')
+        success = {'type': 'ReconcileSuccess', 'status': 'True',
+                   'observedGeneration': 3, 'lastTransitionTime': '2026-10-26T13:22:08Z'}
+        old_error = {'type': 'ReconcileError', 'status': 'True',
+                     'observedGeneration': 2, 'lastTransitionTime': '2026-10-26T13:16:26Z'}
+        cases = [
+            ([], True),
+            ([{'metadata': {'generation': 3}}], True),
+            ([{'metadata': {'generation': 3}, 'status': {'conditions': [old_error]}}], True),
+        ]
+        for conditions, generation, fails in [
+            ([success], 3, False), ([old_error, success], 3, False),
+            ([success], 4, True),
+            ([{k: v for k, v in success.items() if k != 'observedGeneration'}], 3, True),
+            ([success, {**old_error, 'lastTransitionTime': '2026-10-26T13:23:00Z'}], 3, True),
+        ]:
+            cases.append(([{'metadata': {'generation': generation}, 'status': {
+                'conditions': conditions, 'lastSyncSuccessTime': '2026-10-26T13:22:08Z'}}], fails))
+        for resources, fails in cases:
+            with self.subTest(resources=resources):
+                variables = {**{k: trust_as_template(v) for k, v in task['vars'].items()},
+                             '_group_sync': {'resources': resources}}
+                result = Templar(loader=DataLoader(), variables=variables).template(
+                    trust_as_template('{{ ' + task['failed_when'] + ' }}'))
+                self.assertEqual(str(result).lower(), str(fails).lower())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
