@@ -21,6 +21,12 @@
     KUBECONFIG: "{{ k8s_kubeconfig | default(lookup('env', 'KUBECONFIG'), true) }}"
 
   tasks:
+    - name: Refuse uninstall through an external-storage migration profile
+      ansible.builtin.assert:
+        that: migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
+        fail_msg: Migration rollback is application-specific; uninstall may delete PVCs and is not an allowed rollback procedure.
+      tags: [always]
+
     # ==================== Post-deploy ====================
     - name: "Uninstall: OpenCode config"
       ansible.builtin.file:

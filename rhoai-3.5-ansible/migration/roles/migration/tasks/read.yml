@@ -1,0 +1,51 @@
+---
+- ansible.builtin.include_tasks: identity.yml
+
+- name: Read supported operator inputs (missing API is recorded; authorization errors abort)
+  kubernetes.core.k8s_info:
+    api_version: "{{ item.api_version }}"
+    kind: "{{ item.kind }}"
+    kubeconfig: "{{ migration_kubeconfig }}"
+  loop: "{{ migration_resource_types }}"
+  register: _migration_discovery
+  no_log: true
+
+- name: Read PVC configuration without reading volume contents
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: PersistentVolumeClaim
+    kubeconfig: "{{ migration_kubeconfig }}"
+  register: _migration_pvcs
+  no_log: true
+
+- name: Read storage classes
+  kubernetes.core.k8s_info:
+    api_version: storage.k8s.io/v1
+    kind: StorageClass
+    kubeconfig: "{{ migration_kubeconfig }}"
+  register: _migration_storage
+  no_log: true
+
+- name: Initialize collected objects
+  ansible.builtin.set_fact:
+    _migration_objects: []
+    _migration_apis: []
+
+- name: Collect declarative specs only (no status, annotations, managedFields or Secret exports)
+  ansible.builtin.include_tasks: collect_type.yml
+  loop: "{{ _migration_discovery.results }}"
+  loop_control:
+    loop_var: discovered
+    label: "{{ discovered.item.kind }}"
+
+
+- name: Assemble portable snapshot
+  ansible.builtin.set_fact:
+    _migration_snapshot:
+      schema_version: 1
+      cluster_uid: "{{ _migration_cluster_uid }}"
+      objects: "{{ _migration_objects }}"
+      pvcs: "{{ _migration_pvcs.resources }}"
+      storage_classes: "{{ _migration_storage.resources }}"
+      api_discovery: "{{ _migration_apis }}"
+  no_log: true

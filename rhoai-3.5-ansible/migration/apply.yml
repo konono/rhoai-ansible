@@ -1,0 +1,17 @@
+---
+# Review gate, fresh read-only collection, then the actual standard deployment.
+- name: Validate a reviewed standardization plan
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_root: "{{ playbook_dir | dirname }}"
+    migration_root: "{{ playbook_dir }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: migration
+        tasks_from: apply
+      tags: [always]
+
+- ansible.builtin.import_playbook: ../site.yml
+# site.yml already imports the unscoped verify.yml after deployment.

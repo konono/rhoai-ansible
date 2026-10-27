@@ -1,0 +1,26 @@
+---
+- name: Require an explicit cluster connection
+  ansible.builtin.assert:
+    that:
+      - migration_kubeconfig is defined
+      - migration_kubeconfig is string
+      - migration_kubeconfig is match('^/')
+    fail_msg: Set migration_kubeconfig to an absolute path. No implicit current context is used.
+
+- name: Read stable cluster identity
+  kubernetes.core.k8s_info:
+    api_version: v1
+    kind: Namespace
+    name: kube-system
+    kubeconfig: "{{ migration_kubeconfig }}"
+  register: _migration_identity
+
+- name: Require cluster identity
+  ansible.builtin.assert:
+    that:
+      - _migration_identity.resources | length == 1
+      - _migration_identity.resources[0].metadata.uid | length > 0
+
+- name: Record cluster UID
+  ansible.builtin.set_fact:
+    _migration_cluster_uid: "{{ _migration_identity.resources[0].metadata.uid }}"

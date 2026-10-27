@@ -1,0 +1,73 @@
+---
+- name: Require complete execution and explicit reviewed plan checksum
+  ansible.builtin.assert:
+    that:
+      - migration_bundle is defined
+      - migration_bundle is match('^/')
+      - migration_approved_digest is defined
+      - ansible_run_tags | difference(['all']) | length == 0
+      - ansible_skip_tags | length == 0
+      - not ansible_check_mode
+    fail_msg: Run apply.yml without tags/check mode and with migration_bundle and migration_approved_digest. Use plan.yml for read-only assessment.
+
+- name: Read the reviewed report and collected baseline
+  ansible.builtin.set_fact:
+    _migration_report: "{{ lookup('file', migration_bundle ~ '/plan.yml') | from_yaml }}"
+    _migration_snapshot: "{{ lookup('file', migration_bundle ~ '/baseline.yml') | from_yaml }}"
+  no_log: true
+
+- name: Refuse blockers, edits or a mismatched approval before contacting the cluster
+  ansible.builtin.assert:
+    that: >-
+      _migration_report | migration_validate_plan(_migration_snapshot,
+      ansible_root | migration_source_digest, migration_bundle | migration_inventory_digest,
+      migration_approved_digest)
+
+- ansible.builtin.stat:
+    path: "{{ migration_bundle }}/inventory/group_vars/all/{{ item }}"
+  loop: [cluster.yml, components.yml, vault.yml]
+  register: _migration_configs
+
+- name: Load precisely the same configuration files as planning
+  ansible.builtin.include_vars:
+    file: "{{ item.stat.path }}"
+  loop: "{{ _migration_configs.results }}"
+  when: item.stat.exists
+  no_log: true
+
+- ansible.builtin.set_fact:
+    _migration_expected_config: {}
+
+- ansible.builtin.set_fact:
+    _migration_expected_config: "{{ _migration_expected_config | combine(lookup('file', item.stat.path) | from_yaml) }}"
+  loop: "{{ _migration_configs.results }}"
+  when: item.stat.exists
+  no_log: true
+
+- name: Reject command-line overrides of planned configuration
+  ansible.builtin.assert:
+    that: lookup('vars', item.key) == item.value
+  loop: "{{ _migration_expected_config | dict2items }}"
+  no_log: true
+
+- name: Refresh live identity and declarative state before any mutation
+  ansible.builtin.include_tasks: read.yml
+
+- name: Refuse a different cluster or drift since collection
+  ansible.builtin.assert:
+    that: >-
+      _migration_report | migration_validate_plan(_migration_snapshot,
+      ansible_root | migration_source_digest, migration_bundle | migration_inventory_digest,
+      migration_approved_digest)
+
+- name: Save pre-apply evidence
+  ansible.builtin.copy:
+    dest: "{{ migration_bundle }}/before-apply.yml"
+    content: "{{ _migration_snapshot | to_nice_yaml }}"
+    mode: '0600'
+  no_log: true
+
+- name: Authorize this standard site execution after validation
+  ansible.builtin.set_fact:
+    _migration_authorized: true
+    _migration_inventory_dir: "{{ migration_bundle }}/inventory"

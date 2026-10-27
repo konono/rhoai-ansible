@@ -1,0 +1,12 @@
+---
+- name: Offline assessment of standard roles against a collected baseline
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_root: "{{ playbook_dir | dirname }}"
+    migration_root: "{{ playbook_dir }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: migration
+        tasks_from: plan
