@@ -174,7 +174,7 @@
       args:
         chdir: "{{ ansible_root }}"
       environment:
-        OPENCODE_INVENTORY: "{{ inventory_dir }}"
+        OPENCODE_INVENTORY: "{{ _migration_inventory_dir | default(inventory_dir) }}"
       register: _opencode
       changed_when: "'opencode.json' in _opencode.stdout"
       failed_when: false

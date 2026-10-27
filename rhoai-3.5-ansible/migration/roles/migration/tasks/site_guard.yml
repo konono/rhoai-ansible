@@ -1,0 +1,39 @@
+---
+# Called before password generation and every other preflight side effect.
+- name: Require the reviewed migration entrypoint
+  ansible.builtin.assert:
+    that:
+      - _migration_authorized | default(false) | bool
+      - _migration_expected_config | default({}) | length > 0
+      - migration_mode | default('') == 'standardize'
+      - migration_external_storage | default(false) | bool
+      - not (install_lvm | default(false) | bool)
+      - not (install_odf | default(false) | bool)
+      - not (install_metallb | default(false) | bool)
+      - not (install_mlflow | default(false) | bool)
+      - not (install_ogx | default(false) | bool)
+      - not (keycloak_admin_recovery | default(false) | bool)
+      - models | default({}) | dict2items | selectattr('value.purge', 'defined') | selectattr('value.purge') | list | length == 0
+    fail_msg: >-
+      Use migration/apply.yml with a reviewed plan. Storage platform management,
+      cache purge and the current NooBaa-provisioning MLflow/OGX paths are prohibited.
+      Add a reviewed external-S3 adapter before enabling those roles.
+
+- name: Require inherited Keycloak credentials instead of random replacement
+  ansible.builtin.assert:
+    that: lookup('vars', item, default='') | length > 0
+    fail_msg: "Supply the inherited credential {{ item }} in the reviewed inventory."
+  loop: [keycloak_db_password, oidc_client_secret, maas_oidc_client_secret, group_sync_password]
+  when: install_keycloak | default(false) | bool
+
+- name: Require inherited MaaS database credential
+  ansible.builtin.assert:
+    that: maas_db_password | default('') | length > 0
+    fail_msg: Supply the inherited maas_db_password in the reviewed inventory.
+  when: install_rhoai | default(false) | bool
+
+- name: Recheck planned effective variables at the site entrypoint
+  ansible.builtin.assert:
+    that: lookup('vars', item.key) == item.value
+  loop: "{{ _migration_expected_config | default({}) | dict2items }}"
+  no_log: true

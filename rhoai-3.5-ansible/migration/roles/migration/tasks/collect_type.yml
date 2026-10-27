@@ -1,0 +1,15 @@
+---
+- name: Preserve identity and full declarative spec for each discovered resource
+  ansible.builtin.set_fact:
+    _migration_objects: >-
+      {{ _migration_objects + [{'id': item.kind ~ '/' ~ (item.metadata.namespace | default('_cluster')) ~ '/' ~ item.metadata.name,
+         'apiVersion': item.apiVersion, 'kind': item.kind, 'resource': discovered.item.resource,
+         'name': item.metadata.name, 'namespace': item.metadata.namespace | default(''),
+         'uid': item.metadata.uid, 'spec': item.spec | default({}),
+         'observed': {'installedCSV': item.status.installedCSV | default('')}}] }}
+  loop: "{{ discovered.resources | default([]) }}"
+  no_log: true
+
+- name: Record the requested API and whether discovery succeeded
+  ansible.builtin.set_fact:
+    _migration_apis: "{{ _migration_apis + [{'api_version': discovered.item.api_version, 'kind': discovered.item.kind, 'api_found': discovered.api_found | default(false)}] }}"

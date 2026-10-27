@@ -1,0 +1,86 @@
+---
+- name: Require bundle path
+  ansible.builtin.assert:
+    that:
+      - migration_bundle is defined
+      - migration_bundle is match('^/')
+
+- name: Load baseline and target inventory exactly as renderer does
+  ansible.builtin.set_fact:
+    _migration_snapshot: "{{ lookup('file', migration_bundle ~ '/baseline.yml') | from_yaml }}"
+    _migration_cfg: {}
+  no_log: true
+
+- ansible.builtin.stat:
+    path: "{{ migration_bundle }}/inventory/group_vars/all/{{ item }}"
+  loop: [cluster.yml, components.yml, vault.yml]
+  register: _migration_configs
+
+- ansible.builtin.set_fact:
+    _migration_cfg: "{{ _migration_cfg | combine(lookup('file', item.stat.path) | from_yaml) }}"
+  loop: "{{ _migration_configs.results }}"
+  when: item.stat.exists
+  no_log: true
+
+- name: Create isolated render directory for this analysis
+  ansible.builtin.tempfile:
+    state: directory
+    path: "{{ migration_bundle }}"
+    prefix: analysis-
+  register: _migration_render_dir
+
+- name: Render standard desired manifests locally (never execute the generated guide)
+  ansible.builtin.command:
+    argv:
+      - "{{ ansible_playbook_python }}"
+      - "{{ ansible_root }}/render-manifests/render.py"
+      - -c
+      - "{{ migration_bundle }}/inventory"
+      - -o
+      - "{{ _migration_render_dir.path }}"
+  register: _migration_render
+  changed_when: false
+  failed_when: false
+  no_log: true
+
+- ansible.builtin.copy:
+    dest: "{{ _migration_render_dir.path }}/render.log"
+    content: "{{ _migration_render.stdout }}\n{{ _migration_render.stderr }}"
+    mode: '0600'
+  no_log: true
+
+- ansible.builtin.find:
+    paths: "{{ _migration_render_dir.path }}/manifests"
+    patterns: ['*.yml', '*.yaml']
+    recurse: true
+  register: _migration_manifest_files
+  when: _migration_render.rc == 0
+
+- ansible.builtin.set_fact:
+    _migration_manifests: []
+
+- ansible.builtin.set_fact:
+    _migration_manifests: "{{ _migration_manifests + (lookup('file', item.path) | from_yaml_all | list) }}"
+  loop: "{{ _migration_manifest_files.files | default([]) }}"
+  no_log: true
+
+- name: Analyze differences and operational hazards without exposing values
+  ansible.builtin.set_fact:
+    _migration_report: >-
+      {{ _migration_snapshot | migration_assess(_migration_cfg, _migration_manifests,
+           ansible_root | migration_source_digest, migration_bundle | migration_inventory_digest,
+           _migration_render.rc == 0) }}
+  no_log: true
+
+- ansible.builtin.copy:
+    dest: "{{ migration_bundle }}/plan.yml"
+    content: "{{ _migration_report | to_nice_yaml }}"
+    mode: '0600'
+  no_log: true
+
+- ansible.builtin.debug:
+    msg:
+      - "Plan: {{ migration_bundle }}/plan.yml"
+      - "Blockers={{ _migration_report.blockers | length }}, warnings={{ _migration_report.warnings | length }}, potential changes={{ _migration_report.changes | length }}"
+      - "Review checksum: {{ _migration_report.plan_digest }}"
+      - "Private render log: {{ _migration_render_dir.path }}/render.log"

@@ -1,0 +1,39 @@
+---
+# Smoke test: prove the control node can reach the cluster through the SOCKS5
+# proxy before running anything real.
+#
+#   ssh -D 1080 -N bastion.example.com &
+#   ansible-playbook verify-socks.yml -e k8s_host=https://api.cluster.internal:6443
+- name: Verify kubernetes.core works through a SOCKS5 proxy
+  hosts: localhost
+  gather_facts: false
+  vars:
+    k8s_proxy: socks5h://127.0.0.1:1080
+    # k8s_host / k8s_api_key are expected from -e or the environment.
+  tasks:
+    - name: Fail early if PySocks is missing
+      ansible.builtin.command: "{{ ansible_playbook_python }} -c 'import socks'"
+      changed_when: false
+      register: pysocks
+      failed_when: pysocks.rc != 0
+
+    - name: Confirm the kubernetes client is new enough for SOCKS
+      ansible.builtin.command: >-
+        {{ ansible_playbook_python }} -c
+        "import kubernetes, sys;
+        v = int(kubernetes.__version__.split('.')[0]);
+        sys.exit(0 if v >= 37 else 1)"
+      changed_when: false
+
+    - name: Query the cluster through the proxy
+      kubernetes.core.k8s_cluster_info:
+        host: "{{ k8s_host }}"
+        api_key: "{{ k8s_api_key | default(omit) }}"
+        kubeconfig: "{{ k8s_kubeconfig | default(omit) }}"
+        validate_certs: "{{ k8s_validate_certs | default(true) }}"
+        proxy: "{{ k8s_proxy }}"
+      register: info
+
+    - name: Show what came back
+      ansible.builtin.debug:
+        msg: "Reached {{ k8s_host }} through {{ k8s_proxy }} - server {{ info.version.server.kubernetes.gitVersion }}"

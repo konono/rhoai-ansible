@@ -1,5 +1,8 @@
 # RHOAI 3.5 Ansible Installer
 
+手動構築済みの環境をこの playbook の管理へ移す場合は [migration/README.md](migration/README.md) を参照してください。
+収集・inventory 生成・診断・移行適用・現地改修用 Skill を `migration/` にまとめています。既存 CSI／ストレージ基盤は管理対象にしません。
+
 ## Playbook の更新とリリース
 
 GitHub Release の最新版を確認し、変更一覧を表示します。クラスタへの適用は行いません。

@@ -2,6 +2,10 @@
 
 # RHOAI 3.5 Ansible Installer
 
+For an existing manually deployed environment, start in [migration/](migration/README.md).
+It contains discovery, inventory generation, migration planning and apply playbooks,
+plus a customer-site AI skill. Existing CSI/storage infrastructure stays externally managed.
+
 ## Playbook updates and releases
 
 Preview the latest GitHub Release, then apply the verified source update:

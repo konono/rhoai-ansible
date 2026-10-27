@@ -1,0 +1,42 @@
+---
+- name: Load repository defaults without running any deployment role
+  ansible.builtin.set_fact:
+    _migration_defaults: >-
+      {{ (lookup('file', ansible_root ~ '/inventory/sample/group_vars/all/cluster.yml.sample') | from_yaml)
+         | combine(lookup('file', ansible_root ~ '/inventory/sample/group_vars/all/components.yml.sample') | from_yaml) }}
+  no_log: true
+
+- name: Infer a draft from observed values
+  ansible.builtin.set_fact:
+    _migration_draft: >-
+      {{ _migration_snapshot | migration_infer(_migration_defaults, migration_operator_mapping,
+           ansible_root, migration_output_dir, migration_kubeconfig) }}
+  no_log: true
+
+- name: Write standard-role inventory draft
+  ansible.builtin.copy:
+    dest: "{{ migration_output_dir }}/inventory/group_vars/all/components.yml"
+    content: "{{ _migration_draft | to_nice_yaml }}"
+    mode: '0600'
+  no_log: true
+
+- name: Write localhost inventory
+  ansible.builtin.copy:
+    dest: "{{ migration_output_dir }}/inventory/hosts.yml"
+    mode: '0600'
+    content: |
+      all:
+        hosts:
+          localhost:
+            ansible_connection: local
+            ansible_python_interpreter: "{% raw %}{{ ansible_playbook_python }}{% endraw %}"
+
+- name: Write initial insights without any secret values
+  ansible.builtin.copy:
+    dest: "{{ migration_output_dir }}/insights.yml"
+    mode: '0600'
+    content: >-
+      {{ _migration_snapshot | migration_assess(_migration_draft, [],
+           ansible_root | migration_source_digest,
+           migration_output_dir | migration_inventory_digest) | to_nice_yaml }}
+  no_log: true

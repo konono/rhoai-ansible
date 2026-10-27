@@ -1,0 +1,36 @@
+---
+- name: Require a new absolute output directory
+  ansible.builtin.assert:
+    that:
+      - migration_output_dir is defined
+      - migration_output_dir is match('^/')
+
+- ansible.builtin.stat:
+    path: "{{ migration_output_dir }}"
+  register: _migration_output
+
+- ansible.builtin.assert:
+    that: not _migration_output.stat.exists
+    fail_msg: Use a new output directory; never overwrite a previous migration baseline.
+
+- ansible.builtin.include_tasks: read.yml
+
+- name: Create private migration bundle
+  ansible.builtin.file:
+    path: "{{ migration_output_dir }}/{{ item }}"
+    state: directory
+    mode: '0700'
+  loop: ['', inventory, inventory/group_vars, inventory/group_vars/all]
+
+- name: Save private baseline
+  ansible.builtin.copy:
+    dest: "{{ migration_output_dir }}/baseline.yml"
+    content: "{{ _migration_snapshot | to_nice_yaml }}"
+    mode: '0600'
+  no_log: true
+
+- ansible.builtin.include_tasks: generate.yml
+
+- name: Report bundle location (never print resource values)
+  ansible.builtin.debug:
+    msg: "Read-only collection complete: {{ migration_output_dir }}. Review the generated inventory and run plan.yml. Baseline specs are never replayed; apply.yml runs the standard site.yml after its migration gate."

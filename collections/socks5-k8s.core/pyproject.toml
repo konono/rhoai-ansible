@@ -1,0 +1,45 @@
+# Control node environment for running kubernetes.core against a cluster that is
+# only reachable through a SOCKS5 proxy (e.g. an air-gapped cluster behind an SSH
+# bastion opened with `ssh -D 1080 -N bastion`).
+#
+# No patched collection is needed: the kubernetes client gained SOCKS support in
+# v37.0.0, so the stock kubernetes.core from Ansible Galaxy works as long as the
+# Python side is pinned correctly. That is what this file does.
+#
+# This is not a Python package. kubernetes.core is an Ansible collection and is
+# installed with ansible-galaxy (see requirements.yml), not with pip.
+
+[project]
+name = "kubernetes-core-socks-env"
+version = "1.0.0"
+description = "Control node environment for kubernetes.core over a SOCKS5 proxy"
+# Upper bound is deliberate: ansible-core 2.21.5 fails on Python 3.15 with
+# "AttributeError: module 'dataclasses' has no attribute '_is_type'".
+requires-python = ">=3.12,<3.14"
+
+dependencies = [
+  # kubernetes.core 6.6.0 declares requires_ansible '>=2.16.0'.
+  "ansible-core>=2.16.0",
+
+  # THE important pin. kubernetes<37.0.0 builds a urllib3.ProxyManager
+  # unconditionally, which rejects socks* schemes:
+  #   "Proxy URL had unsupported scheme socks5h, should use http:// or https://"
+  # v37.0.0 routes socks* URLs to urllib3's SOCKSProxyManager instead.
+  "kubernetes>=37.0.0",
+
+  # The rest of kubernetes.core's requirements.txt.
+  "requests-oauthlib",
+  "jsonpatch",
+
+  # urllib3 imports PySocks lazily inside urllib3.contrib.socks, and the 'socks'
+  # extra is what pulls it in. Without it, a socks* proxy fails at runtime with
+  # "No module named 'socks'".
+  "urllib3[socks]>=1.26.0",
+]
+
+[project.optional-dependencies]
+# Only needed for `validate: {...}` in the k8s module.
+validate = ["kubernetes-validate"]
+
+[tool.uv]
+package = false

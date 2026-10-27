@@ -1,4 +1,7 @@
 ---
+- ansible.builtin.include_tasks: "{{ ansible_root }}/migration/roles/migration/tasks/site_guard.yml"
+  when: migration_mode | default('') == 'standardize' or (migration_external_storage | default(false) | bool)
+
 - name: Verify oc login
   ansible.builtin.command: oc whoami
   changed_when: false
@@ -28,27 +31,35 @@
   ansible.builtin.include_vars:
     file: "{{ ansible_root }}/.generated-passwords.yml"
   ignore_errors: true
+  when: migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
   no_log: true
 
 - name: Generate maas_db_password if empty
   ansible.builtin.set_fact:
     maas_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
-  when: maas_db_password | default('') | length == 0
+  when:
+    - migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
+    - maas_db_password | default('') | length == 0
   no_log: true
 
 - name: Generate ogx_db_password if empty
   ansible.builtin.set_fact:
     ogx_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
-  when: ogx_db_password | default('') | length == 0
+  when:
+    - migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
+    - ogx_db_password | default('') | length == 0
   no_log: true
 
 - name: Generate keycloak_db_password if empty
   ansible.builtin.set_fact:
     keycloak_db_password: "{{ lookup('password', '/dev/null length=20 chars=ascii_letters,digits') }}"
-  when: keycloak_db_password | default('') | length == 0
+  when:
+    - migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
+    - keycloak_db_password | default('') | length == 0
   no_log: true
 
 - name: Check if passwords file needs update
+  when: migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
   ansible.builtin.set_fact:
     _passwords_changed: >-
       {{ (maas_db_password != _prev_maas_db_password | default('')) or
@@ -71,13 +82,16 @@
     dest: "{{ ansible_root }}/.generated-passwords.yml"
     mode: "0600"
   delegate_to: localhost
-  when: _passwords_changed | default(true) | bool
+  when:
+    - migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
+    - _passwords_changed | default(true) | bool
   no_log: true
 
 - name: Auto-enable install_lvm when storage_class uses lvms
   ansible.builtin.set_fact:
     install_lvm: true
   when:
+    - migration_mode | default('') != 'standardize' and not (migration_external_storage | default(false) | bool)
     - storage_class is defined
     - storage_class is match('lvms-.*')
     - not (install_lvm | default(true))

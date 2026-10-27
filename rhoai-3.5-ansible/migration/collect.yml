@@ -1,0 +1,13 @@
+---
+# Read-only discovery. Explicit kubeconfig and a new output directory are required.
+- name: Discover an existing installation for standardization using external CSI
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    ansible_root: "{{ playbook_dir | dirname }}"
+    migration_root: "{{ playbook_dir }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: migration
+        tasks_from: collect

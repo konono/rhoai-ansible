@@ -83,6 +83,7 @@ tar czf "$OUTPUT" \
     --exclude='vendor' \
     --exclude='.venv' \
     --exclude='.local' \
+    --exclude='*/migration/output' \
     --exclude='collections' \
     --exclude='.kube' \
     --exclude='.credentials' \

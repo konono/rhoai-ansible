@@ -1,0 +1,38 @@
+---
+# Collection scope only. These resources are NOT applied from this snapshot.
+migration_resource_types:
+  - {api_version: operators.coreos.com/v1alpha1, kind: Subscription, resource: subscriptions.operators.coreos.com}
+  - {api_version: datasciencecluster.opendatahub.io/v1, kind: DataScienceCluster, resource: datascienceclusters.datasciencecluster.opendatahub.io}
+  - {api_version: dscinitialization.opendatahub.io/v1, kind: DSCInitialization, resource: dscinitializations.dscinitialization.opendatahub.io}
+  - {api_version: nvidia.com/v1, kind: ClusterPolicy, resource: clusterpolicies.nvidia.com}
+  - {api_version: k8s.keycloak.org/v2beta1, kind: Keycloak, resource: keycloaks.k8s.keycloak.org}
+  - {api_version: redhatcop.redhat.io/v1alpha1, kind: GroupSync, resource: groupsyncs.redhatcop.redhat.io}
+  - {api_version: serving.kserve.io/v1alpha2, kind: LLMInferenceService, resource: llminferenceservices.v1alpha2.serving.kserve.io}
+  - {api_version: maas.opendatahub.io/v1alpha1, kind: MaaSAuthPolicy, resource: maasauthpolicies.maas.opendatahub.io}
+  - {api_version: maas.opendatahub.io/v1alpha1, kind: MaaSSubscription, resource: maassubscriptions.maas.opendatahub.io}
+  - {api_version: maas.opendatahub.io/v1alpha1, kind: MaaSModelRef, resource: maasmodelrefs.maas.opendatahub.io}
+  - {api_version: perses.dev/v1alpha2, kind: PersesDashboard, resource: persesdashboards.perses.dev}
+  - {api_version: apps/v1, kind: StatefulSet, resource: statefulsets.apps}
+  - {api_version: apps/v1, kind: Deployment, resource: deployments.apps}
+  - {api_version: mlflow.opendatahub.io/v1, kind: MLflow, resource: mlflows.mlflow.opendatahub.io}
+  - {api_version: ogx.io/v1beta1, kind: OGXServer, resource: ogxservers.ogx.io}
+  - {api_version: trustyai.opendatahub.io/v1alpha1, kind: NemoGuardrails, resource: nemoguardrails.trustyai.opendatahub.io}
+  - {api_version: objectbucket.io/v1alpha1, kind: ObjectBucketClaim, resource: objectbucketclaims.objectbucket.io}
+  - {api_version: noobaa.io/v1alpha1, kind: BackingStore, resource: backingstores.noobaa.io}
+migration_operator_mapping:
+  openshift-cert-manager-operator: {channel_key: openshift_cert_manager_operator, flag: install_cert_manager}
+  servicemeshoperator3: {channel_key: servicemeshoperator3, flag: install_servicemesh}
+  nfd: {channel_key: nfd, flag: install_nfd}
+  gpu-operator-certified: {channel_key: gpu_operator_certified, flag: install_gpu_operator}
+  rhcl-operator: {channel_key: rhcl_operator, flag: install_rhcl}
+  kueue-operator: {channel_key: kueue_operator, flag: install_kueue}
+  job-set: {channel_key: job_set, flag: install_jobset}
+  leader-worker-set: {channel_key: leader_worker_set, flag: install_leaderworkerset}
+  odf-operator: {channel_key: odf_operator, flag: install_odf}
+  rhods-operator: {channel_key: rhods_operator, flag: install_rhoai}
+  rhbk-operator: {channel_key: rhbk_operator, flag: install_keycloak}
+  group-sync-operator: {channel_key: group_sync_operator, flag: install_keycloak}
+  cluster-observability-operator: {channel_key: cluster_observability_operator, flag: install_observability}
+  opentelemetry-product: {channel_key: opentelemetry_product, flag: install_observability}
+  lvms-operator: {channel_key: lvms_operator, flag: install_lvm}
+  metallb-operator: {channel_key: metallb_operator, flag: install_metallb}

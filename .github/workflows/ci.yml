@@ -47,6 +47,10 @@ jobs:
           done
           exit $fail
 
+      - name: Offline migration workflow tests
+        working-directory: ${{ env.PB_DIR }}/migration
+        run: python -m unittest discover -s tests -v
+
       - name: Repeat generated GPU runtime tests with diagnostics
         if: success() || failure()
         working-directory: ${{ env.PB_DIR }}
