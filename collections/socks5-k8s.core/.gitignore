@@ -1,0 +1,4 @@
+# Created by `uv sync` and `ansible-galaxy collection install -p ./collections`
+# on the target host. Do not carry these over; regenerate them there.
+.venv/
+collections/

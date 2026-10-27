@@ -1,0 +1,6 @@
+---
+# The stock collection from Ansible Galaxy. No patch is required: SOCKS support
+# comes from kubernetes>=37.0.0, pinned in pyproject.toml.
+collections:
+  - name: kubernetes.core
+    version: 6.6.0
